@@ -73,6 +73,9 @@ Choose how users sign in via `AUTH_MODE`:
   hands the client your web config.
 
 Clients call `GET /auth/config` (public) to discover the mode before showing a login screen.
+In `local` mode, clients use `POST /auth/register` and `POST /auth/login` (both public, return
+a JWT for the `Authorization: Bearer` header). `GET /auth/me` and `POST /auth/sync` work in
+both modes.
 
 **Firebase – option A (file):**
 

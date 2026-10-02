@@ -15,9 +15,11 @@ datasource db {
 // ============================================================================
 
 model User {
-  id          String   @id @default(uuid()) @db.Uuid
-  firebaseUid String   @unique @map("firebase_uid")
-  email       String   @unique
+  id            String   @id @default(uuid()) @db.Uuid
+  firebaseUid   String?  @unique @map("firebase_uid")
+  passwordHash  String?  @map("password_hash")
+  emailVerified Boolean  @default(false) @map("email_verified")
+  email         String   @unique
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
