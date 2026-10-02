@@ -1,5 +1,5 @@
-import type { FastifyInstance } from 'fastify';
-import { authMiddleware, getAuthUser } from '../../shared/middleware/auth.middleware.js';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { authMiddleware, getAuthUser, type AuthUser } from '../../shared/middleware/auth.middleware.js';
 import {
   getUserByFirebaseUid,
   getUserHouseholds,
@@ -7,6 +7,46 @@ import {
 import { getOrCreatePersonalHousehold } from '../households/households.service.js';
 import { processReferralCode } from '../users/referrals.service.js';
 import { prisma } from '../../shared/db/prisma.js';
+import { env, isLocalAuth } from '../../shared/config/env.js';
+import { login, register } from './local.service.js';
+import { UnauthorizedError } from '../../shared/errors/index.js';
+
+/**
+ * Resolve the current DB user in both auth modes.
+ * - firebase: lookup (or auto-create) by Firebase UID.
+ * - local: authUser.uid is already the user id (uuid); firebaseUid is NULL,
+ *   so lookup by id. Never fall back to getUserByFirebaseUid here, which
+ *   would overwrite firebaseUid with a uuid.
+ */
+async function resolveCurrentUser(authUser: AuthUser) {
+  if (authUser.mode === 'local' || isLocalAuth) {
+    const user = await prisma.user.findUnique({
+      where: { id: authUser.uid },
+    });
+    if (!user) {
+      throw new UnauthorizedError('User not found');
+    }
+    return user;
+  }
+  return getUserByFirebaseUid(authUser.uid, authUser.email);
+}
+
+const errorResponseSchema = {
+  type: 'object',
+  properties: {
+    success: { type: 'boolean' },
+    error: { type: 'string' },
+  },
+} as const;
+
+const credentialsBodySchema = {
+  type: 'object',
+  required: ['email', 'password'],
+  properties: {
+    email: { type: 'string', format: 'email' },
+    password: { type: 'string', minLength: 8 },
+  },
+} as const;
 
 export async function authRoutes(app: FastifyInstance) {
   /**
@@ -67,7 +107,7 @@ export async function authRoutes(app: FastifyInstance) {
     },
     async (request, reply) => {
       const authUser = getAuthUser(request);
-      const user = await getUserByFirebaseUid(authUser.uid, authUser.email);
+      const user = await resolveCurrentUser(authUser);
 
       // Get user's households (may be empty)
       const households = await getUserHouseholds(user.id);
@@ -140,7 +180,7 @@ export async function authRoutes(app: FastifyInstance) {
       const referralCode = body?.referralCode;
 
       // Create or get user
-      const user = await getUserByFirebaseUid(authUser.uid, authUser.email);
+      const user = await resolveCurrentUser(authUser);
 
       // Process referral code if provided (only for users without existing referral record)
       // The processReferralCode function already handles duplicate checks and validation
@@ -192,6 +232,153 @@ export async function authRoutes(app: FastifyInstance) {
           emailVerified: authUser.emailVerified,
           createdAt: user.createdAt,
           householdId: household.id, // Return household ID so frontend can save it
+        },
+      });
+    }
+  );
+
+  /**
+   * POST /auth/register
+   * Register with email + password (local auth mode only)
+   */
+  app.post(
+    '/register',
+    {
+      schema: {
+        description: 'Register a new user with email and password. Only available when AUTH_MODE=local.',
+        tags: ['Auth'],
+        body: credentialsBodySchema,
+        response: {
+          201: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', format: 'uuid' },
+                  email: { type: 'string', format: 'email' },
+                  householdId: { type: 'string', format: 'uuid' },
+                },
+              },
+            },
+          },
+          400: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!isLocalAuth) {
+        return reply.code(404).send({
+          success: false,
+          error: 'Local registration is not available in firebase auth mode',
+        });
+      }
+
+      const body = request.body as { email: string; password: string };
+      const user = await register(body.email, body.password);
+
+      const household = await getOrCreatePersonalHousehold(user.id, user.email);
+
+      return reply.code(201).send({
+        success: true,
+        data: {
+          id: user.id,
+          email: user.email,
+          householdId: household.id,
+        },
+      });
+    }
+  );
+
+  /**
+   * POST /auth/login
+   * Login with email + password (local auth mode only)
+   */
+  app.post(
+    '/login',
+    {
+      schema: {
+        description: 'Login with email and password. Only available when AUTH_MODE=local.',
+        tags: ['Auth'],
+        body: credentialsBodySchema,
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  token: { type: 'string' },
+                  id: { type: 'string', format: 'uuid' },
+                  email: { type: 'string', format: 'email' },
+                },
+              },
+            },
+          },
+          401: errorResponseSchema,
+          404: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!isLocalAuth) {
+        return reply.code(404).send({
+          success: false,
+          error: 'Local login is not available in firebase auth mode',
+        });
+      }
+
+      const body = request.body as { email: string; password: string };
+      const { user, token } = await login(body.email, body.password);
+
+      return reply.send({
+        success: true,
+        data: {
+          token,
+          id: user.id,
+          email: user.email,
+        },
+      });
+    }
+  );
+
+  /**
+   * GET /auth/config
+   * Public auth-mode discovery for dual-mode frontend
+   */
+  app.get(
+    '/config',
+    {
+      schema: {
+        description: 'Get auth mode configuration. Used by the frontend to select local or firebase auth flow.',
+        tags: ['Auth'],
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  authMode: { type: 'string', enum: ['local', 'firebase'] },
+                  firebaseWebApiKey: { type: ['string', 'null'] },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (_request: FastifyRequest, reply) => {
+      return reply.send({
+        success: true,
+        data: {
+          authMode: env.AUTH_MODE,
+          firebaseWebApiKey: env.AUTH_FIREBASE_WEB_API_KEY ?? null,
         },
       });
     }
