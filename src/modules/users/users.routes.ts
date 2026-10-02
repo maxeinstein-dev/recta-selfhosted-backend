@@ -1,7 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { authMiddleware, getAuthUser } from '../../shared/middleware/auth.middleware.js';
 import { getUserByFirebaseUid } from '../../shared/middleware/authorization.middleware.js';
-import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError } from '../../shared/errors/index.js';
 import {
   getUserById,
@@ -163,10 +162,8 @@ export async function userRoutes(app: FastifyInstance) {
     },
     async (request, reply) => {
       const authUser = getAuthUser(request);
-      // Use getUserByFirebaseUid from users.service (not from authorization middleware)
-      const user = await prisma.user.findUnique({
-        where: { firebaseUid: authUser.uid },
-      });
+      // Mode-aware lookup (local: by id, no auto-create; firebase: legacy path)
+      const user = await getUserByFirebaseUid(authUser.uid, authUser.email);
       
       if (!user) {
         throw new NotFoundError('User');
@@ -206,10 +203,8 @@ export async function userRoutes(app: FastifyInstance) {
     },
     async (request, reply) => {
       const authUser = getAuthUser(request);
-      // Use findUnique instead of upsert for deletion - we don't want to create user if it doesn't exist
-      const user = await prisma.user.findUnique({
-        where: { firebaseUid: authUser.uid },
-      });
+      // Mode-aware lookup (local: by id, no auto-create; firebase: legacy path)
+      const user = await getUserByFirebaseUid(authUser.uid, authUser.email);
       
       if (!user) {
         throw new NotFoundError('User');
