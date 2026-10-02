@@ -1,8 +1,9 @@
 import type { FastifyRequest } from 'fastify';
 import type { HouseholdRole, Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../db/prisma.js';
-import { ForbiddenError, NotFoundError, InsufficientRoleError } from '../errors/index.js';
+import { ForbiddenError, NotFoundError, InsufficientRoleError, UnauthorizedError } from '../errors/index.js';
 import { getAuthUser } from './auth.middleware.js';
+import { isLocalAuth } from '../config/env.js';
 import * as householdsService from '../../modules/households/households.service.js';
 
 /**
@@ -33,11 +34,52 @@ function hasRoleLevel(userRole: HouseholdRole, requiredRole: HouseholdRole): boo
 }
 
 /**
+ * Public user fields — never expose passwordHash.
+ * Mirrors users.service selects so route responses stay safe in both modes.
+ */
+const publicUserSelect = {
+  id: true,
+  firebaseUid: true,
+  email: true,
+  emailVerified: true,
+  displayName: true,
+  isPremium: true,
+  onboardingCompleted: true,
+  onboardingRestartedAt: true,
+  theme: true,
+  baseCurrency: true,
+  locale: true,
+  country: true,
+  referralCode: true,
+  dashboardPreferences: true,
+  lastRecurringProcessedMonth: true,
+  lastRecurringProcessedAt: true,
+  preferencesUpdatedAt: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
+/**
  * Get user's database record from Firebase UID
  * Creates user if doesn't exist (for first login)
  * Handles case where user exists with same email but different firebaseUid
+ *
+ * In local auth mode the caller passes the user id (uuid) as firebaseUid:
+ * lookup is by id only — never auto-create and never overwrite firebaseUid,
+ * otherwise every request would corrupt local users (firebaseUid = userId)
+ * and leak passwordHash through the full-row return.
  */
 export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
+  if (isLocalAuth) {
+    const user = await prisma.user.findUnique({
+      where: { id: firebaseUid },
+      select: publicUserSelect,
+    });
+    if (!user) {
+      throw new UnauthorizedError('User not found');
+    }
+    return user;
+  }
   // Validate email - must be a non-empty string
   if (!email || email.trim() === '') {
     throw new Error('Email is required to create user');
@@ -48,6 +90,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
   // First, try to find user by firebaseUid
   let user = await prisma.user.findUnique({
     where: { firebaseUid },
+    select: publicUserSelect,
   });
 
   if (user) {
@@ -58,6 +101,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
   // This can happen if Firebase UID changed or there's data inconsistency
   const existingUserByEmail = await prisma.user.findUnique({
     where: { email: trimmedEmail },
+    select: { id: true },
   });
 
   if (existingUserByEmail) {
@@ -66,6 +110,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
     user = await prisma.user.update({
       where: { id: existingUserByEmail.id },
       data: { firebaseUid },
+      select: publicUserSelect,
     });
     return user;
   }
@@ -76,6 +121,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
       firebaseUid,
       email: trimmedEmail,
     },
+    select: publicUserSelect,
   });
 
   return user;

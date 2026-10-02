@@ -35,7 +35,13 @@ const errorResponseSchema = {
   type: 'object',
   properties: {
     success: { type: 'boolean' },
-    error: { type: 'string' },
+    error: {
+      type: 'object',
+      properties: {
+        code: { type: 'string' },
+        message: { type: 'string' },
+      },
+    },
   },
 } as const;
 
@@ -94,13 +100,7 @@ export async function authRoutes(app: FastifyInstance) {
               },
             },
           },
-          401: {
-            type: 'object',
-            properties: {
-              success: { type: 'boolean' },
-              error: { type: 'string' },
-            },
-          },
+          401: errorResponseSchema,
         },
       },
       preHandler: authMiddleware(),
@@ -163,13 +163,7 @@ export async function authRoutes(app: FastifyInstance) {
               },
             },
           },
-          401: {
-            type: 'object',
-            properties: {
-              success: { type: 'boolean' },
-              error: { type: 'string' },
-            },
-          },
+          401: errorResponseSchema,
         },
       },
       preHandler: authMiddleware({ requireEmailVerified: false }),
@@ -273,7 +267,7 @@ export async function authRoutes(app: FastifyInstance) {
       if (!isLocalAuth) {
         return reply.code(404).send({
           success: false,
-          error: 'Local registration is not available in firebase auth mode',
+          error: { code: 'NOT_FOUND', message: 'Local registration is not available in firebase auth mode' },
         });
       }
 
@@ -328,7 +322,7 @@ export async function authRoutes(app: FastifyInstance) {
       if (!isLocalAuth) {
         return reply.code(404).send({
           success: false,
-          error: 'Local login is not available in firebase auth mode',
+          error: { code: 'NOT_FOUND', message: 'Local login is not available in firebase auth mode' },
         });
       }
 
