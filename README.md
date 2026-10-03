@@ -150,6 +150,47 @@ npm run cron:process-recurrences
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
 
+## Importing transactions
+
+Two importers live under `/transactions/import`. Both require authentication and EDITOR+ on the household that owns the destination accounts, both accept files up to 5 MB, and both work in two steps: a **preview** that parses the file without persisting anything, and a **confirm** that persists the rows the user kept.
+
+### Bank statements (OFX / CSV)
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/preview` | multipart: `accountId`, `file` (.ofx or .csv) | Returns parsed rows flagged as duplicate when an identical transaction (account, day, amount, description) already exists. |
+| `POST /transactions/import/confirm` | JSON: `{ accountId, rows: [{ date, description, amount, type }] }` | Creates the rows through the regular transaction service (balances are updated); duplicates are re-checked and skipped. |
+
+The CSV flavour expects `date;description;amount` (`,` also accepted as delimiter), dates as `dd/MM/yyyy` or `yyyy-MM-dd`, and Brazilian or plain decimal amounts. Negative amounts become expenses.
+
+### Monthly sheet ("MaxFin" format)
+
+A monthly budget sheet exported as CSV (one tab per month) can be imported in one go. The expected layout is: a title cell containing `Mês de <mês> de <ano>`, a header row whose second column is `Descrição`, and four blocks of rows:
+
+1. **income** rows (values in `Entrada - Previsto` / `Recebido`), with no `Total` row;
+2. **bills** rows (values in `Saída - Previsto` / `Realizado`) ending in a `Total` row;
+3. **credit card** rows ending in a `Total` row — descriptions may carry installments as `N/M`, and `N/M +K` means `K` further installments were prepaid in this invoice (the row amount is the net total);
+4. **debit/pix** rows ending in a `Total` row.
+
+Everything after the third `Total` (grand totals, account balances) is ignored. Free text in the last column is kept as the transaction notes.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/maxfin/preview` | multipart: `file` (.csv), `accounts` (JSON `{ income, bills, credit, debit }` account ids), optional `options` (JSON) | Returns every row with its status (`new`, `duplicate`, `changed`, `replaces-future`, `legacy-duplicate`), per-block sums against the sheet totals, a category map with suggestions, warnings and the invoice payment that confirm would record. |
+| `POST /transactions/import/maxfin/confirm` | JSON: `{ month, accounts, options, categoryMap, rows }` | Creates the requested custom categories, the transactions, the remaining installments and the invoice payment. |
+
+Rules applied:
+
+- Every row is dated day 1 of the sheet month. Income uses `Recebido` when present, otherwise `Previsto`; expenses use `Realizado`, otherwise `Previsto`. A row is paid when the realized value is present; credit card rows are always paid (Recta's convention for CREDIT accounts).
+- `options.closedMonth` (default: the sheet month is before the current month) marks every row as paid and enables `options.payInvoice`, which records the credit card invoice payment from the bills account on the card's due day, for the exact amount imported in that call, at most once per card and month.
+- `options.generateFutureInstallments` (default: open month only) creates the remaining installments `N+1..M` of each credit row in the following months, sharing one `installmentId`.
+- Each imported row stores a `sourceRef` (`maxfin:<yyyy-MM>:<block>:<line>`), unique per household (the column is nullable, so manual transactions are unaffected). Re-importing the same sheet imports nothing, and a repeated or concurrent confirm cannot store a row twice. A row whose amount or paid flag changed is reported as `changed` and only replaced when the client sends `replace: true`.
+- Installments generated for later months carry a `sourceRef` ending in `:f<N>`. When a later sheet carries the same plan (same description and total), its row is reported as `replaces-future` and, with `replace: true`, supersedes the generated installments it covers (`N..N+K`). Generation never repeats an installment number that is already stored, and `replace` never deletes anything else.
+- Confirm re-validates what the preview derived and rejects inconsistent requests before any write: `sourceRef` outside the sheet month or repeated, `type` not matching the block, `date` outside the month, installment shape (at most 99 installments; `futureCount` is recomputed server-side).
+- A second confirm for the same closed month does not record a second invoice payment. The preview says so up front: `invoice.alreadyPaid` is true when the payment of that card and month already exists, and `invoice.willPay` is then false.
+- The preview counts `replaces-future` rows as new (they import), but confirm skips them with a warning unless the client sends `replace: true` for them. Replacing is a delete followed by a create, not one database transaction: if confirm fails midway, run the preview again, rows already imported show up as duplicates and the missing ones as new.
+- The category map lets the client point each sheet category name to a system category, an existing custom category, a new custom category, or the default (`OTHER_INCOME` / `OTHER_EXPENSES`).
+
 ## Project structure
 
 ```
