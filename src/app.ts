@@ -20,6 +20,7 @@ import { accountRoutes } from './modules/accounts/index.js';
 import { categoryRoutes } from './modules/categories/index.js';
 import { transactionRoutes } from './modules/transactions/index.js';
 import { importRoutes } from './modules/transactions/import.routes.js';
+import { maxfinImportRoutes } from './modules/transactions/maxfin-import.routes.js';
 import { budgetRoutes } from './modules/budgets/index.js';
 import { savingsGoalRoutes } from './modules/savings-goals/index.js';
 import { recurringTransactionRoutes } from './modules/recurring-transactions/index.js';
@@ -304,6 +305,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(categoryRoutes, { prefix: '/categories' });
   await app.register(transactionRoutes, { prefix: '/transactions' });
   await app.register(importRoutes, { prefix: '/transactions' });
+  await app.register(maxfinImportRoutes, { prefix: '/transactions' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
   await app.register(recurringTransactionRoutes, { prefix: '/recurring-transactions' });
