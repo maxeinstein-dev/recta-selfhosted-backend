@@ -24,6 +24,17 @@ import type {
 } from './transactions.schema.js';
 
 /**
+ * Order of every cursor-paginated transaction listing. Cursor pagination needs a total order: `date` is a day
+ * and many rows share it (an import dates a whole month on day 01), so `createdAt` and finally the unique `id`
+ * break the ties; with ties left, consecutive pages overlap and skip rows.
+ */
+export const PAGINATED_TRANSACTION_ORDER: Prisma.TransactionOrderByWithRelationInput[] = [
+  { date: 'desc' },
+  { createdAt: 'desc' },
+  { id: 'desc' },
+];
+
+/**
  * Calculate balance change for a transaction based on account type and income/expense
  * @param amount Transaction amount (always positive)
  * @param isIncome True for INCOME, false for EXPENSE
@@ -686,7 +697,7 @@ export async function listTransactions(query: ListTransactionsQuery) {
         select: { id: true, name: true, type: true },
       },
     },
-    orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    orderBy: PAGINATED_TRANSACTION_ORDER,
   });
 
   // Get total count for the filters
@@ -1932,14 +1943,14 @@ export async function calculateCreditCardInvoice(
   const allInvoiceTransactions = pagination?.cursor
     ? await prisma.transaction.findMany({
         where: whereClause,
-        orderBy: { date: 'desc' },
+        orderBy: PAGINATED_TRANSACTION_ORDER,
         take: limit + 1,
         cursor: { id: pagination.cursor },
         skip: 1,
       })
     : await prisma.transaction.findMany({
         where: whereClause,
-        orderBy: { date: 'desc' },
+        orderBy: PAGINATED_TRANSACTION_ORDER,
         take: limit + 1,
       });
 
