@@ -3,6 +3,13 @@ import { ZodError } from 'zod';
 import { AppError, ValidationError } from './app-error.js';
 import { isProduction } from '../config/env.js';
 
+/** Codes for the Fastify/plugin client errors that carry no AppError code of their own. */
+const CLIENT_ERROR_CODES: Record<number, string> = {
+  413: 'PAYLOAD_TOO_LARGE',
+  415: 'UNSUPPORTED_MEDIA_TYPE',
+  429: 'TOO_MANY_REQUESTS',
+};
+
 interface ErrorResponse {
   success: false;
   error: {
@@ -83,6 +90,32 @@ export function errorHandler(
       },
     };
     reply.status(400).send(response);
+    return;
+  }
+
+  // Database unique violations (Prisma P2002), e.g. a repeated sourceRef sent to the transactions API, are
+  // conflicts the client caused, not server errors.
+  if ((error as { code?: unknown }).code === 'P2002') {
+    const response: ErrorResponse = {
+      success: false,
+      error: { code: 'CONFLICT', message: 'A record with the same unique value already exists' },
+    };
+    reply.status(409).send(response);
+    return;
+  }
+
+  // Handle Fastify's own client errors (e.g. FST_REQ_FILE_TOO_LARGE from @fastify/multipart, 415, 429)
+  // instead of reporting them as 500s.
+  const statusCode = (error as FastifyError).statusCode;
+  if (typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500) {
+    const response: ErrorResponse = {
+      success: false,
+      error: {
+        code: CLIENT_ERROR_CODES[statusCode] ?? 'BAD_REQUEST',
+        message: error.message,
+      },
+    };
+    reply.status(statusCode).send(response);
     return;
   }
 
