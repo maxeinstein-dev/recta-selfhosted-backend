@@ -44,6 +44,7 @@ export const createTransactionSchema = z.object({
   installmentNumber: z.number().int().positive().optional(),
   totalInstallments: z.number().int().positive().optional(),
   attachmentUrl: z.string().max(500).optional(), // Pode ser URL ou identificador técnico (ex: invoice_pay:xxx:xxx)
+  sourceRef: z.string().max(120).optional(), // Identificador de origem de importação (dedup exata / reimportação idempotente)
   // Split expense fields (only for EXPENSE transactions in shared households)
   isSplit: z.boolean().optional().default(false),
   splits: z.array(transactionSplitInputSchema).optional(), // Array of splits when isSplit is true
@@ -178,6 +179,7 @@ export const batchCreateTransactionsSchema = z.object({
       installmentId: z.string().optional(),
       installmentNumber: z.number().int().positive().optional(),
       totalInstallments: z.number().int().positive().optional(),
+      sourceRef: z.string().max(120).optional(), // Identificador de origem de importação
     })
   ).min(1).max(100),
 });
@@ -204,6 +206,7 @@ export const payInvoiceSchema = z.object({
   amount: z.coerce.number().positive().optional(), // Valor a pagar (opcional, se não fornecido usa o total da fatura)
   month: z.string().regex(/^\d{4}-\d{2}$/, 'Month must be in format YYYY-MM'), // "YYYY-MM"
   description: z.string().max(255).optional(),
+  paymentDate: localDateSchema.optional(), // Data do lançamento de pagamento (default: hoje). Usado por importações de meses fechados.
 });
 
 export type PayInvoiceInput = z.infer<typeof payInvoiceSchema>;

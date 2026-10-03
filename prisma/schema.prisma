@@ -281,6 +281,9 @@ model Transaction {
   attachmentUrl          String?         @map("attachment_url")
   // Split expense fields
   isSplit                Boolean         @default(false) @map("is_split") // Indica se a transação é dividida entre membros
+  // Import provenance: stable id of the source row (e.g. maxfin:2026-10:credit:27, ofx:<fitid>:<hash>). Unique per household
+  // (NULLs allowed, so manual transactions are unaffected): exact dedup, idempotent re-import and race-proof double submits
+  sourceRef              String?         @map("source_ref") @db.VarChar(120)
   createdAt              DateTime        @default(now()) @map("created_at")
   updatedAt              DateTime        @updatedAt @map("updated_at")
 
@@ -305,6 +308,7 @@ model Transaction {
   @@index([date])
   @@index([recurringTransactionId])
   @@index([installmentId])
+  @@unique([householdId, sourceRef])
   @@map("transactions")
 }
 

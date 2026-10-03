@@ -189,6 +189,7 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
         ...(input.installmentId && { installmentId: input.installmentId }),
         ...(input.installmentNumber && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments && { totalInstallments: input.totalInstallments }),
+        ...(input.sourceRef && { sourceRef: input.sourceRef }),
         ...(input.attachmentUrl && { attachmentUrl: input.attachmentUrl }),
       },
       include: {
@@ -1200,7 +1201,7 @@ export async function batchCreateTransactions(input: BatchCreateTransactionsInpu
   // Execute batch creation
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const created = await tx.transaction.createMany({
-      data: transactionsData.map((t: { accountId: string; categoryName: string; amount: number; description?: string; date: Date; notes?: string; paid: boolean; recurringTransactionId?: string; installmentId?: string; installmentNumber?: number; totalInstallments?: number }) => {
+      data: transactionsData.map((t: { accountId: string; categoryName: string; amount: number; description?: string; date: Date; notes?: string; paid: boolean; recurringTransactionId?: string; installmentId?: string; installmentNumber?: number; totalInstallments?: number; sourceRef?: string }) => {
         const isInc = isIncomeForCategory(t.categoryName);
         return {
           householdId,
@@ -1216,6 +1217,7 @@ export async function batchCreateTransactions(input: BatchCreateTransactionsInpu
           ...(t.installmentId && { installmentId: t.installmentId }),
           ...(t.installmentNumber && { installmentNumber: t.installmentNumber }),
           ...(t.totalInstallments && { totalInstallments: t.totalInstallments }),
+          ...(t.sourceRef && { sourceRef: t.sourceRef }),
         };
       }),
     });
@@ -1988,7 +1990,7 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
   }
   const accountId = input.accountId;
 
-  const { sourceAccountId, amount, month, description } = input;
+  const { sourceAccountId, amount, month, description, paymentDate } = input;
 
   // Parse month
   const [year, monthNum] = month.split('-').map(Number);
@@ -2189,7 +2191,7 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
         categoryName: CategoryName.OTHER_EXPENSES,
         amount: new Prisma.Decimal(amountToPay),
         description: description || `Pagamento de fatura - ${month}`,
-        date: new Date(),
+        date: paymentDate ?? new Date(),
         paid: true,
         attachmentUrl: technicalIdentifier,
       },

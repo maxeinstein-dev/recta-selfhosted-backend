@@ -292,6 +292,7 @@ export async function transactionRoutes(app: FastifyInstance) {
         properties: {
           amount: { type: 'number' },
           category: { type: 'string' },
+          sourceRef: { type: 'string', maxLength: 120 },
         },
       },
       response: {
@@ -646,6 +647,7 @@ export async function transactionRoutes(app: FastifyInstance) {
             month: { type: 'string', pattern: '^\\d{4}-\\d{2}$' },
             description: { type: 'string' },
             householdId: { type: 'string', format: 'uuid' },
+            paymentDate: { type: 'string', format: 'date' },
           },
         },
         response: {
