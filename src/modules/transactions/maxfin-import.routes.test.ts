@@ -5,7 +5,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { ForbiddenError } from '../../shared/errors/app-error.js';
 import { errorHandler } from '../../shared/errors/error-handler.js';
 import { requireEditor } from '../../shared/middleware/authorization.middleware.js';
-import { buildMaxFinPreview, confirmMaxFinImport, resolveMaxFinAccounts } from './maxfin-import.service.js';
+import { buildXlsx } from '../../shared/xlsx/__fixtures__/build-xlsx.js';
+import {
+  buildMaxFinPreview,
+  buildMaxFinWorkbookPreview,
+  confirmMaxFinImport,
+  resolveMaxFinAccounts,
+} from './maxfin-import.service.js';
 import { maxfinImportRoutes } from './maxfin-import.routes.js';
 
 vi.mock('../../shared/middleware/auth.middleware.js', () => ({
@@ -19,6 +25,7 @@ vi.mock('../../shared/middleware/authorization.middleware.js', () => ({
 vi.mock('./maxfin-import.service.js', () => ({
   resolveMaxFinAccounts: vi.fn(),
   buildMaxFinPreview: vi.fn(),
+  buildMaxFinWorkbookPreview: vi.fn(),
   confirmMaxFinImport: vi.fn(),
 }));
 
@@ -33,6 +40,7 @@ const RESOLVED = { householdId: 'household-1' };
 const mockedRequireEditor = vi.mocked(requireEditor);
 const mockedResolve = vi.mocked(resolveMaxFinAccounts);
 const mockedPreview = vi.mocked(buildMaxFinPreview);
+const mockedWorkbookPreview = vi.mocked(buildMaxFinWorkbookPreview);
 const mockedConfirm = vi.mocked(confirmMaxFinImport);
 
 let app: FastifyInstance;
@@ -58,10 +66,18 @@ beforeEach(() => {
     return RESOLVED;
   }) as never);
   mockedPreview.mockResolvedValue({ rows: [] } as never);
+  mockedWorkbookPreview.mockResolvedValue({ months: [] } as never);
   mockedConfirm.mockResolvedValue({ imported: 1 } as never);
 });
 
-function multipartBody(fields: Record<string, string>, file?: { name: string; content: Buffer }) {
+interface UploadFile {
+  name: string;
+  content: Buffer;
+  /** Content type of the file part (default text/csv). */
+  type?: string;
+}
+
+function multipartBody(fields: Record<string, string>, file?: UploadFile) {
   const boundary = `----vitest${Math.random().toString(16).slice(2)}`;
   const chunks: Buffer[] = [];
   for (const [name, value] of Object.entries(fields)) {
@@ -70,7 +86,7 @@ function multipartBody(fields: Record<string, string>, file?: { name: string; co
   if (file) {
     chunks.push(
       Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file.name}"\r\nContent-Type: text/csv\r\n\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file.name}"\r\nContent-Type: ${file.type ?? 'text/csv'}\r\n\r\n`,
       ),
       file.content,
       Buffer.from('\r\n'),
@@ -80,12 +96,17 @@ function multipartBody(fields: Record<string, string>, file?: { name: string; co
   return { payload: Buffer.concat(chunks), headers: { 'content-type': `multipart/form-data; boundary=${boundary}` } };
 }
 
-function preview(fields: Record<string, string>, file?: { name: string; content: Buffer }) {
+function preview(fields: Record<string, string>, file?: UploadFile) {
   const { payload, headers } = multipartBody(fields, file);
   return app.inject({ method: 'POST', url: '/transactions/import/maxfin/preview', payload, headers });
 }
 
 const CSV = { name: 'sheet.csv', content: Buffer.from('a,b\n1,2\n') };
+const XLSX: UploadFile = {
+  name: 'FINANCAS_2026.xlsx',
+  content: buildXlsx({ sheets: [{ name: 'OUT', rows: [['', 'Descrição']] }] }),
+  type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
 
 describe('POST /transactions/import/maxfin/preview', () => {
   it('authorizes the household while resolving the accounts and before building the preview', async () => {
@@ -127,6 +148,15 @@ describe('POST /transactions/import/maxfin/preview', () => {
     expect(mockedResolve).not.toHaveBeenCalled();
   });
 
+  it('rejects a workbook and points to the workbook preview', async () => {
+    const res = await preview({ accounts: JSON.stringify(ACCOUNTS) }, XLSX);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.message).toContain('/transactions/import/maxfin/workbook/preview');
+    expect(mockedResolve).not.toHaveBeenCalled();
+    expect(mockedWorkbookPreview).not.toHaveBeenCalled();
+  });
+
   it('rejects `accounts` that is not JSON with a 400, not a 500', async () => {
     const res = await preview({ accounts: '{not json' }, CSV);
 
@@ -150,6 +180,110 @@ describe('POST /transactions/import/maxfin/preview', () => {
     expect(res.statusCode).toBe(413);
     expect(res.json()).toMatchObject({ success: false, error: { code: 'PAYLOAD_TOO_LARGE' } });
     expect(mockedPreview).not.toHaveBeenCalled();
+  });
+});
+
+function workbookPreview(fields: Record<string, string>, file?: UploadFile) {
+  const { payload, headers } = multipartBody(fields, file);
+  return app.inject({ method: 'POST', url: '/transactions/import/maxfin/workbook/preview', payload, headers });
+}
+
+describe('POST /transactions/import/maxfin/workbook/preview', () => {
+  it('authorizes the household, then passes the workbook, the accounts and the parsed options to the service', async () => {
+    const options = { months: ['2026-01', '2026-10'], closedThrough: null, payInvoice: false, generateFutureInstallments: true };
+
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS), options: JSON.stringify(options) }, XLSX);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: true, data: { months: [] } });
+    expect(mockedRequireEditor).toHaveBeenCalledWith(expect.anything(), 'household-1');
+    expect(mockedRequireEditor.mock.invocationCallOrder[0]!).toBeLessThan(
+      mockedWorkbookPreview.mock.invocationCallOrder[0]!,
+    );
+    expect(mockedWorkbookPreview).toHaveBeenCalledWith({
+      filename: 'FINANCAS_2026.xlsx',
+      buffer: XLSX.content,
+      accounts: ACCOUNTS,
+      options,
+      resolved: RESOLVED,
+    });
+    expect(mockedPreview).not.toHaveBeenCalled();
+  });
+
+  it('passes empty options when the field is absent and accepts the extension in any case', async () => {
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS) }, { ...XLSX, name: 'PLANILHA.XLSX' });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockedWorkbookPreview).toHaveBeenCalledWith(expect.objectContaining({ filename: 'PLANILHA.XLSX', options: {} }));
+  });
+
+  it('answers 403 and never builds a preview when the caller cannot edit the household', async () => {
+    mockedRequireEditor.mockRejectedValue(new ForbiddenError('not your household'));
+
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS) }, XLSX);
+
+    expect(res.statusCode).toBe(403);
+    expect(mockedWorkbookPreview).not.toHaveBeenCalled();
+  });
+
+  it('rejects a request without a file', async () => {
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS) });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'BAD_REQUEST' } });
+    expect(mockedResolve).not.toHaveBeenCalled();
+  });
+
+  it('rejects a .csv upload and points to the CSV preview', async () => {
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS) }, CSV);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.message).toContain('/transactions/import/maxfin/preview');
+    expect(mockedResolve).not.toHaveBeenCalled();
+    expect(mockedWorkbookPreview).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['a month that is not a calendar month', { months: ['2026-13'] }],
+    ['a month without zero padding', { months: ['2026-1'] }],
+    ['months that is not an array', { months: '2026-01' }],
+    ['more than 60 months', { months: Array.from({ length: 61 }, () => '2026-01') }],
+    ['a malformed closedThrough', { closedThrough: '2026-00' }],
+    ['a closedThrough that is not a string', { closedThrough: 202609 }],
+    ['a payInvoice that is not a boolean', { payInvoice: 'yes' }],
+    ['a generateFutureInstallments that is not a boolean', { generateFutureInstallments: 1 }],
+  ])('rejects options with %s before resolving anything', async (_label, options) => {
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS), options: JSON.stringify(options) }, XLSX);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'VALIDATION_ERROR' } });
+    expect(mockedResolve).not.toHaveBeenCalled();
+    expect(mockedWorkbookPreview).not.toHaveBeenCalled();
+  });
+
+  it('rejects options that are not JSON', async () => {
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS), options: '{months' }, XLSX);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'BAD_REQUEST' } });
+  });
+
+  it('rejects account ids that are not UUIDs', async () => {
+    const res = await workbookPreview({ accounts: JSON.stringify({ ...ACCOUNTS, bills: 'abc' }) }, XLSX);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'VALIDATION_ERROR' } });
+    expect(mockedResolve).not.toHaveBeenCalled();
+  });
+
+  it('answers 413 (not 500) when the file is over the 5 MB limit', async () => {
+    const big = { name: 'big.xlsx', content: Buffer.alloc(5 * 1024 * 1024 + 4096, 97) };
+
+    const res = await workbookPreview({ accounts: JSON.stringify(ACCOUNTS) }, big);
+
+    expect(res.statusCode).toBe(413);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'PAYLOAD_TOO_LARGE' } });
+    expect(mockedWorkbookPreview).not.toHaveBeenCalled();
   });
 });
 

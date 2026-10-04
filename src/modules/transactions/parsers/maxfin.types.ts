@@ -56,12 +56,17 @@ export interface MaxFinRow {
   /** Índice 1-based da linha lógica na grade (após o tokenizador), para rastreio e sourceRef. */
   sourceLine: number;
   section: MaxFinSectionKey;
+  /**
+   * Tipo do bloco (INCOME em entradas, EXPENSE nos outros), invertido quando o valor da planilha é negativo:
+   * estorno num bloco de despesa vira crédito (INCOME) e valor negativo em entradas vira débito (EXPENSE),
+   * sempre no mesmo bloco (e portanto na mesma conta).
+   */
   type: 'INCOME' | 'EXPENSE';
   /** Coluna B, com trim. Mantém "N/M" e "+K" quando existirem. */
   description: string;
   /** Coluna C com trim; para renda com C vazia, a própria descrição; '' quando não há chave. */
   categoryKey: string;
-  /** Valor positivo pela regra: Recebido/Realizado quando ≠ 0, senão Previsto. */
+  /** Valor absoluto pela regra: Recebido/Realizado quando ≠ 0, senão Previsto (o sinal decide o `type`). */
   amount: number;
   /** Previsto (D para renda, G para despesa), ou null. */
   planned: number | null;
@@ -73,7 +78,10 @@ export interface MaxFinRow {
   date: Date;
   /** Coluna J (trim) ou null. */
   rawNote: string | null;
-  /** rawNote + notas geradas ("previsto R$ x", "antecipou K parcelas (N+1..N+K)"), separadas por " · ". */
+  /**
+   * rawNote + notas geradas ("previsto R$ x", "antecipou K parcelas (N+1..N+K)",
+   * "valor negativo na planilha: lançado como crédito|débito"), separadas por " · ".
+   */
   notes: string | null;
   /** Coluna A ("ok", "-") ou null. */
   flag: string | null;
@@ -93,7 +101,7 @@ export interface MaxFinSectionSummary {
   key: MaxFinSectionKey;
   label: string;
   count: number;
-  /** Soma dos `amount` das linhas aceitas da seção. */
+  /** Soma líquida das linhas aceitas: as do tipo do bloco menos as de tipo invertido (valores negativos), como o Total da planilha. */
   sum: number;
   /** Previsto da linha "Total" da planilha (null para entradas, que não têm Total). */
   sheetTotalPlanned: number | null;
@@ -109,7 +117,8 @@ export interface MaxFinMonth {
 
 export interface MaxFinParseResult {
   month: MaxFinMonth | null;
-  monthSource: 'title' | 'filename' | 'override' | 'none';
+  /** 'sheet' = mês do nome da aba (sheetName), que vale mais que o título quando os dois divergem. */
+  monthSource: 'title' | 'sheet' | 'filename' | 'override' | 'none';
   rows: MaxFinRow[];
   skipped: MaxFinSkippedRow[];
   sections: MaxFinSectionSummary[];
@@ -117,8 +126,20 @@ export interface MaxFinParseResult {
 }
 
 export interface MaxFinParseOptions {
-  /** Nome do arquivo enviado, usado como fallback para detectar o mês ("FINANÇAS_MAX_2026.xlsx - OUT.csv"). */
+  /** Nome do arquivo enviado, usado como fallback para detectar o mês ("FINANÇAS_2026.xlsx - OUT.csv"). */
   filename?: string;
-  /** Mês informado pelo usuário quando a detecção falha. Tem precedência sobre título e nome do arquivo. */
+  /**
+   * Nome da aba ("OUT", "Março 2026"). Um mês nele vale mais que o título (abas copiadas de outra costumam
+   * manter o título antigo; a divergência gera aviso com o ano usado e o motivo). O ano: do próprio nome; senão,
+   * se o título diz o mesmo mês, o do título; se diz outro mês, o do nome do arquivo, senão o do título (o
+   * seguinte quando o mês da aba vem antes do mês do título: a cópia é feita depois da original); sem mês no
+   * título, o do nome do arquivo, senão `fallbackYear`.
+   */
+  sheetName?: string;
+  /** Ano do nome do arquivo enviado, quando o chamador o tem sem `filename` (pasta de trabalho: o nome nunca dá o mês). */
+  fileYear?: number;
+  /** Último recurso para o ano de um mês tirado do nome da aba (pasta de trabalho: o ano comum às abas com título). */
+  fallbackYear?: number;
+  /** Mês informado pelo usuário quando a detecção falha. Tem precedência sobre aba, título e nome do arquivo. */
   monthOverride?: MaxFinMonth;
 }

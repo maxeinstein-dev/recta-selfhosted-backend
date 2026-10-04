@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { authMiddleware, getAuthUser } from '../../shared/middleware/auth.middleware.js';
 import {
@@ -9,6 +9,7 @@ import { BadRequestError } from '../../shared/errors/app-error.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import {
   buildMaxFinPreview,
+  buildMaxFinWorkbookPreview,
   confirmMaxFinImport,
   resolveMaxFinAccounts,
 } from './maxfin-import.service.js';
@@ -56,6 +57,15 @@ export const maxfinPreviewOptionsSchema = z.object({
   payInvoice: z.boolean().optional(),
   generateFutureInstallments: z.boolean().optional(),
   monthOverride: maxfinMonthSchema.optional(),
+});
+
+const MONTH_KEY = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+export const maxfinWorkbookOptionsSchema = z.object({
+  months: z.array(z.string().regex(MONTH_KEY, 'months must be YYYY-MM')).max(60).optional(),
+  closedThrough: z.string().regex(MONTH_KEY, 'closedThrough must be YYYY-MM').nullable().optional(),
+  payInvoice: z.boolean().optional(),
+  generateFutureInstallments: z.boolean().optional(),
 });
 
 const importOptionsSchema = z.object({
@@ -112,6 +122,35 @@ export const maxfinConfirmBodySchema = z.object({
     .max(500),
 });
 
+interface MaxFinUpload {
+  /** Name of the first file part (undefined when the client sent none). */
+  filename: string | undefined;
+  buffer: Buffer | null;
+  accountsRaw: unknown;
+  optionsRaw: unknown;
+}
+
+/** Reads the multipart body of a preview: the first `file` part, `accounts` and `options`. */
+async function readMaxFinUpload(request: FastifyRequest): Promise<MaxFinUpload> {
+  const upload: MaxFinUpload = { filename: undefined, buffer: null, accountsRaw: undefined, optionsRaw: undefined };
+  for await (const part of request.parts()) {
+    if (part.type === 'file') {
+      // First file part wins; others must still be consumed so the stream drains.
+      if (!upload.buffer) {
+        upload.filename = part.filename ?? undefined;
+        upload.buffer = await part.toBuffer();
+      } else {
+        await part.toBuffer();
+      }
+    } else if (part.fieldname === 'accounts') {
+      upload.accountsRaw = part.value;
+    } else if (part.fieldname === 'options') {
+      upload.optionsRaw = part.value;
+    }
+  }
+  return upload;
+}
+
 function parseJsonField(name: string, raw: unknown): unknown {
   if (raw === undefined || raw === null || raw === '') return undefined;
   if (typeof raw !== 'string') return raw;
@@ -148,32 +187,15 @@ export async function maxfinImportRoutes(app: FastifyInstance) {
       },
     },
   }, async (request, reply) => {
-    let accountsRaw: unknown;
-    let optionsRaw: unknown;
-    let filename = 'upload.csv';
-    let buffer: Buffer | null = null;
-
-    for await (const part of request.parts()) {
-      if (part.type === 'file') {
-        // First file part wins; others must still be consumed so the stream drains.
-        if (!buffer) {
-          filename = part.filename ?? 'upload.csv';
-          buffer = await part.toBuffer();
-        } else {
-          await part.toBuffer();
-        }
-      } else if (part.fieldname === 'accounts') {
-        accountsRaw = part.value;
-      } else if (part.fieldname === 'options') {
-        optionsRaw = part.value;
-      }
-    }
+    const { filename = 'upload.csv', buffer, accountsRaw, optionsRaw } = await readMaxFinUpload(request);
 
     if (!buffer) {
       throw new BadRequestError('A .csv file is required in the "file" field.');
     }
     if (!filename.toLowerCase().endsWith('.csv')) {
-      throw new BadRequestError('Only .csv files are accepted by the MaxFin importer (XLSX support is planned).');
+      throw new BadRequestError(
+        'Only .csv files are accepted here; send .xlsx workbooks to POST /transactions/import/maxfin/workbook/preview.',
+      );
     }
 
     const accounts = maxfinAccountsSchema.parse(parseJsonField('accounts', accountsRaw));
@@ -183,6 +205,49 @@ export async function maxfinImportRoutes(app: FastifyInstance) {
     const resolved = await resolveMaxFinAccounts(accounts, (householdId) => requireEditor(request, householdId));
 
     const preview = await buildMaxFinPreview({ filename, buffer, accounts, options, resolved });
+    return reply.send({ success: true, data: preview });
+  });
+
+  /**
+   * POST /transactions/import/maxfin/workbook/preview — multipart/form-data ONLY.
+   * Fields: `file` (.xlsx, max 5MB), `accounts` (JSON: {income, bills, credit, debit}),
+   * `options` (JSON, optional: months, closedThrough, payInvoice, generateFutureInstallments).
+   * Reads every tab, previews each selected month like the CSV preview and merges the category maps.
+   * Nothing is persisted; months are confirmed one by one with /import/maxfin/confirm.
+   */
+  app.post('/import/maxfin/workbook/preview', {
+    schema: {
+      description:
+        'Preview a MaxFin workbook import (multipart/form-data: file field `file` (.xlsx, max 5MB) + text fields `accounts` (JSON {income,bills,credit,debit} account ids) and optional `options` (JSON {months?: ["YYYY-MM"], closedThrough?: "YYYY-MM" | null, payInvoice?: boolean, generateFutureInstallments?: boolean})). Every tab is listed as selected, available or skipped (with the reason); each selected month (default: every month tab up to the current month) comes back as a full monthly preview, the same the CSV preview gives, with its own options (closed up to closedThrough, by default the previous month; future installments only from the latest month), plus one category map merged across them. Nothing is persisted: confirm month by month with POST /transactions/import/maxfin/confirm. Requires EDITOR+ on the accounts household.',
+      tags: ['Transactions'],
+      security: [{ bearerAuth: [] }],
+      consumes: ['multipart/form-data'],
+      response: {
+        200: okResponseSchema,
+        400: errorResponseSchema,
+        403: errorResponseSchema,
+        404: errorResponseSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const { filename = 'upload.xlsx', buffer, accountsRaw, optionsRaw } = await readMaxFinUpload(request);
+
+    if (!buffer) {
+      throw new BadRequestError('An .xlsx file is required in the "file" field.');
+    }
+    if (!filename.toLowerCase().endsWith('.xlsx')) {
+      throw new BadRequestError(
+        'Only .xlsx workbooks are accepted here; send a tab exported as .csv to POST /transactions/import/maxfin/preview.',
+      );
+    }
+
+    const accounts = maxfinAccountsSchema.parse(parseJsonField('accounts', accountsRaw));
+    const options = maxfinWorkbookOptionsSchema.parse(parseJsonField('options', optionsRaw) ?? {});
+
+    // Authorization runs inside the resolution, for every household involved, before any mixed-selection error.
+    const resolved = await resolveMaxFinAccounts(accounts, (householdId) => requireEditor(request, householdId));
+
+    const preview = await buildMaxFinWorkbookPreview({ filename, buffer, accounts, options, resolved });
     return reply.send({ success: true, data: preview });
   });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CategoryName } from '../../shared/enums/index.js';
-import type { MaxFinInstallment, MaxFinMonth, MaxFinRow } from './parsers/maxfin.types.js';
+import type { MaxFinInstallment, MaxFinMonth, MaxFinRow, MaxFinSectionKey } from './parsers/maxfin.types.js';
 import {
   addMonths,
   buildCategoryMap,
@@ -11,6 +11,7 @@ import {
   invoiceTechnicalId,
   isFutureDraftRef,
   legacyKey,
+  mergeCategoryMaps,
   missingFutureNumbers,
   parseLocalDateString,
   storedDateString,
@@ -22,6 +23,7 @@ import {
   normalizeLabel,
   suggestCategory,
   sumAmounts,
+  invoiceNetAmount,
   type CustomCategoryRef,
 } from './maxfin-import.helpers.js';
 
@@ -245,6 +247,27 @@ describe('buildCategoryMap', () => {
     ]);
   });
 
+  it('suggests the default category for an unknown label used only by refunds', () => {
+    const rows = [
+      makeRow({ section: 'credit', type: 'INCOME', categoryKey: 'Lazer Teste' }),
+      makeRow({ section: 'income', type: 'EXPENSE', categoryKey: 'Ajuste Teste' }),
+    ];
+
+    expect(buildCategoryMap(rows, []).map((e) => [e.type, e.key, e.suggestion])).toEqual([
+      ['INCOME', 'Lazer Teste', { kind: 'default', categoryName: CategoryName.OTHER_INCOME }],
+      ['EXPENSE', 'Ajuste Teste', { kind: 'default', categoryName: CategoryName.OTHER_EXPENSES }],
+    ]);
+  });
+
+  it('keeps creating the category when the label is also used by regular rows of that type', () => {
+    const rows = [
+      makeRow({ section: 'income', type: 'INCOME', categoryKey: 'Bico Teste' }),
+      makeRow({ section: 'credit', type: 'INCOME', categoryKey: 'Bico Teste' }),
+    ];
+
+    expect(buildCategoryMap(rows, [])[0]?.suggestion).toEqual({ kind: 'create', name: 'Bico Teste' });
+  });
+
   it('keeps the same key separate per type', () => {
     const rows = [
       makeRow({ section: 'income', categoryKey: 'Aluguel' }),
@@ -458,14 +481,16 @@ describe('day strings', () => {
   });
 
   it('gives the same legacy key to a parsed row and to the stored row of the same day', () => {
-    const parsed = legacyKey('acc', toLocalDateString(new Date(2026, 1, 1)), 12.34, ' Padaria ');
-    const stored = legacyKey('acc', storedDateString(new Date('2026-02-01T00:00:00.000Z')), 12.34, 'Padaria');
+    const parsed = legacyKey('acc', toLocalDateString(new Date(2026, 1, 1)), 12.34, ' Padaria ', 'EXPENSE');
+    const stored = legacyKey('acc', storedDateString(new Date('2026-02-01T00:00:00.000Z')), 12.34, 'Padaria', 'EXPENSE');
     expect(stored).toBe(parsed);
-    expect(parsed).toBe('acc|2026-02-01|12.34|Padaria');
+    expect(parsed).toBe('acc|2026-02-01|12.34|Padaria|EXPENSE');
   });
 
   it('keeps cents in the legacy key', () => {
-    expect(legacyKey('acc', '2026-02-01', 4.2, 'x')).toBe('acc|2026-02-01|4.20|x');
+    expect(legacyKey('acc', '2026-02-01', 4.2, 'x', 'EXPENSE')).toBe('acc|2026-02-01|4.20|x|EXPENSE');
+    // Amounts are absolute: an expense and a credit of the same value are different rows.
+    expect(legacyKey('acc', '2026-02-01', 4.2, 'x', 'INCOME')).not.toBe(legacyKey('acc', '2026-02-01', 4.2, 'x', 'EXPENSE'));
   });
 
   it('parses a real calendar day and rejects roll-overs and bad formats', () => {
@@ -540,5 +565,51 @@ describe('sumAmounts', () => {
     expect(sumAmounts([{ amount: 1.005 }])).toBe(1.01);
     expect(sumAmounts([{ amount: 10.004 }])).toBe(10);
     expect(sumAmounts([{ amount: 10 }, { amount: -2.5 }])).toBe(7.5);
+  });
+});
+
+describe('invoiceNetAmount', () => {
+  it('subtracts the credits (INCOME) from the purchases (EXPENSE), in cents', () => {
+    expect(invoiceNetAmount([{ type: 'EXPENSE', amount: 100.1 }, { type: 'INCOME', amount: 30.05 }])).toBe(70.05);
+    expect(invoiceNetAmount([{ type: 'EXPENSE', amount: 0.3 }, { type: 'INCOME', amount: 0.1 }])).toBe(0.2);
+  });
+
+  it('is zero for no rows and negative when the credits are larger', () => {
+    expect(invoiceNetAmount([])).toBe(0);
+    expect(invoiceNetAmount([{ type: 'EXPENSE', amount: 40 }, { type: 'INCOME', amount: 100 }])).toBe(-60);
+  });
+});
+
+describe('mergeCategoryMaps', () => {
+  const entry = (key: string, type: 'INCOME' | 'EXPENSE', count: number, sections: MaxFinSectionKey[], label = key) => ({
+    key,
+    type,
+    count,
+    sections,
+    suggestion: { label },
+  });
+
+  it('joins entries of one type and normalized key: counts summed, blocks in block order, first spelling kept', () => {
+    const merged = mergeCategoryMaps([
+      [entry('Compras', 'EXPENSE', 2, ['debit'], 'primeiro'), entry('Salário', 'INCOME', 1, ['income'])],
+      [entry(' compras ', 'EXPENSE', 1, ['credit'], 'segundo'), entry('Compras', 'INCOME', 1, ['credit']), entry('Casa', 'EXPENSE', 1, ['bills'])],
+    ]);
+
+    expect(merged).toEqual([
+      entry('Salário', 'INCOME', 1, ['income']),
+      entry('Compras', 'INCOME', 1, ['credit']),
+      entry('Casa', 'EXPENSE', 1, ['bills']),
+      entry('Compras', 'EXPENSE', 3, ['credit', 'debit'], 'primeiro'),
+    ]);
+  });
+
+  it('leaves the maps it merges untouched', () => {
+    const first = [entry('Casa', 'EXPENSE', 1, ['debit'])];
+    const second = [entry('casa', 'EXPENSE', 2, ['bills'])];
+
+    mergeCategoryMaps([first, second]);
+
+    expect(first).toEqual([entry('Casa', 'EXPENSE', 1, ['debit'])]);
+    expect(second).toEqual([entry('casa', 'EXPENSE', 2, ['bills'])]);
   });
 });

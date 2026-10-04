@@ -22,6 +22,12 @@ const EXPENSE_SECTIONS: readonly MaxFinSectionKey[] = MAXFIN_SECTION_KEYS.filter
 const EXPECTED_TOTAL_ROWS = 3;
 /** Rows scanned for the title when the header row is missing. */
 const TITLE_SCAN_LIMIT = 10;
+/**
+ * Longest cell that can still be a keyword ("Descrição", "Total", "Mês anterior") or a title: longer cells are never
+ * normalized, so a long text repeated down a column (a workbook cell holds up to 50,000 characters) stays cheap.
+ */
+const MAX_KEYWORD_CELL = 64;
+const MAX_TITLE_CELL = 1_000;
 /** Tolerance when comparing the accepted sum with the sheet "Total". */
 const SUM_TOLERANCE = 0.05;
 /** Longest values the confirm endpoint accepts; longer cells are cut here so one long row cannot reject the whole batch. */
@@ -89,7 +95,9 @@ const OWED_BY_ME_REGEX = /^pagar\s+[aà]\s+(.+)$/i;
 const SKIP_REASON_CARRY_OVER = 'Mês anterior';
 const SKIP_REASON_NO_VALUE = 'sem valor';
 const SKIP_REASON_ZERO = 'valor zero';
-const SKIP_REASON_NEGATIVE = 'valor negativo';
+/** Generated notes of a row whose value is negative in the sheet (its type is flipped). */
+const NOTE_NEGATIVE_AS_CREDIT = 'valor negativo na planilha: lançado como crédito';
+const NOTE_NEGATIVE_AS_DEBIT = 'valor negativo na planilha: lançado como débito';
 
 interface SheetTotals {
   planned: number | null;
@@ -118,12 +126,27 @@ function stripAccents(text: string): string {
   return text.normalize('NFD').replace(/[̀-ͯ]/g, '');
 }
 
+/** Normalized cell when it is short enough to be a keyword, otherwise null (it is none). */
+function keywordOf(text: string): string | null {
+  const trimmed = text.trim();
+  return trimmed.length <= MAX_KEYWORD_CELL ? normalizeCell(trimmed) : null;
+}
+
 function normalizeCell(text: string): string {
   return stripAccents(text.trim().toLowerCase());
 }
 
 function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+/** Type of the rows of a block when the sheet value is positive. */
+function blockTypeOf(section: MaxFinSectionKey): MaxFinRow['type'] {
+  return section === 'income' ? 'INCOME' : 'EXPENSE';
+}
+
+function oppositeType(type: MaxFinRow['type']): MaxFinRow['type'] {
+  return type === 'INCOME' ? 'EXPENSE' : 'INCOME';
 }
 
 /** 5000 -> "R$ 5.000,00"; -156 -> "-R$ 156,00". */
@@ -259,48 +282,157 @@ export function detectMonthFromTitle(text: string): MaxFinMonth | null {
   return { year: Number(match[2]), month: monthFromName(match[1] ?? '') };
 }
 
-/**
- * "FINANÇAS_MAX_2026.xlsx - OUT.csv" -> { year: 2026, month: 10 }. Needs a
- * standalone month token (abbreviation or full name) and a 4-digit year.
- */
-export function detectMonthFromFilename(filename: string): MaxFinMonth | null {
-  const normalized = stripAccents(filename.toLowerCase());
-  const yearMatch = YEAR_REGEX.exec(normalized);
-  if (!yearMatch) return null;
-  const year = Number(yearMatch[1]);
-
-  for (const token of normalized.match(/[a-z]+/g) ?? []) {
+/** First standalone month token (abbreviation or full name), accent/case-insensitive: "OUT" -> 10. */
+function monthTokenOf(name: string): number | null {
+  for (const token of stripAccents(name.toLowerCase()).match(/[a-z]+/g) ?? []) {
     const byAbbreviation = (MONTH_ABBREVIATIONS as readonly string[]).indexOf(token);
-    if (byAbbreviation >= 0) return { year, month: byAbbreviation + 1 };
+    if (byAbbreviation >= 0) return byAbbreviation + 1;
     const byName = monthFromName(token);
-    if (byName > 0) return { year, month: byName };
+    if (byName > 0) return byName;
   }
   return null;
 }
 
+/** First standalone 4-digit number of a name: "FINANÇAS_2026.xlsx" -> 2026. */
+export function detectYearFromName(name: string): number | null {
+  const match = YEAR_REGEX.exec(name);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * "FINANÇAS_2026.xlsx - OUT.csv" -> { year: 2026, month: 10 }. Needs a
+ * standalone month token (abbreviation or full name) and a 4-digit year.
+ */
+export function detectMonthFromFilename(filename: string): MaxFinMonth | null {
+  const year = detectYearFromName(filename);
+  if (year === null) return null;
+  const month = monthTokenOf(filename);
+  return month === null ? null : { year, month };
+}
+
+/**
+ * Splits a file named like Google Sheets' download of one tab, "<workbook> - <tab>.csv", at the last " - "
+ * ("FINANÇAS_2026.xlsx - OUT.csv" -> "FINANÇAS_2026.xlsx" and "OUT"). Null for any other name. No regex: the
+ * name comes from the upload (part headers reach 80 KB) and a backtracking pattern was quadratic on it.
+ */
+function splitCsvDownloadName(filename: string): { workbook: string; tab: string } | null {
+  if (filename.length < 4 || filename.slice(-4).toLowerCase() !== '.csv') return null;
+  const body = filename.slice(0, -4);
+  const cut = body.lastIndexOf(' - ');
+  if (cut < 0) return null;
+  const tab = body.slice(cut + 3).trim();
+  return tab ? { workbook: body.slice(0, cut), tab } : null;
+}
+
+/** Tab name of a "<workbook> - <tab>.csv" download ("FINANÇAS_2026.xlsx - OUT.csv" -> "OUT"), null otherwise. */
+export function sheetNameFromCsvFilename(filename: string): string | null {
+  return splitCsvDownloadName(filename)?.tab ?? null;
+}
+
+/** Accented month names for messages, index = month - 1. */
+const MONTH_LABELS = [
+  'janeiro',
+  'fevereiro',
+  'março',
+  'abril',
+  'maio',
+  'junho',
+  'julho',
+  'agosto',
+  'setembro',
+  'outubro',
+  'novembro',
+  'dezembro',
+] as const;
+
+export function monthLabel({ year, month }: MaxFinMonth): string {
+  return `${MONTH_LABELS[month - 1] ?? month}/${year}`;
+}
+
+const YEAR_FROM_TAB_NAME = 'ano do nome da aba';
+const YEAR_FROM_FILE_NAME = 'ano do nome do arquivo';
+const YEAR_FROM_TITLE = 'ano do título';
+const YEAR_AFTER_TITLE = 'ano seguinte ao do título: a aba é uma cópia feita depois dele';
+const YEAR_FROM_OTHER_TABS = 'ano das outras abas';
+
+/**
+ * Year of a month read from the tab name, and why. When the title names the same month: the tab name's year,
+ * else the title's. When the title names another month (a tab copied from another one): the tab name's year,
+ * else the file name's (for a "<workbook> - <tab>.csv" download, its workbook part), else the title's, moved to
+ * the next year when the tab month is earlier (a copy is made after its source: DEZ copied to JAN). Without a
+ * title month: the tab name's year, else the file name's, else `fallbackYear`.
+ */
+function sheetYear(
+  options: MaxFinParseOptions,
+  sheetName: string,
+  sheetMonth: number,
+  titleMonth: MaxFinMonth | null,
+): { year: number; reason: string } | null {
+  const nameYear = detectYearFromName(sheetName);
+  if (nameYear !== null) return { year: nameYear, reason: YEAR_FROM_TAB_NAME };
+  if (titleMonth && titleMonth.month === sheetMonth) return { year: titleMonth.year, reason: YEAR_FROM_TITLE };
+  const fileYear =
+    options.fileYear ??
+    (options.filename ? detectYearFromName(splitCsvDownloadName(options.filename)?.workbook ?? options.filename) : null);
+  if (fileYear !== null) return { year: fileYear, reason: YEAR_FROM_FILE_NAME };
+  if (titleMonth) {
+    return sheetMonth < titleMonth.month
+      ? { year: titleMonth.year + 1, reason: YEAR_AFTER_TITLE }
+      : { year: titleMonth.year, reason: YEAR_FROM_TITLE };
+  }
+  return options.fallbackYear === undefined ? null : { year: options.fallbackYear, reason: YEAR_FROM_OTHER_TABS };
+}
+
+function findTitleMonth(grid: Grid, headerIndex: number): MaxFinMonth | null {
+  const limit = headerIndex >= 0 ? headerIndex : Math.min(grid.length, TITLE_SCAN_LIMIT);
+  for (let index = 0; index < limit; index++) {
+    for (const cell of grid[index] ?? []) {
+      if (cell.length > MAX_TITLE_CELL) continue;
+      const month = detectMonthFromTitle(cell);
+      if (month) return month;
+    }
+  }
+  return null;
+}
+
+/**
+ * Order: monthOverride > month token of the tab name > title > file name. The tab name only gives the month;
+ * sheetYear picks its year. A title that names another month (a tab copied from another one) loses to the tab
+ * name, with a warning that says which year was used and why.
+ */
 function resolveMonth(
   grid: Grid,
   headerIndex: number,
   options: MaxFinParseOptions,
-): Pick<MaxFinParseResult, 'month' | 'monthSource'> {
+): Pick<MaxFinParseResult, 'month' | 'monthSource'> & { warning: string | null } {
   if (options.monthOverride) {
     const { year, month } = options.monthOverride;
-    return { month: { year, month }, monthSource: 'override' };
+    return { month: { year, month }, monthSource: 'override', warning: null };
   }
 
-  const limit = headerIndex >= 0 ? headerIndex : Math.min(grid.length, TITLE_SCAN_LIMIT);
-  for (let index = 0; index < limit; index++) {
-    for (const cell of grid[index] ?? []) {
-      const month = detectMonthFromTitle(cell);
-      if (month) return { month, monthSource: 'title' };
+  const titleMonth = findTitleMonth(grid, headerIndex);
+  const sheetMonthNumber = options.sheetName === undefined ? null : monthTokenOf(options.sheetName);
+  if (options.sheetName !== undefined && sheetMonthNumber !== null) {
+    const choice = sheetYear(options, options.sheetName, sheetMonthNumber, titleMonth);
+    if (choice) {
+      const sheetMonth: MaxFinMonth = { year: choice.year, month: sheetMonthNumber };
+      if (titleMonth && titleMonth.year === choice.year && titleMonth.month === sheetMonthNumber) {
+        return { month: titleMonth, monthSource: 'title', warning: null };
+      }
+      const warning = titleMonth
+        ? `O título da aba diz ${monthLabel(titleMonth)}, mas a aba se chama "${options.sheetName}": usei ${monthLabel(sheetMonth)} (${choice.reason}).`
+        : null;
+      return { month: sheetMonth, monthSource: 'sheet', warning };
     }
   }
 
+  if (titleMonth) return { month: titleMonth, monthSource: 'title', warning: null };
+
   if (options.filename) {
     const month = detectMonthFromFilename(options.filename);
-    if (month) return { month, monthSource: 'filename' };
+    if (month) return { month, monthSource: 'filename', warning: null };
   }
-  return { month: null, monthSource: 'none' };
+  return { month: null, monthSource: 'none', warning: null };
 }
 
 function describePrepaid({ number, prepaid }: MaxFinInstallment): string {
@@ -316,7 +448,9 @@ function buildSections(
 ): MaxFinSectionSummary[] {
   return MAXFIN_SECTION_KEYS.map((key) => {
     const sectionRows = rows.filter((row) => row.section === key);
-    const sum = round2(sectionRows.reduce((acc, row) => acc + row.amount, 0));
+    // Net of the block, like the sheet Total: rows of the opposite type (negative values) count against it.
+    const blockType = blockTypeOf(key);
+    const sum = round2(sectionRows.reduce((acc, row) => acc + (row.type === blockType ? row.amount : -row.amount), 0));
     const { planned, realized } = sheetTotals[key];
     const label = MAXFIN_SECTION_LABELS[key];
 
@@ -341,8 +475,13 @@ function buildSections(
  * A "Total" row closes a block. The whole cell is the word (optionally followed by ":"), so an expense called
  * "TotalPass" or "Total Pass" is a row, not a block delimiter, whatever its category cell holds.
  */
-function isTotalRow(normalizedDescription: string): boolean {
-  return /^total\s*:?$/.test(normalizedDescription);
+function isTotalRow(keyword: string | null): boolean {
+  return keyword !== null && /^total\s*:?$/.test(keyword);
+}
+
+/** Index of the header row (column B reads "Descrição", whatever the case, accents and spaces), or -1. */
+export function findMaxFinHeaderIndex(grid: Grid): number {
+  return grid.findIndex((row) => keywordOf(row[1] ?? '') === 'descricao');
 }
 
 export function parseMaxFinGrid(
@@ -359,8 +498,9 @@ export function parseMaxFinGrid(
     debit: { planned: null, realized: null },
   };
 
-  const headerIndex = grid.findIndex((row) => normalizeCell(row[1] ?? '') === 'descricao');
-  const { month, monthSource } = resolveMonth(grid, headerIndex, options);
+  const headerIndex = findMaxFinHeaderIndex(grid);
+  const { month, monthSource, warning } = resolveMonth(grid, headerIndex, options);
+  if (warning) warnings.push(warning);
   if (!month) {
     warnings.push('Não foi possível identificar o mês da planilha; informe o mês manualmente.');
   }
@@ -378,9 +518,9 @@ export function parseMaxFinGrid(
   for (let index = headerIndex + 1; index < grid.length; index++) {
     const sourceLine = index + 1;
     const cells = readCells(grid[index] ?? []);
-    const normalizedDescription = normalizeCell(cells.description);
+    const keyword = keywordOf(cells.description);
 
-    if (isTotalRow(normalizedDescription)) {
+    if (isTotalRow(keyword)) {
       const totalSection = EXPENSE_SECTIONS[totalsSeen];
       if (totalSection) {
         sheetTotals[totalSection] = {
@@ -395,7 +535,7 @@ export function parseMaxFinGrid(
     }
 
     if (cells.description.length === 0) continue;
-    if (normalizedDescription === 'mes anterior') {
+    if (keyword === 'mes anterior') {
       skipped.push({ sourceLine, description: cells.description, reason: SKIP_REASON_CARRY_OVER });
       continue;
     }
@@ -419,16 +559,18 @@ export function parseMaxFinGrid(
     const planned = parseMoneyBR(isIncome ? cells.incomePlanned : cells.expensePlanned);
     const realized = parseMoneyBR(isIncome ? cells.incomeRealized : cells.expenseRealized);
     const hasRealized = realized !== null && realized !== 0;
-    const amount = hasRealized ? realized : planned;
+    const value = hasRealized ? realized : planned;
 
-    if (amount === null || amount === 0) {
+    if (value === null || value === 0) {
       skipped.push({ sourceLine, description: cells.description, reason: SKIP_REASON_ZERO });
       continue;
     }
-    if (amount < 0) {
-      skipped.push({ sourceLine, description: cells.description, reason: SKIP_REASON_NEGATIVE });
-      continue;
-    }
+    // A negative value stays in its block (so on the same account) with the opposite type: a refund or
+    // reversal in an expense block is a credit, a negative entry in the income block is a debit.
+    const negative = value < 0;
+    const blockType = blockTypeOf(section);
+    const type = negative ? oppositeType(blockType) : blockType;
+    const amount = Math.abs(value);
 
     const { installment, invalid } = matchInstallment(cells.description);
     if (invalid) {
@@ -442,13 +584,16 @@ export function parseMaxFinGrid(
     if (installment && installment.prepaid > 0) {
       generatedNotes.push(describePrepaid(installment));
     }
+    if (negative) {
+      generatedNotes.push(type === 'INCOME' ? NOTE_NEGATIVE_AS_CREDIT : NOTE_NEGATIVE_AS_DEBIT);
+    }
     const rawNote = cells.note.length > 0 ? cells.note : null;
     const notes = [rawNote, ...generatedNotes].filter((note): note is string => Boolean(note));
 
     rows.push({
       sourceLine,
       section,
-      type: isIncome ? 'INCOME' : 'EXPENSE',
+      type,
       description: clampText(cells.description, MAX_DESCRIPTION_LENGTH),
       categoryKey: clampText(
         cells.category.length > 0 ? cells.category : isIncome ? cells.description : '',

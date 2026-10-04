@@ -112,7 +112,14 @@ const SECTION_ORDER = Object.fromEntries(MAXFIN_SECTION_KEYS.map((key, index) =>
 interface CategoryMapAccumulator {
   normalized: string;
   firstSection: MaxFinSectionKey;
+  /** Every row of the entry had its type inverted by a negative value (a refund in an expense block). */
+  allReversed: boolean;
   entry: CategoryMapEntry;
+}
+
+/** A negative value inverts the type of its block: INCOME in bills/credit/debit, EXPENSE in income. */
+function isReversedRow(row: MaxFinRow): boolean {
+  return (row.section === 'income') !== (row.type === 'INCOME');
 }
 
 /**
@@ -133,6 +140,7 @@ export function buildCategoryMap(rows: MaxFinRow[], customs: CustomCategoryRef[]
       acc = {
         normalized,
         firstSection: row.section,
+        allReversed: true,
         entry: {
           key: row.categoryKey.trim(),
           type: row.type,
@@ -144,20 +152,84 @@ export function buildCategoryMap(rows: MaxFinRow[], customs: CustomCategoryRef[]
       byKey.set(id, acc);
     }
     acc.entry.count += 1;
+    acc.allReversed = acc.allReversed && isReversedRow(row);
     if (!acc.entry.sections.includes(row.section)) {
       acc.entry.sections.push(row.section);
     }
   }
 
   return [...byKey.values()]
-    .sort((a, b) => {
-      if (a.entry.type !== b.entry.type) return a.entry.type === 'INCOME' ? -1 : 1;
-      const bySection = SECTION_ORDER[a.firstSection] - SECTION_ORDER[b.firstSection];
-      if (bySection !== 0) return bySection;
-      if (a.normalized === b.normalized) return 0;
-      return a.normalized < b.normalized ? -1 : 1;
-    })
-    .map((acc) => acc.entry);
+    .sort((a, b) =>
+      compareCategoryEntries(
+        { type: a.entry.type, section: a.firstSection, normalized: a.normalized },
+        { type: b.entry.type, section: b.firstSection, normalized: b.normalized },
+      ),
+    )
+    .map((acc) => {
+      // Refunds keep the label of the purchase ("Lazer"); creating an income category with that name would only
+      // clutter the list, so an unknown label used only by refunds goes to the default category of its type.
+      if (acc.allReversed && acc.entry.suggestion.kind === 'create') {
+        const categoryName = acc.entry.type === 'INCOME' ? CategoryName.OTHER_INCOME : CategoryName.OTHER_EXPENSES;
+        return { ...acc.entry, suggestion: { kind: 'default', categoryName } };
+      }
+      return acc.entry;
+    });
+}
+
+interface CategoryOrderKey {
+  type: 'INCOME' | 'EXPENSE';
+  section: MaxFinSectionKey;
+  normalized: string;
+}
+
+/** INCOME first, then by block, then by normalized key. */
+function compareCategoryEntries(a: CategoryOrderKey, b: CategoryOrderKey): number {
+  if (a.type !== b.type) return a.type === 'INCOME' ? -1 : 1;
+  const bySection = SECTION_ORDER[a.section] - SECTION_ORDER[b.section];
+  if (bySection !== 0) return bySection;
+  if (a.normalized === b.normalized) return 0;
+  return a.normalized < b.normalized ? -1 : 1;
+}
+
+/** What mergeCategoryMaps needs from an entry (a CategoryMapEntry or its DTO). */
+export interface MergeableCategoryEntry {
+  key: string;
+  type: 'INCOME' | 'EXPENSE';
+  count: number;
+  sections: MaxFinSectionKey[];
+}
+
+/**
+ * One category map for several months: entries with the same type and normalized key become one, with the
+ * counts summed and the sections joined in block order. The spelling and the suggestion come from the first map
+ * that has the entry: the workbook preview passes the months oldest first, so the oldest month's suggestion wins
+ * even when a later month alone would suggest another target (for example a label used only by refunds there).
+ * Sorted like buildCategoryMap, by the first block of the joined sections.
+ */
+export function mergeCategoryMaps<T extends MergeableCategoryEntry>(maps: T[][]): T[] {
+  const merged = new Map<string, T>();
+  for (const map of maps) {
+    for (const entry of map) {
+      const id = `${entry.type}|${normalizeLabel(entry.key)}`;
+      const existing = merged.get(id);
+      if (!existing) {
+        merged.set(id, { ...entry, sections: [...entry.sections] });
+        continue;
+      }
+      existing.count += entry.count;
+      for (const section of entry.sections) {
+        if (!existing.sections.includes(section)) existing.sections.push(section);
+      }
+    }
+  }
+  const entries = [...merged.values()];
+  for (const entry of entries) entry.sections.sort((a, b) => SECTION_ORDER[a] - SECTION_ORDER[b]);
+  const orderKey = (entry: T): CategoryOrderKey => ({
+    type: entry.type,
+    section: entry.sections[0] ?? 'income',
+    normalized: normalizeLabel(entry.key),
+  });
+  return entries.sort((a, b) => compareCategoryEntries(orderKey(a), orderKey(b)));
 }
 
 // Month arithmetic (local time; the sheet is a calendar month, dates are day 01 at local midnight)
@@ -332,9 +404,9 @@ export function invoiceTechnicalId(accountId: string, month: MaxFinMonth): strin
   return `invoice_pay:${accountId}:${month.year}-${month.month - 1}`;
 }
 
-/** Key of the "same account, same day, same amount, same description" legacy duplicate rule. */
-export function legacyKey(accountId: string, day: string, amount: number, description: string): string {
-  return `${accountId}|${day}|${amount.toFixed(2)}|${description.trim()}`;
+/** Key of the "same account, day, amount, description and type" legacy duplicate rule (amounts are absolute). */
+export function legacyKey(accountId: string, day: string, amount: number, description: string, type: string): string {
+  return `${accountId}|${day}|${amount.toFixed(2)}|${description.trim()}|${type}`;
 }
 
 /** True for the sourceRef of a future installment generated by an import (`<rowRef>:f<N>`). */
@@ -355,4 +427,13 @@ export function sumAmounts(rows: Array<{ amount: number }>): number {
   let cents = 0;
   for (const row of rows) cents += toCents(row.amount);
   return cents / 100;
+}
+
+/**
+ * What a card invoice covers, in reais: its purchases (EXPENSE) minus its credits (INCOME rows, from negative
+ * values such as refunds), added up in integer cents so no float drift creeps in. Zero or less means there is
+ * nothing to pay.
+ */
+export function invoiceNetAmount(rows: Array<{ type: 'INCOME' | 'EXPENSE'; amount: number }>): number {
+  return sumAmounts(rows.map((row) => ({ amount: row.type === 'INCOME' ? -row.amount : row.amount })));
 }
