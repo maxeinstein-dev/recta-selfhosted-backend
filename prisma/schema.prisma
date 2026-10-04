@@ -295,6 +295,7 @@ model Transaction {
   relatedAccount       Account?              @relation("TransactionRelatedAccount", fields: [relatedEntityId], references: [id], onDelete: SetNull)
   recurringTransaction RecurringTransaction? @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
   splits                TransactionSplit[]    // Divisões da transação entre membros
+  externalRefs          TransactionExternalRef[] // Linhas externas (ex.: OFX da fatura) que esta transação já representa
 
   // Indexes for common queries
   @@index([householdId])
@@ -310,6 +311,23 @@ model Transaction {
   @@index([installmentId])
   @@unique([householdId, sourceRef])
   @@map("transactions")
+}
+
+// External lines (e.g. card invoice OFX lines, ref `ofx:<FITID>:<hash>`) a transaction already represents. One
+// transaction may represent several lines (a sheet row covering a prepaid plan or a sum of purchases); a ref is
+// recorded once per household, so re-importing the same file finds every line already reconciled.
+model TransactionExternalRef {
+  id            String   @id @default(uuid()) @db.Uuid
+  householdId   String   @map("household_id") @db.Uuid
+  transactionId String   @map("transaction_id") @db.Uuid
+  ref           String   @db.VarChar(120)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, ref])
+  @@index([transactionId])
+  @@map("transaction_external_refs")
 }
 
 // ============================================================================
