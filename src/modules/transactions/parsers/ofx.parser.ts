@@ -39,7 +39,11 @@ function buildDate(
   return date;
 }
 
-function parseOfxDate(raw: string): Date | null {
+/**
+ * Local Date of an OFX date-time (`YYYYMMDD[HHMMSS[.XXX]][[offset:TZ]]`): the digits are read as written, in the
+ * statement's own clock, so the calendar day is the one the bank printed. Null when the day or time is not real.
+ */
+export function parseOfxDate(raw: string): Date | null {
   const value = raw.trim();
   if (value.length >= 14 && /^\d{14}/.test(value)) {
     const chunk = value.slice(0, 14);
