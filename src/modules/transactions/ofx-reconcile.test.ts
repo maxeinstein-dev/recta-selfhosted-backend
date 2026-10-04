@@ -321,6 +321,45 @@ describe('reconcileCardOfx: exact matches', () => {
     ]);
   });
 
+  it('accepts one cent of installment rounding when both sides carry the same N/M', () => {
+    const bank = line('fa', 'Loja Alfa - Parcela 3/10', -33.34);
+    const row = sheetRow('Loja Alfa 3/10', 33.33);
+
+    const [exact] = proposalsOf(run({ lines: [bank], sheetRows: [row] }), 'enrich-exact');
+
+    expect(exact).toMatchObject({
+      refs: [bank.ref],
+      defaultSelected: true,
+      target: { id: row.id, amount: 33.33 },
+      result: { date: bank.date, description: bank.memo, notesAppend: 'Planilha: Loja Alfa 3/10' },
+    });
+  });
+
+  it('never accepts a cent without the same N/M, nor two cents with it', () => {
+    const cases: Array<[CardOfxStatementLine, StoredCardRow]> = [
+      [line('fa', 'Mercado Beta', -10.01), sheetRow('Mercado', 10)],
+      [line('fa', 'Loja Alfa - Parcela 4/10', -33.34), sheetRow('Loja Alfa 3/10', 33.33)],
+      [line('fa', 'Loja Alfa - Parcela 3/10', -33.35), sheetRow('Loja Alfa 3/10', 33.33)],
+    ];
+    for (const [bank, row] of cases) {
+      const result = run({ lines: [bank], sheetRows: [row] });
+      expect(proposalsOf(result, 'enrich-exact'), bank.memo).toEqual([]);
+      expect(result.sheetOnly).toEqual([row]);
+    }
+  });
+
+  it('prefers the same N/M a cent away to an exact amount without N/M, then the exact amount, then words', () => {
+    const sameInstallment = line('fa', 'Loja Alfa - Parcela 3/10', -33.34);
+    const plain = line('fb', 'Banca Beta', -33.33);
+    const row = sheetRow('Loja Alfa 3/10', 33.33);
+    expect(proposalFor(run({ lines: [plain, sameInstallment], sheetRows: [row] }), sameInstallment.ref).target?.id).toBe(row.id);
+
+    const cent = line('fc', 'Curso Gama - Parcela 3/10', -50.01); // shares a word with the row, one cent off
+    const exactAmount = line('fd', 'Loja Delta - Parcela 3/10', -50);
+    const other = sheetRow('Curso Gama 3/10', 50);
+    expect(proposalFor(run({ lines: [cent, exactAmount], sheetRows: [other] }), exactAmount.ref).target?.id).toBe(other.id);
+  });
+
   it('never pairs different types of the same amount', () => {
     const refund = line('fr', 'Estorno de "Loja Ro" (Loja Ro)', 35);
     const expense = sheetRow('Loja Ro', 35);
@@ -329,6 +368,25 @@ describe('reconcileCardOfx: exact matches', () => {
 
     expect(proposalsOf(result, 'enrich-exact')).toEqual([]);
     expect(result.sheetOnly).toEqual([expense]);
+  });
+});
+
+describe('reconcileCardOfx: proposals are disjoint', () => {
+  it('never puts a line or a sheet row in two proposals, ambiguous sums included', () => {
+    const lines = [line('s1', 'Loja Um', -10), line('s2', 'Loja Dois', -20), line('s3', 'Loja Tres', -15), line('s4', 'Loja Quatro', -15)];
+    const rows = [sheetRow('Compras A', 30), sheetRow('Compras B', 30)];
+
+    const result = run({ lines, sheetRows: rows });
+
+    // The first row has two subsets (ambiguous, one proposal); the second takes what is left (15 + 15).
+    expect(proposalsOf(result, 'enrich-sum').map((p) => [p.target?.id, p.ambiguous, p.refs])).toEqual([
+      [rows[0]!.id, true, refsOf([lines[0]!, lines[1]!])],
+      [rows[1]!.id, false, refsOf([lines[2]!, lines[3]!])],
+    ]);
+    const refs = result.proposals.flatMap((p) => p.refs);
+    const targets = result.proposals.flatMap((p) => (p.target ? [p.target.id] : []));
+    expect(new Set(refs).size).toBe(refs.length);
+    expect(new Set(targets).size).toBe(targets.length);
   });
 });
 

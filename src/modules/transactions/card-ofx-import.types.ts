@@ -72,6 +72,10 @@ export interface CardOfxPayment {
   date: string;
   /** Invoice it pays (the previous month), YYYY-MM. */
   invoiceMonthKey: string;
+  /**
+   * The recorded payment (amounts summed when there are several). sourceAccountId is null when its account can no
+   * longer pay an invoice (deleted, inactive): an adjust then needs the confirm's payment.sourceAccountId.
+   */
   recorded: null | { transactionId: string; amount: number; date: string; sourceAccountId: string | null };
   proposal: 'ok' | 'adjust' | 'create';
 }
@@ -112,7 +116,10 @@ export interface CardOfxConfirmRequest {
   selectedGroups: string[];
   /** For the create proposals. */
   categoryMap: MaxFinCategoryMapInput[];
-  /** sourceAccountId is required when the payment proposal is 'create'. */
+  /**
+   * sourceAccountId is required when the payment proposal is 'create', and for an 'adjust' whose
+   * recorded.sourceAccountId is null; otherwise an adjust pays again from the recorded payment's account.
+   */
   payment: null | { apply: boolean; sourceAccountId?: string };
 }
 
@@ -122,7 +129,7 @@ export interface CardOfxConfirmResponse {
   /** Transactions created from create proposals (future installments and reversal pairs apart). */
   created: number;
   futureInstallments: number;
-  /** Reversal pairs imported (two transactions each). */
+  /** Transactions created from reversal pairs (two per pair). */
   reversalsImported: number;
   payment: null | { action: 'adjusted' | 'created'; transactionId: string; amount: number; date: string };
   /** Selected groups that no longer exist in the recomputation (or were applied meanwhile by another confirm). */

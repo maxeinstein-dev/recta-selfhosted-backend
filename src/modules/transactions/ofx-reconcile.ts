@@ -10,7 +10,8 @@
  *     (what the generic "Importar" button stored);
  *  2. prepaid plan: a sheet row "N/M +K" = installments N..N+K of one FITID minus its discount(s), within 2 cents;
  *  2b. plan without "+K": a sheet expense equal to the net of all remaining lines of one FITID (2 lines or more);
- *  3. exact, one to one: same amount and type; ties go by equal N/M, then by words in common;
+ *  3. exact, one to one: same type and amount, or one cent apart when both carry the same N/M (installment
+ *     rounding; the sheet keeps its amount); ties go by equal N/M, then exact amount, then words in common;
  *  4. sum: a sheet expense equal to a subset of the remaining purchases (searched among at most 15 of them, those
  *     sharing words with the row first, then in file order; smaller rows first); more than one subset makes the
  *     proposal ambiguous (unselected);
@@ -92,7 +93,7 @@ export interface ReconcileProposal {
   futureNumbers: number[];
   /** create: ref of the line the future installments continue (`<ref>:f<i>` refs, plan `ofx:<FITID>`). */
   futureBaseRef: string | null;
-  /** enrich-exact: other rows or lines had the same amount and type (decided by N/M, then words in common). */
+  /** enrich-exact: the row or the line had other candidates (decided by N/M, exact amount, then words in common). */
   tieBroken: boolean;
 }
 
@@ -118,6 +119,8 @@ export interface ReconcileResult {
 
 /** A +K plan or a FITID net may differ from the sheet by rounding of the prepayment discount. */
 export const PLAN_TOLERANCE_CENTS = 2;
+/** A sheet installment and the bank's one may differ by a cent of rounding when both carry the same N/M. */
+export const INSTALLMENT_ROUNDING_CENTS = 1;
 /** A stored future installment is the real one within one cent (its amount was copied or estimated). */
 export const FUTURE_TOLERANCE_CENTS = 1;
 /** Candidate purchases searched per sheet row in the sum step (2^15 subsets at most). */
@@ -428,46 +431,49 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     }
   }
 
-  // 3. Exact, one to one: same type and amount; ties by equal N/M, then by words in common.
-  const buckets = new Map<string, { rows: RowState[]; states: LineState[] }>();
-  const bucket = (type: string, cents: number) => {
-    const key = `${type}|${cents}`;
-    let entry = buckets.get(key);
-    if (!entry) {
-      entry = { rows: [], states: [] };
-      buckets.set(key, entry);
-    }
-    return entry;
-  };
-  for (const row of sheet) if (!row.used) bucket(row.row.type, row.cents).rows.push(row);
+  // 3. Exact, one to one: same type and amount, or one cent apart when both sides carry the same installment N/M
+  // (installment rounding: the sheet row keeps its own amount). Equal N/M goes first, then the exact amount, then
+  // words in common.
+  const linesByAmount = new Map<string, LineState[]>();
   for (const state of lines) {
     const eligible = state.status === 'free' && (state.line.kind !== 'payment' || state.advance);
-    if (eligible) bucket(state.line.type, state.cents).states.push(state);
+    if (!eligible) continue;
+    const key = `${state.line.type}|${state.cents}`;
+    linesByAmount.set(key, [...(linesByAmount.get(key) ?? []), state]);
   }
-  for (const { rows, states } of buckets.values()) {
-    if (rows.length === 0 || states.length === 0) continue;
-    const tieBroken = rows.length > 1 || states.length > 1;
-    const pairs: Array<{ row: RowState; state: LineState; inst: number; shared: number }> = [];
-    for (const row of rows) {
-      for (const state of states) {
+  const pairs: Array<{ row: RowState; state: LineState; inst: number; exact: number; shared: number }> = [];
+  for (const row of sheet) {
+    if (row.used) continue;
+    for (let delta = -INSTALLMENT_ROUNDING_CENTS; delta <= INSTALLMENT_ROUNDING_CENTS; delta++) {
+      for (const state of linesByAmount.get(`${row.row.type}|${row.cents + delta}`) ?? []) {
         const inst = state.line.installment;
         const sameInstallment =
           row.installment !== null && inst !== null && row.installment.number === inst.number && row.installment.total === inst.total;
-        pairs.push({ row, state, inst: sameInstallment ? 1 : 0, shared: sharedWordCount(row.words, state.words) });
+        if (delta !== 0 && !sameInstallment) continue;
+        pairs.push({ row, state, inst: sameInstallment ? 1 : 0, exact: delta === 0 ? 1 : 0, shared: sharedWordCount(row.words, state.words) });
       }
     }
-    pairs.sort((a, b) => b.inst - a.inst || b.shared - a.shared || a.row.index - b.row.index || a.state.index - b.state.index);
-    for (const pair of pairs) {
-      if (pair.row.used || pair.state.status !== 'free') continue;
-      propose('enrich-exact', [pair.state], pair.row, {
-        tieBroken,
-        result: {
-          date: pair.state.line.date,
-          description: pair.state.line.memo,
-          notesAppend: clampText(`Planilha: ${pair.row.row.description}`, MAX_NOTES_APPEND),
-        },
-      });
-    }
+  }
+  const candidatesOfRow = new Map<RowState, number>();
+  const candidatesOfLine = new Map<LineState, number>();
+  for (const { row, state } of pairs) {
+    candidatesOfRow.set(row, (candidatesOfRow.get(row) ?? 0) + 1);
+    candidatesOfLine.set(state, (candidatesOfLine.get(state) ?? 0) + 1);
+  }
+  pairs.sort(
+    (a, b) =>
+      b.inst - a.inst || b.exact - a.exact || b.shared - a.shared || a.row.index - b.row.index || a.state.index - b.state.index,
+  );
+  for (const pair of pairs) {
+    if (pair.row.used || pair.state.status !== 'free') continue;
+    propose('enrich-exact', [pair.state], pair.row, {
+      tieBroken: candidatesOfRow.get(pair.row)! > 1 || candidatesOfLine.get(pair.state)! > 1,
+      result: {
+        date: pair.state.line.date,
+        description: pair.state.line.memo,
+        notesAppend: clampText(`Planilha: ${pair.row.row.description}`, MAX_NOTES_APPEND),
+      },
+    });
   }
 
   // 4. Sums: a sheet expense equal to a subset of the remaining purchases. Smaller rows go first: few lines can

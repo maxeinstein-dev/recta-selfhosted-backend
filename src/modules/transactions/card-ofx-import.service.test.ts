@@ -393,7 +393,7 @@ describe('card OFX import: a month that has sheet rows', () => {
     expect(JSON.stringify(store)).toBe(snapshot);
   });
 
-  it('imports a selected reversal pair as both transactions', async () => {
+  it('imports a selected reversal pair as both transactions, counting transactions', async () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
 
     const result = await confirmCardOfxImport({
@@ -401,7 +401,7 @@ describe('card OFX import: a month that has sheet rows', () => {
       account: card,
     });
 
-    expect(result).toMatchObject({ reversalsImported: 1, created: 0, enriched: 0 });
+    expect(result).toMatchObject({ reversalsImported: 2, created: 0, enriched: 0 });
     expect(store.transactions.filter((t) => t.description?.includes('Loja Mu')).map((t) => [t.type, t.amount, t.categoryName])).toEqual([
       ['EXPENSE', 149.9, 'OTHER_EXPENSES'],
       ['INCOME', 149.9, 'OTHER_INCOME'],
@@ -490,7 +490,7 @@ describe('card OFX import: a month that has sheet rows', () => {
     const result = await confirmCardOfxImport({
       request: confirmRequest(preview, {
         selectedGroups: [proposal(preview, 'create').group],
-        categoryMap: [{ key: 'livraria nova', type: 'EXPENSE', target: { kind: 'create', name: 'Livros' } }],
+        categoryMap: [{ key: '  LIVRARIA   nóva ', type: 'EXPENSE', target: { kind: 'create', name: 'Livros' } }],
         payment: null,
       }),
       account: card,
@@ -499,6 +499,19 @@ describe('card OFX import: a month that has sheet rows', () => {
     expect(result.createdCategories).toEqual([{ id: expect.any(String), name: 'Livros', type: 'EXPENSE' }]);
     const created = store.transactions.find((t) => t.description === 'Livraria Nova' && t.date === '2026-09-25')!;
     expect(created.categoryName).toBe(`CUSTOM:${result.createdCategories[0]!.id}`);
+  });
+
+  it('enriches an installment one cent off the bank (same N/M), keeping the sheet amount', async () => {
+    const row = seedSheetRow(20, 'Loja Pi 3/10', 33.33, { installmentId: 'maxfin:loja-pi:10', installmentNumber: 3, totalInstallments: 10 });
+    const invoice = ofx([...OCTOBER, { fitid: 'fit-pi', date: '20260914', amount: '-33.34', memo: 'Loja Pi - Parcela 3/10' }]);
+    const preview = await buildCardOfxPreview({ account: card, buffer: invoice });
+    const exact = preview.proposals.find((p) => p.target?.transactionId === row.id)!;
+    expect(exact).toMatchObject({ kind: 'enrich-exact', defaultSelected: true, target: { amount: 33.33 } });
+
+    await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [exact.group], payment: null }), account: card });
+
+    expect(tx(row.id)).toMatchObject({ amount: 33.33, date: '2026-09-14', description: 'Loja Pi - Parcela 3/10', notes: 'Planilha: Loja Pi 3/10' });
+    expect(refsOf(row.id)).toEqual(exact.refs);
   });
 
   it('records the refs of lines the generic importer already stored', async () => {
@@ -523,15 +536,70 @@ describe('card OFX import: a month that has sheet rows', () => {
     expect(fakeServices.payCreditCardInvoice).not.toHaveBeenCalled();
   });
 
-  it('does not adjust when the account of the recorded payment is gone, and says so', async () => {
+  it('reports no source account for an adjust whose recorded account can no longer pay, and says so', async () => {
     store.accounts.find((a) => a.id === BANK)!.isActive = false;
+
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
 
-    const result = await confirmCardOfxImport({ request: confirmRequest(preview), account: card });
+    expect(preview.payment).toMatchObject({ proposal: 'adjust', recorded: { transactionId: recordedPayment.id, sourceAccountId: null } });
+    expect(preview.warnings).toContainEqual(expect.stringContaining('escolha a conta de origem para o ajuste'));
+  });
 
-    expect(result.payment).toBeNull();
-    expect(result.warnings).toEqual([expect.stringContaining('não ajustado')]);
+  it.each<[string, () => void]>([
+    ['was deleted (no account on the payment)', () => {
+      recordedPayment.accountId = null;
+    }],
+    ['is inactive', () => {
+      store.accounts.find((a) => a.id === BANK)!.isActive = false;
+    }],
+  ])('answers 400 before any write when the recorded account %s and the request names none', async (_label, breakIt) => {
+    breakIt();
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+
+    await expect(confirmCardOfxImport({ request: confirmRequest(preview), account: card })).rejects.toEqual(
+      isBadRequest('payment.sourceAccountId is required'),
+    );
     expect(fakeServices.undoCreditCardPayment).not.toHaveBeenCalled();
+    expect(fakePrisma.transaction.update).not.toHaveBeenCalled();
+    expect(store.refs).toEqual([]);
+  });
+
+  it('adjusts from the request account when the recorded payment has none', async () => {
+    recordedPayment.accountId = null;
+    seedAccount({ id: 'savings-1', householdId: HH, type: 'SAVINGS' });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { payment: { apply: true, sourceAccountId: 'savings-1' } }),
+      account: card,
+    });
+
+    expect(result.payment).toMatchObject({ action: 'adjusted', amount: 1500 });
+    expect(fakeServices.payCreditCardInvoice).toHaveBeenCalledWith(expect.objectContaining({ sourceAccountId: 'savings-1' }));
+  });
+
+  it('adjusts from the recorded payment account even when the request names another one', async () => {
+    seedAccount({ id: 'savings-1', householdId: HH, type: 'SAVINGS' });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+
+    await confirmCardOfxImport({
+      request: confirmRequest(preview, { payment: { apply: true, sourceAccountId: 'savings-1' } }),
+      account: card,
+    });
+
+    expect(fakeServices.payCreditCardInvoice).toHaveBeenCalledWith(expect.objectContaining({ sourceAccountId: BANK }));
+  });
+
+  it('echoes reconciled and payment lines harmlessly: they never become transactions', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    const echoed = confirmRequest(preview, { selectedGroups: [], payment: null });
+    expect(echoed.lines).toHaveLength(OCTOBER.length);
+
+    const result = await confirmCardOfxImport({ request: echoed, account: card });
+
+    expect(result).toMatchObject({ enriched: 0, created: 0, reversalsImported: 0, payment: null, skipped: 0 });
+    expect(fakeServices.createTransaction).not.toHaveBeenCalled();
+    expect(store.refs).toEqual([]);
   });
 });
 
@@ -638,6 +706,33 @@ describe('card OFX import: a month without sheet rows', () => {
     expect(tx('fut-b6')).toMatchObject({ date: '2026-11-27', description: 'Curso Beta - Parcela 6/6' });
     const discount = store.transactions.find((t) => t.description === 'Desconto Antecipação Curso Beta')!;
     expect(discount).toMatchObject({ type: 'INCOME', amount: 2, categoryName: 'OTHER_INCOME', installmentId: null });
+  });
+
+  it('gives a consumed future the bank amount through the transaction service (the card balance moves)', async () => {
+    tx('fut-a4').amount = 49.99; // one cent off: still the same installment
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const consume = preview.proposals.find((p) => p.target?.transactionId === 'fut-a4')!;
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: [consume.group], payment: null }),
+      account: card,
+    });
+
+    expect(result.consumedFutures).toBe(1);
+    expect(fakeServices.updateTransaction).toHaveBeenCalledWith('fut-a4', HH, expect.objectContaining({ amount: 50, paid: true }));
+    expect(tx('fut-a4')).toMatchObject({ amount: 50, date: '2026-11-03', description: 'Loja Alfa - Parcela 4/10' });
+    expect(refsOf('fut-a4')).toEqual(consume.refs);
+  });
+
+  it('rewrites a consumed future in one database transaction when amount and paid flag already match', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const consume = preview.proposals.find((p) => p.target?.transactionId === 'fut-a4')!;
+
+    await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [consume.group], payment: null }), account: card });
+
+    expect(fakeServices.updateTransaction).not.toHaveBeenCalled();
+    expect(fakePrisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(tx('fut-a4')).toMatchObject({ amount: 50, date: '2026-11-03' });
   });
 
   it('marks a consumed future paid through the transaction service when it was unpaid', async () => {

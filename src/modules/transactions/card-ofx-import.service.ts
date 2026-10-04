@@ -393,7 +393,12 @@ export function paymentProposal(line: Pick<CardOfxStatementLine, 'amount' | 'dat
   return 'ok';
 }
 
-function paymentDto(result: ReconcileResult, recorded: RecordedPayment[], month: MaxFinMonth): CardOfxPayment | null {
+function paymentDto(
+  result: ReconcileResult,
+  recorded: RecordedPayment[],
+  month: MaxFinMonth,
+  usableSource: string | null,
+): CardOfxPayment | null {
   if (!result.payment) return null;
   const { line } = result.payment;
   const latest = recorded[0];
@@ -407,7 +412,7 @@ function paymentDto(result: ReconcileResult, recorded: RecordedPayment[], month:
           transactionId: latest.id,
           amount: recorded.reduce((total, p) => total + toCents(p.amount), 0) / 100,
           date: storedDateString(latest.date),
-          sourceAccountId: latest.accountId,
+          sourceAccountId: usableSource,
         }
       : null,
     proposal: paymentProposal(line, recorded),
@@ -673,6 +678,13 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       `Pagamento antecipado de ${formatBRL(advance.amount)} em ${formatDay(advance.date)} não será importado: o Recta registra só o pagamento da fatura anterior.`,
     );
   }
+  const latestPayment = context.recordedPayments[0];
+  const usableSource = latestPayment ? await usableRecordedSource(latestPayment, account.householdId) : null;
+  if (result.payment && latestPayment && !usableSource && paymentProposal(result.payment.line, context.recordedPayments) === 'adjust') {
+    warnings.push(
+      `O pagamento registrado da fatura de ${monthKey(addMonths(month, -1))} saiu de uma conta que não está mais disponível: escolha a conta de origem para o ajuste.`,
+    );
+  }
   if (context.recordedPayments.length > 1 && result.payment) {
     const sum = context.recordedPayments.reduce((total, p) => total + toCents(p.amount), 0) / 100;
     warnings.push(
@@ -700,7 +712,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     lines,
     proposals,
     sheetOnly: result.sheetOnly.map(toTransactionRef),
-    payment: paymentDto(result, context.recordedPayments, month),
+    payment: paymentDto(result, context.recordedPayments, month, usableSource),
     categoryMap: await buildCardCategoryMap(account.householdId, createLines),
     totals: {
       lines: lines.length,
@@ -806,31 +818,37 @@ async function planPayment(
   recorded: RecordedPayment[],
   householdId: string,
   invoiceMonth: MaxFinMonth,
-  warnings: string[],
 ): Promise<PaymentPlan> {
   if (!input?.apply || !result.payment) return { kind: 'none' };
   const { line } = result.payment;
   const proposal = paymentProposal(line, recorded);
   if (proposal === 'ok') return { kind: 'none' };
   if (proposal === 'create') {
-    if (!input.sourceAccountId) {
-      throw new BadRequestError('payment.sourceAccountId is required to record the invoice payment (none is recorded).');
-    }
-    const status = await payingAccount(input.sourceAccountId, householdId);
-    if (status === 'missing') throw new BadRequestError('payment.sourceAccountId: account not found or inactive in this household.');
-    if (status === 'credit') throw new BadRequestError('payment.sourceAccountId: an invoice cannot be paid from a credit card.');
-    return { kind: 'create', line, sourceAccountId: input.sourceAccountId };
+    const source = await requestedSource(input.sourceAccountId, householdId, 'no payment is recorded for that invoice');
+    return { kind: 'create', line, sourceAccountId: source };
   }
-  // Adjust: undo and pay again from the account of the recorded payment.
+  // Adjust: undo and pay again from the account of the recorded payment, or from the request's when it has none
+  // (or it is no longer usable).
   const latest = recorded[0]!;
-  const source = latest.accountId;
-  if (!source || (await payingAccount(source, householdId)) !== 'ok') {
-    warnings.push(
-      `Pagamento da fatura de ${monthKey(invoiceMonth)} não ajustado: a conta de origem do pagamento registrado não está mais disponível.`,
-    );
-    return { kind: 'none' };
-  }
+  const source =
+    (await usableRecordedSource(latest, householdId)) ??
+    (await requestedSource(input.sourceAccountId, householdId, 'the recorded payment has no usable source account'));
   return { kind: 'adjust', line, sourceAccountId: source, recorded, description: latest.description || paymentDescription(invoiceMonth) };
+}
+
+/** The recorded payment's account when it can still pay an invoice (active, of the household, not a card). */
+async function usableRecordedSource(payment: RecordedPayment, householdId: string): Promise<string | null> {
+  if (!payment.accountId) return null;
+  return (await payingAccount(payment.accountId, householdId)) === 'ok' ? payment.accountId : null;
+}
+
+/** The request's payment.sourceAccountId, validated. @throws BadRequestError (400) when missing or unusable. */
+async function requestedSource(sourceAccountId: string | undefined, householdId: string, why: string): Promise<string> {
+  if (!sourceAccountId) throw new BadRequestError(`payment.sourceAccountId is required: ${why}.`);
+  const status = await payingAccount(sourceAccountId, householdId);
+  if (status === 'missing') throw new BadRequestError('payment.sourceAccountId: account not found or inactive in this household.');
+  if (status === 'credit') throw new BadRequestError('payment.sourceAccountId: an invoice cannot be paid from a credit card.');
+  return sourceAccountId;
 }
 
 /**
@@ -877,12 +895,15 @@ async function applyEnrich(householdId: string, proposal: ReconcileProposal): Pr
   return claimAndUpdate(householdId, proposal, targetData(proposal));
 }
 
-/** The real line replaces a stored future installment: its date, memo and paid flag (true) go to the future. */
-async function applyConsumeFuture(householdId: string, proposal: ReconcileProposal): Promise<boolean> {
+/**
+ * The real line replaces a stored future installment (a placeholder the importer generated): its date, memo, amount
+ * and paid flag (true) go to the future.
+ */
+async function applyConsumeFuture(householdId: string, proposal: ReconcileProposal, amount: number): Promise<boolean> {
   const data = targetData(proposal);
-  if (proposal.target!.paid) return claimAndUpdate(householdId, proposal, data);
-  // Marking it paid moves the card balance: claim the refs, then go through the transaction service.
   const target = proposal.target!;
+  if (target.paid && toCents(target.amount) === toCents(amount)) return claimAndUpdate(householdId, proposal, data);
+  // A new amount or the paid flag moves the card balance: claim the refs, then go through the transaction service.
   try {
     await prisma.transactionExternalRef.createMany({
       data: proposal.refs.map((ref) => ({ householdId, transactionId: target.id, ref })),
@@ -892,7 +913,7 @@ async function applyConsumeFuture(householdId: string, proposal: ReconcilePropos
     throw error;
   }
   try {
-    await updateTransaction(target.id, householdId, { ...data, paid: true });
+    await updateTransaction(target.id, householdId, { ...data, amount, paid: true });
   } catch (error) {
     await prisma.transactionExternalRef.deleteMany({ where: { householdId, transactionId: target.id, ref: { in: proposal.refs } } });
     throw error;
@@ -1078,7 +1099,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   let skipped = selected.size - toApply.length;
 
   const warnings: string[] = [];
-  const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth, warnings);
+  const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth);
 
   const importedLines = toApply
     .filter((p) => p.kind === 'create' || p.kind === 'reversal')
@@ -1108,7 +1129,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
         else skipped += 1;
         break;
       case 'consume-future':
-        if (await applyConsumeFuture(householdId, proposal)) consumedFutures += 1;
+        if (await applyConsumeFuture(householdId, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) consumedFutures += 1;
         else skipped += 1;
         break;
       case 'create': {
@@ -1121,10 +1142,12 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
         futureInstallments += await createFutureInstallments(createContext, proposal);
         break;
       }
-      case 'reversal':
-        if ((await createLines(createContext, proposal.refs)) > 0) reversalsImported += 1;
+      case 'reversal': {
+        const count = await createLines(createContext, proposal.refs);
+        if (count > 0) reversalsImported += count;
         else skipped += 1;
         break;
+      }
     }
   }
 
