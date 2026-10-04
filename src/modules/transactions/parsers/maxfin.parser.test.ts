@@ -7,10 +7,13 @@ import {
   clampText,
   detectMonthFromFilename,
   detectMonthFromTitle,
+  detectYearFromName,
+  findMaxFinHeaderIndex,
   parseInstallment,
   parseMaxFinGrid,
   parseMoneyBR,
   parseShareHint,
+  sheetNameFromCsvFilename,
   slugify,
 } from './maxfin.parser.js';
 import type {
@@ -68,7 +71,7 @@ function splitCsvForTests(text: string): Grid {
   return rows;
 }
 
-const FIXTURE_FILENAME = 'FINANÇAS_MAX_2026.xlsx - OUT.csv';
+const FIXTURE_FILENAME = 'FINANÇAS_2026.xlsx - OUT.csv';
 const fixtureText = readFileSync(
   new URL('./__fixtures__/maxfin-sample.csv', import.meta.url),
   'utf8',
@@ -278,7 +281,7 @@ describe('detectMonthFromFilename', () => {
 
   it('requires a standalone abbreviation and a year', () => {
     expect(detectMonthFromFilename('checkout_2026.csv')).toBeNull();
-    expect(detectMonthFromFilename('FINANÇAS_MAX - OUT.csv')).toBeNull();
+    expect(detectMonthFromFilename('FINANÇAS - OUT.csv')).toBeNull();
     expect(detectMonthFromFilename('')).toBeNull();
   });
 });
@@ -331,6 +334,197 @@ describe('parseMaxFinGrid – month detection', () => {
     expect(result.rows).toHaveLength(1);
     expect(result.rows[0]?.date.getTime()).toBe(new Date(1970, 0, 1).getTime());
     expect(result.rows[0]?.sourceRef).toBe('maxfin:unknown:bills:4');
+  });
+});
+
+describe('parseMaxFinGrid – month from the tab name', () => {
+  const untitled = (): Grid =>
+    buildGrid([['', 'Mercado', 'Casa', '', '', '', 'R$ 10,00', 'R$ 10,00']], 'Finanças Teste');
+
+  it('reports the title when the tab name agrees with it, the year coming from the title', () => {
+    const result = parseMaxFinGrid(fixtureGrid, { sheetName: 'MAR' });
+
+    expect(result).toMatchObject({ month: { year: 2026, month: 3 }, monthSource: 'title' });
+    expect(result.warnings.filter((w) => w.includes('título da aba'))).toEqual([]);
+  });
+
+  it('prefers the tab name over a title copied from another month, and says so', () => {
+    const result = parseMaxFinGrid(fixtureGrid, { sheetName: 'NOV' });
+
+    expect(result).toMatchObject({ month: { year: 2026, month: 11 }, monthSource: 'sheet' });
+    expect(result.warnings).toContain(
+      'O título da aba diz março/2026, mas a aba se chama "NOV": usei novembro/2026 (ano do título).',
+    );
+    expect(result.rows.every((r) => r.sourceRef.startsWith('maxfin:2026-11:'))).toBe(true);
+    expect(result.rows[0]?.date.getMonth()).toBe(10);
+  });
+
+  it('takes the year from the tab name before the title', () => {
+    const result = parseMaxFinGrid(fixtureGrid, { sheetName: 'Outubro 2025' });
+
+    expect(result).toMatchObject({ month: { year: 2025, month: 10 }, monthSource: 'sheet' });
+    expect(result.warnings).toContain(
+      'O título da aba diz março/2026, mas a aba se chama "Outubro 2025": usei outubro/2025 (ano do nome da aba).',
+    );
+  });
+
+  it('without a title month, takes the year from the file name, then from fallbackYear', () => {
+    expect(
+      parseMaxFinGrid(untitled(), { sheetName: 'OUT', filename: 'FINANÇAS_2026.xlsx - OUT.csv', fallbackYear: 2030 }),
+    ).toMatchObject({ month: { year: 2026, month: 10 }, monthSource: 'sheet' });
+    expect(parseMaxFinGrid(untitled(), { sheetName: 'OUT', fallbackYear: 2027 })).toMatchObject({
+      month: { year: 2027, month: 10 },
+      monthSource: 'sheet',
+    });
+    expect(parseMaxFinGrid(untitled(), { sheetName: 'OUT' })).toMatchObject({ month: null, monthSource: 'none' });
+  });
+
+  it('falls back to the title, then to the file name, when the tab name has no month', () => {
+    expect(parseMaxFinGrid(fixtureGrid, { sheetName: 'Resumo' })).toMatchObject({
+      month: { year: 2026, month: 3 },
+      monthSource: 'title',
+    });
+    expect(parseMaxFinGrid(untitled(), { sheetName: 'Resumo', filename: 'financas 2025 - mar.csv' })).toMatchObject({
+      month: { year: 2025, month: 3 },
+      monthSource: 'filename',
+    });
+  });
+
+  it('never takes the month from the file name when the tab name has one', () => {
+    const result = parseMaxFinGrid(untitled(), { sheetName: 'OUT', filename: 'Planilha março 2026 - OUT.csv' });
+
+    expect(result).toMatchObject({ month: { year: 2026, month: 10 }, monthSource: 'sheet' });
+  });
+
+  it('lets monthOverride win over the tab name', () => {
+    expect(parseMaxFinGrid(fixtureGrid, { sheetName: 'NOV', monthOverride: { year: 2024, month: 7 } })).toMatchObject({
+      month: { year: 2024, month: 7 },
+      monthSource: 'override',
+    });
+  });
+});
+
+describe('parseMaxFinGrid – year of a tab whose title names another month', () => {
+  const titled = (title: string): Grid =>
+    buildGrid([['', 'Mercado', 'Casa', '', '', '', 'R$ 10,00', 'R$ 10,00']], `Finanças Teste\n${title}`);
+  const ROLLED = 'ano seguinte ao do título: a aba é uma cópia feita depois dele';
+
+  it('keeps the year of the title when the tab is the same month, whatever the file name says', () => {
+    const result = parseMaxFinGrid(titled('Mês de dezembro de 2026'), { sheetName: 'DEZ', filename: 'FINANÇAS_2027.xlsx - DEZ.csv' });
+
+    expect(result).toMatchObject({ month: { year: 2026, month: 12 }, monthSource: 'title' });
+    expect(result.warnings.filter((warning) => warning.includes('título da aba'))).toEqual([]);
+  });
+
+  it('takes the year from the tab name first', () => {
+    const result = parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'SET 2025', filename: 'FINANÇAS_2026.xlsx - SET 2025.csv' });
+
+    expect(result.month).toEqual({ year: 2025, month: 9 });
+    expect(result.warnings).toContain('O título da aba diz outubro/2026, mas a aba se chama "SET 2025": usei setembro/2025 (ano do nome da aba).');
+  });
+
+  it('keeps a backward copy (SET made from OUT) in the year of the file name', () => {
+    const result = parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'SET', filename: 'FINANÇAS_2026.xlsx - SET.csv' });
+
+    expect(result).toMatchObject({ month: { year: 2026, month: 9 }, monthSource: 'sheet' });
+    expect(result.warnings).toContain('O título da aba diz outubro/2026, mas a aba se chama "SET": usei setembro/2026 (ano do nome do arquivo).');
+  });
+
+  it('takes JAN copied from DEZ in a file named for the next year as January of that year', () => {
+    const result = parseMaxFinGrid(titled('Mês de dezembro de 2026'), { sheetName: 'JAN', filename: 'X_2027.xlsx - JAN.csv' });
+
+    expect(result.month).toEqual({ year: 2027, month: 1 });
+    expect(result.warnings).toContain('O título da aba diz dezembro/2026, mas a aba se chama "JAN": usei janeiro/2027 (ano do nome do arquivo).');
+  });
+
+  it('reads the file-name year from the workbook part of a tab download, or from fileYear', () => {
+    expect(parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'SET', filename: 'Planilha 2025.xlsx - SET.csv' }).month).toEqual({
+      year: 2025,
+      month: 9,
+    });
+    expect(parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'SET', fileYear: 2024, fallbackYear: 2030 }).month).toEqual({
+      year: 2024,
+      month: 9,
+    });
+  });
+
+  it('with no year but the title, takes a JAN tab copied from DEZ as January of the next year, and says why', () => {
+    const result = parseMaxFinGrid(titled('Mês de dezembro de 2026'), { sheetName: 'JAN', filename: 'Planilha.xlsx - JAN.csv' });
+
+    expect(result).toMatchObject({ month: { year: 2027, month: 1 }, monthSource: 'sheet' });
+    expect(result.warnings).toContain(`O título da aba diz dezembro/2026, mas a aba se chama "JAN": usei janeiro/2027 (${ROLLED}).`);
+    expect(result.rows[0]?.sourceRef).toBe('maxfin:2027-01:bills:4');
+  });
+
+  it('with no year but the title, keeps a later month in the title year and moves an earlier one to the next', () => {
+    const later = parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'NOV' });
+    const earlier = parseMaxFinGrid(titled('Mês de outubro de 2026'), { sheetName: 'SET' });
+
+    expect(later.month).toEqual({ year: 2026, month: 11 });
+    expect(later.warnings).toContain('O título da aba diz outubro/2026, mas a aba se chama "NOV": usei novembro/2026 (ano do título).');
+    expect(earlier.month).toEqual({ year: 2027, month: 9 });
+    expect(earlier.warnings).toContain(`O título da aba diz outubro/2026, mas a aba se chama "SET": usei setembro/2027 (${ROLLED}).`);
+  });
+
+  it('never needs fallbackYear when the title names a month', () => {
+    expect(parseMaxFinGrid(titled('Mês de dezembro de 2026'), { sheetName: 'JAN', fallbackYear: 2031 }).month).toEqual({
+      year: 2027,
+      month: 1,
+    });
+  });
+});
+
+describe('sheetNameFromCsvFilename', () => {
+  it('reads the tab of a "<workbook> - <tab>.csv" download name, after the last " - "', () => {
+    expect(sheetNameFromCsvFilename('FINANÇAS_2026.xlsx - OUT.csv')).toBe('OUT');
+    expect(sheetNameFromCsvFilename('Contas - casa - NOV.CSV')).toBe('NOV');
+    expect(sheetNameFromCsvFilename('Finanças 2026 - OUT (1).csv')).toBe('OUT (1)');
+  });
+
+  it('splits a long crafted name in linear time', () => {
+    const crafted = `${' - '.repeat(30_000)}x`;
+    const started = performance.now();
+
+    expect(sheetNameFromCsvFilename(crafted)).toBeNull();
+    expect(sheetNameFromCsvFilename(`${crafted}.csv`)).toBe('x');
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
+  it('returns null for other names', () => {
+    expect(sheetNameFromCsvFilename('planilha.csv')).toBeNull();
+    expect(sheetNameFromCsvFilename('OUT.csv')).toBeNull();
+    expect(sheetNameFromCsvFilename('Finanças - OUT.xlsx')).toBeNull();
+    expect(sheetNameFromCsvFilename('Finanças -  .csv')).toBeNull();
+  });
+
+  it('keeps month 10 for a CSV named "Finanças 2026 - OUT.csv", with or without a title', () => {
+    const filename = 'Finanças 2026 - OUT.csv';
+    const sheetName = sheetNameFromCsvFilename(filename) ?? undefined;
+    const rows = [['', 'Mercado', 'Casa', '', '', '', 'R$ 10,00', 'R$ 10,00']];
+
+    expect(parseMaxFinGrid(buildGrid(rows, 'Finanças Teste'), { filename, sheetName })).toMatchObject({
+      month: { year: 2026, month: 10 },
+      monthSource: 'sheet',
+    });
+    expect(
+      parseMaxFinGrid(buildGrid(rows, 'Finanças Teste\nMês de outubro de 2026'), { filename, sheetName }),
+    ).toMatchObject({ month: { year: 2026, month: 10 }, monthSource: 'title' });
+  });
+});
+
+describe('detectYearFromName', () => {
+  it('reads the first standalone 4-digit number', () => {
+    expect(detectYearFromName('FINANÇAS_2026.xlsx')).toBe(2026);
+    expect(detectYearFromName('2025-2026')).toBe(2025);
+    expect(detectYearFromName('planilha 20261.xlsx')).toBeNull();
+    expect(detectYearFromName('planilha.xlsx')).toBeNull();
+  });
+});
+
+describe('findMaxFinHeaderIndex', () => {
+  it('finds the "Descrição" header row, or -1', () => {
+    expect(findMaxFinHeaderIndex(fixtureGrid)).toBe(4);
+    expect(findMaxFinHeaderIndex([['Resumo'], ['', 'Total']])).toBe(-1);
   });
 });
 
@@ -400,10 +594,11 @@ describe('parseMaxFinGrid – fixture sections', () => {
     expect(bills.sheetTotalRealized).toBeCloseTo(1399.9, 2);
   });
 
-  it('counts and sums credit card rows; the sheet Total has no Realizado', () => {
+  it('counts and sums credit card rows, net of the refund; the sheet Total has no Realizado', () => {
     const credit = sectionOf(fixture, 'credit');
-    expect(credit.count).toBe(10);
-    expect(credit.sum).toBeCloseTo(2072.5, 2);
+    expect(credit.count).toBe(11);
+    // 2072.50 of purchases minus the 156.00 refund: the same net as the sheet Total.
+    expect(credit.sum).toBeCloseTo(1916.5, 2);
     expect(credit.sheetTotalPlanned).toBeCloseTo(1916.5, 2);
     expect(credit.sheetTotalRealized).toBeNull();
   });
@@ -416,9 +611,9 @@ describe('parseMaxFinGrid – fixture sections', () => {
     expect(debit.sheetTotalRealized).toBeCloseTo(245, 2);
   });
 
-  it('accepts 17 rows and skips 5', () => {
-    expect(fixture.rows).toHaveLength(17);
-    expect(fixture.skipped).toHaveLength(5);
+  it('accepts 18 rows and skips 4', () => {
+    expect(fixture.rows).toHaveLength(18);
+    expect(fixture.skipped).toHaveLength(4);
   });
 });
 
@@ -650,11 +845,10 @@ describe('parseMaxFinGrid – notes and share hints', () => {
 });
 
 describe('parseMaxFinGrid – skipped rows', () => {
-  it('records the carry-over, zero, negative and value-less rows with their reasons', () => {
+  it('records the carry-over, zero and value-less rows with their reasons', () => {
     expect(fixture.skipped).toEqual([
       { sourceLine: 6, description: 'Mês anterior', reason: 'Mês anterior' },
       { sourceLine: 20, description: 'Assinatura C', reason: 'valor zero' },
-      { sourceLine: 21, description: 'Estorno Loja A', reason: 'valor negativo' },
       { sourceLine: 31, description: 'Porquinho - Lazer', reason: 'sem valor' },
       { sourceLine: 32, description: 'Reserva', reason: 'sem valor' },
     ]);
@@ -670,6 +864,131 @@ describe('parseMaxFinGrid – skipped rows', () => {
 
     expect(result.skipped).toEqual([]);
     expect(result.rows.map((r) => r.description)).toEqual(['Mercado']);
+  });
+});
+
+describe('parseMaxFinGrid – negative values', () => {
+  const money = (value: string) => `R$ ${value}`;
+  const total = ['', 'Total', '', '', '', '', '', '', '', ''];
+
+  it('imports the refund of the fixture card block as a credit instead of skipping it', () => {
+    expect(rowOf(fixture, 'Estorno Loja A')).toMatchObject({
+      sourceRef: 'maxfin:2026-03:credit:21',
+      section: 'credit',
+      type: 'INCOME',
+      amount: 156,
+      planned: -156,
+      realized: -156,
+      paid: true,
+      categoryKey: 'Compras',
+      notes: 'valor negativo na planilha: lançado como crédito',
+    });
+    expect(fixture.skipped.map((row) => row.description)).not.toContain('Estorno Loja A');
+  });
+
+  it('flips the type in every block and keeps the block, so the row stays on the same account', () => {
+    const grid = buildGrid([
+      ['', 'Ajuste salário', 'Salário', '-R$ 200,00', '-R$ 200,00', '', '', '', '', ''],
+      ['', 'Aluguel', 'Moradia', '', '', '', money('1.000,00'), money('1.000,00'), '', ''],
+      ['', 'Devolução condomínio', 'Moradia', '', '', '', '-R$ 80,00', '', '', ''],
+      total,
+      ['', 'Estorno Loja Z', 'Compras', '', '', '', '-R$ 90,00', '-R$ 90,00', '', ''],
+      total,
+      ['', 'Pix devolvido', '', '', '', '', '-R$ 15,00', '-R$ 15,00', '', ''],
+      total,
+    ]);
+
+    const result = parseMaxFinGrid(grid);
+
+    expect(result.rows.map((r) => [r.description, r.section, r.type, r.amount, r.paid])).toEqual([
+      ['Ajuste salário', 'income', 'EXPENSE', 200, true],
+      ['Aluguel', 'bills', 'EXPENSE', 1000, true],
+      ['Devolução condomínio', 'bills', 'INCOME', 80, false],
+      ['Estorno Loja Z', 'credit', 'INCOME', 90, true],
+      ['Pix devolvido', 'debit', 'INCOME', 15, true],
+    ]);
+    expect(rowOf(result, 'Ajuste salário')).toMatchObject({
+      categoryKey: 'Salário',
+      notes: 'valor negativo na planilha: lançado como débito',
+    });
+    expect(rowOf(result, 'Devolução condomínio').notes).toBe('valor negativo na planilha: lançado como crédito');
+    expect(result.skipped).toEqual([]);
+  });
+
+  it('takes the sign from the realized value when there is one, otherwise from the planned one', () => {
+    const grid = buildGrid([
+      ['', 'Realizado negativo', 'Casa', '', '', '', money('100,00'), '-R$ 50,00', '', ''],
+      ['', 'Realizado positivo', 'Casa', '', '', '', '-R$ 40,00', money('40,00'), '', ''],
+      ['', 'Realizado zero', 'Casa', '', '', '', '-R$ 30,00', money('0,00'), '', ''],
+      ['', 'Tudo zero', 'Casa', '', '', '', money('0,00'), money('0,00'), '', ''],
+      total,
+      total,
+      total,
+    ]);
+
+    const result = parseMaxFinGrid(grid);
+
+    expect(rowOf(result, 'Realizado negativo')).toMatchObject({
+      type: 'INCOME',
+      amount: 50,
+      paid: true,
+      notes: 'previsto R$ 100,00 · valor negativo na planilha: lançado como crédito',
+    });
+    expect(rowOf(result, 'Realizado positivo')).toMatchObject({
+      type: 'EXPENSE',
+      amount: 40,
+      paid: true,
+      notes: 'previsto -R$ 40,00',
+    });
+    expect(rowOf(result, 'Realizado zero')).toMatchObject({
+      type: 'INCOME',
+      amount: 30,
+      paid: false,
+      notes: 'valor negativo na planilha: lançado como crédito',
+    });
+    expect(result.skipped).toEqual([{ sourceLine: 7, description: 'Tudo zero', reason: 'valor zero' }]);
+  });
+
+  it('nets the credits out of the block sum, so it compares with a sheet Total that does the same', () => {
+    const grid = buildGrid([
+      ['', 'Aluguel', 'Moradia', '', '', '', money('1.000,00'), money('1.000,00'), '', ''],
+      ['', 'Devolução', 'Moradia', '', '', '', '-R$ 80,00', '-R$ 80,00', '', ''],
+      ['', 'Total', '', '', '', '', money('920,00'), money('920,00'), '', ''],
+      ['', 'Mercado', 'Alimentação', '', '', '', money('200,00'), money('200,00'), '', ''],
+      ['', 'Estorno', 'Alimentação', '', '', '', '-R$ 50,00', '-R$ 50,00', '', ''],
+      ['', 'Total', '', '', '', '', money('150,00'), '', '', ''],
+      total,
+    ]);
+
+    const result = parseMaxFinGrid(grid);
+
+    expect(result.sections.map((s) => [s.key, s.count, s.sum])).toEqual([
+      ['income', 0, 0],
+      ['bills', 2, 920],
+      ['credit', 2, 150],
+      ['debit', 0, 0],
+    ]);
+    expect(result.warnings.filter((w) => w.includes('difere do Total'))).toEqual([]);
+  });
+
+  it('keeps the installment of a negative card row', () => {
+    const grid = buildGrid([
+      total,
+      ['', 'Estorno Loja Z 1/3', 'Compras', '', '', '', '-R$ 30,00', '-R$ 30,00', '', ''],
+      total,
+      total,
+    ]);
+
+    const row = rowOf(parseMaxFinGrid(grid), 'Estorno Loja Z 1/3');
+
+    expect(row).toMatchObject({ section: 'credit', type: 'INCOME', amount: 30 });
+    expect(row.installment).toMatchObject({
+      number: 1,
+      total: 3,
+      prepaid: 0,
+      futureCount: 2,
+      installmentId: 'maxfin:estorno-loja-z:3',
+    });
   });
 });
 
@@ -695,11 +1014,12 @@ describe('parseMaxFinGrid – footer', () => {
 describe('parseMaxFinGrid – sheet totals', () => {
   it('warns when the accepted sum differs from the sheet Total', () => {
     expect(fixture.warnings.some((w) => w.startsWith('Contas fixas'))).toBe(true);
-    expect(fixture.warnings.some((w) => w.startsWith('Cartão'))).toBe(true);
   });
 
-  it('does not warn when the accepted sum matches the sheet Total', () => {
+  it('does not warn when the accepted (net) sum matches the sheet Total', () => {
     expect(fixture.warnings.some((w) => w.startsWith('Débito/pix'))).toBe(false);
+    // The card block matches only because the refund counts against it.
+    expect(fixture.warnings.some((w) => w.startsWith('Cartão'))).toBe(false);
   });
 });
 
@@ -826,7 +1146,7 @@ describe('parseMaxFinGrid – real tokenizer end to end', () => {
 
     expect(viaTokenizer.rows.map((r) => r.sourceRef)).toEqual(fixture.rows.map((r) => r.sourceRef));
     expect(viaTokenizer.month).toEqual({ year: 2026, month: 3 });
-    expect(viaTokenizer.rows).toHaveLength(17);
+    expect(viaTokenizer.rows).toHaveLength(18);
   });
 });
 
@@ -851,6 +1171,61 @@ describe('parseMaxFinGrid – text limits', () => {
     const [row] = parseMaxFinGrid(grid).rows;
 
     expect([row?.description, row?.categoryKey, row?.notes]).toEqual(['Mercado', 'Alimentação', 'nota curta']);
+  });
+});
+
+describe('parseMaxFinGrid – long cells', () => {
+  const money = (value: string) => `R$ ${value}`;
+  const long = 'x'.repeat(30_000);
+
+  it('never takes a long cell for the header, a Total row or the carry-over', () => {
+    const grid: Grid = [
+      ['Finanças Teste\nMês de março de 2026'],
+      ['', `Descrição ${long}`],
+      ['', 'Descrição'],
+      ['', 'Mercado', 'Casa', '', '', '', money('10,00'), money('10,00')],
+      ['', `Total ${long}`, '', '', '', '', money('20,00')],
+      ['', `Mês anterior ${long}`, '', '', '', '', money('30,00')],
+    ];
+
+    const result = parseMaxFinGrid(grid);
+
+    expect(findMaxFinHeaderIndex(grid)).toBe(2);
+    expect(result.rows.map((row) => [row.sourceLine, row.section, row.amount])).toEqual([
+      [4, 'bills', 10],
+      [5, 'bills', 20],
+      [6, 'bills', 30],
+    ]);
+    expect(result.rows[1]?.description).toHaveLength(255);
+  });
+
+  it('still reads a keyword surrounded by spaces', () => {
+    const grid: Grid = [['Mês de março de 2026'], ['', `${' '.repeat(100)}Descrição${' '.repeat(100)}`]];
+
+    expect(findMaxFinHeaderIndex(grid)).toBe(1);
+  });
+
+  it('does not look for the month in a title cell longer than 1,000 characters', () => {
+    const grid: Grid = [[`${'x'.repeat(1_000)} Mês de março de 2026`], ['', 'Descrição'], ['', 'Mercado', 'Casa', '', '', '', money('10,00')]];
+
+    expect(parseMaxFinGrid(grid).month).toBeNull();
+    expect(parseMaxFinGrid([[`${'x'.repeat(900)} Mês de março de 2026`], ...grid.slice(1)]).month).toEqual({ year: 2026, month: 3 });
+  });
+
+  it('parses 2,000 rows of 30,000-character accented descriptions quickly', () => {
+    const accented = 'Çã'.repeat(15_000);
+    const grid: Grid = [
+      ['Mês de março de 2026'],
+      ['', 'Descrição'],
+      ...Array.from({ length: 2_000 }, () => ['', accented, 'Casa', '', '', '', money('1,00'), money('1,00')]),
+    ];
+    const started = performance.now();
+
+    const result = parseMaxFinGrid(grid);
+
+    expect(result.rows).toHaveLength(2_000);
+    // A few milliseconds when long cells are left alone; normalizing each of them took over a second.
+    expect(performance.now() - started).toBeLessThan(500);
   });
 });
 

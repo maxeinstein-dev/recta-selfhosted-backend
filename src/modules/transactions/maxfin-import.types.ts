@@ -1,7 +1,8 @@
 /**
  * HTTP contract of the monthly-sheet ("MaxFin") importer:
- *   POST /transactions/import/maxfin/preview  (multipart: file + accounts + options)
- *   POST /transactions/import/maxfin/confirm  (application/json: MaxFinConfirmRequest)
+ *   POST /transactions/import/maxfin/preview           (multipart: file .csv + accounts + options)
+ *   POST /transactions/import/maxfin/workbook/preview  (multipart: file .xlsx + accounts + options)
+ *   POST /transactions/import/maxfin/confirm           (application/json: MaxFinConfirmRequest, one month)
  *
  * These are the shapes the frontend consumes. Keep them free of Prisma types and
  * of internal helper types; the service maps internal structures into these.
@@ -141,7 +142,8 @@ export interface MaxFinPreviewResponse {
   month: MaxFinMonth | null;
   /** YYYY-MM or null when the month could not be detected. */
   monthKey: string | null;
-  monthSource: 'title' | 'filename' | 'override' | 'none';
+  /** 'sheet': taken from the tab name, which wins over a title that names another month (with a warning). */
+  monthSource: 'title' | 'sheet' | 'filename' | 'override' | 'none';
   householdId: string;
   accounts: MaxFinAccountsInput;
   /** Suggested options (see MaxFinImportOptions). */
@@ -208,5 +210,50 @@ export interface MaxFinConfirmResponse {
   invoicePayment: { transactionId: string; amount: number; date: string } | null;
   ids: string[];
   /** Non-fatal notices (e.g. invoice payment skipped because one already exists for the month). */
+  warnings: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Workbook (.xlsx) preview: every tab of the workbook, one MaxFinPreviewResponse per selected month.
+// Confirm stays per month (POST /transactions/import/maxfin/confirm).
+// ---------------------------------------------------------------------------
+
+/** Options of the workbook preview (multipart field `options`, JSON). */
+export interface MaxFinWorkbookOptionsInput {
+  /** 'YYYY-MM' of the months to preview; default: every month tab up to the current month. */
+  months?: string[];
+  /** Months up to this one ('YYYY-MM', inclusive) are closed; default: the month before the current one; null = none. */
+  closedThrough?: string | null;
+  /** Default true (only matters for closed months). */
+  payInvoice?: boolean;
+  /** Default true (only for the latest selected month, and only when it is open). */
+  generateFutureInstallments?: boolean;
+}
+
+export interface MaxFinWorkbookSheet {
+  name: string;
+  /** 'YYYY-MM' */
+  monthKey: string | null;
+  status: 'selected' | 'available' | 'skipped';
+  /** Why the tab is skipped (pt-BR), null otherwise. */
+  reason: string | null;
+  /** Rows read by the parser (0 when skipped). */
+  rowCount: number;
+  /** Hidden tab in the workbook (read normally; informative only). */
+  hidden: boolean;
+}
+
+export interface MaxFinWorkbookPreviewResponse {
+  filename: string;
+  householdId: string;
+  accounts: MaxFinAccountsInput;
+  options: { months: string[]; closedThrough: string | null; payInvoice: boolean; generateFutureInstallments: boolean };
+  /** In workbook (tab) order. */
+  sheets: MaxFinWorkbookSheet[];
+  /** Selected months, oldest first, each with its own options. */
+  months: MaxFinPreviewResponse[];
+  /** Merged across the selected months. */
+  categoryMap: MaxFinCategoryMapEntry[];
+  /** Workbook warnings (each month's own warnings are in months[i].warnings). */
   warnings: string[];
 }

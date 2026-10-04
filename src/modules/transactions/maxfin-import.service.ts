@@ -9,26 +9,35 @@ import {
   getCategoriesByType,
 } from '../../shared/enums/index.js';
 import { toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
-import { bufferToGrid } from '../../shared/csv/grid.js';
+import { bufferToGrid, type Grid } from '../../shared/csv/grid.js';
+import { DEFAULT_WORKBOOK_LIMITS, readWorkbookSheets, type WorkbookSheet } from '../../shared/xlsx/workbook.js';
 import { createCategory } from '../categories/categories.service.js';
-import { parseMaxFinGrid } from './parsers/maxfin.parser.js';
-import { MAXFIN_SECTION_KEYS, MAXFIN_SECTION_LABELS } from './parsers/maxfin.types.js';
-import type { MaxFinInstallment, MaxFinMonth } from './parsers/maxfin.types.js';
 import {
+  detectYearFromName,
+  findMaxFinHeaderIndex,
+  monthLabel,
+  parseMaxFinGrid,
+  sheetNameFromCsvFilename,
+} from './parsers/maxfin.parser.js';
+import { MAXFIN_SECTION_KEYS, MAXFIN_SECTION_LABELS } from './parsers/maxfin.types.js';
+import type { MaxFinInstallment, MaxFinMonth, MaxFinParseOptions, MaxFinSectionKey } from './parsers/maxfin.types.js';
+import {
+  addMonths,
   buildCategoryMap,
   buildFutureInstallments,
   coveredInstallmentNumbers,
+  invoiceNetAmount,
   invoicePaymentDate,
   invoiceTechnicalId,
   isClosedMonth,
   isFutureDraftRef,
   legacyKey,
+  mergeCategoryMaps,
   missingFutureNumbers,
   monthKey,
   normalizeLabel,
   parseLocalDateString,
   storedDateString,
-  sumAmounts,
   toLocalDateString,
   type CategoryMapEntry,
   type CategorySuggestion,
@@ -49,6 +58,9 @@ import type {
   MaxFinPreviewRow,
   MaxFinRowStatus,
   MaxFinSectionPreview,
+  MaxFinWorkbookOptionsInput,
+  MaxFinWorkbookPreviewResponse,
+  MaxFinWorkbookSheet,
 } from './maxfin-import.types.js';
 import { createTransaction, deleteTransaction, payCreditCardInvoice } from './transactions.service.js';
 
@@ -143,6 +155,8 @@ export interface ExistingBySourceRef {
   id: string;
   amount: number;
   paid: boolean;
+  /** Stored type. Amounts are absolute, so a sheet value whose sign flipped shows up here (EXPENSE <-> INCOME). */
+  type: string;
 }
 
 /** A generated future installment that a sheet row supersedes. */
@@ -151,24 +165,35 @@ export interface FuturePlaceholder {
   installmentNumber: number;
 }
 
+/** How a type reads in its block: a debit or credit is the opposite of what the block holds (a negative value). */
+function typeLabel(type: string, section: MaxFinSectionKey): string {
+  if (type === 'INCOME') return section === 'income' ? 'receita' : 'crédito';
+  if (type === 'EXPENSE') return section === 'income' ? 'débito' : 'despesa';
+  return type.toLowerCase();
+}
+
 /**
  * Classify a parsed row against what is already stored.
  * Order: same sourceRef (duplicate/changed) > generated future installments of the same plan
  * (replaces-future) > identical manual transaction without sourceRef (legacy-duplicate) > new.
+ * A stored row is a duplicate only with the same type, amount and paid flag: amounts are absolute, so a sheet
+ * value whose sign flipped (an expense turned refund) is a change of type.
  */
 export function classifyRow(
-  row: { amount: number; paid: boolean },
+  row: { amount: number; paid: boolean; type: 'INCOME' | 'EXPENSE'; section: MaxFinSectionKey },
   existing: ExistingBySourceRef | undefined,
   placeholders: FuturePlaceholder[],
   legacyMatchId: string | undefined,
 ): { status: MaxFinRowStatus; statusDetail: string | null; existingTransactionId: string | null } {
   if (existing) {
+    const sameType = existing.type === row.type;
     const sameAmount = Math.abs(existing.amount - row.amount) < 0.005;
     const samePaid = existing.paid === row.paid;
-    if (sameAmount && samePaid) {
+    if (sameType && sameAmount && samePaid) {
       return { status: 'duplicate', statusDetail: null, existingTransactionId: existing.id };
     }
     const parts: string[] = [];
+    if (!sameType) parts.push(`tipo ${typeLabel(existing.type, row.section)} → ${typeLabel(row.type, row.section)}`);
     if (!sameAmount) parts.push(`valor ${existing.amount.toFixed(2)} → ${row.amount.toFixed(2)}`);
     if (!samePaid) parts.push(`pago ${existing.paid ? 'sim' : 'não'} → ${row.paid ? 'sim' : 'não'}`);
     return { status: 'changed', statusDetail: parts.join('; '), existingTransactionId: existing.id };
@@ -259,10 +284,8 @@ export function validateConfirmRows(rows: MaxFinConfirmRow[], month: MaxFinMonth
       throw new BadRequestError(`Duplicate sourceRef in rows: ${row.sourceRef}`);
     }
     seen.add(row.sourceRef);
-    const expectedType = row.section === 'income' ? 'INCOME' : 'EXPENSE';
-    if (row.type !== expectedType) {
-      throw new BadRequestError(`Row ${row.sourceRef}: type ${row.type} does not match section ${row.section}`);
-    }
+    // The type is not tied to the block: a negative value in the sheet is a credit (INCOME) in an expense
+    // block and a debit (EXPENSE) in the income block, on the same account.
     if (!row.date.startsWith(`${key}-`)) {
       throw new BadRequestError(`Row ${row.sourceRef}: date ${row.date} is outside ${key}`);
     }
@@ -329,23 +352,42 @@ function placeholdersCovering(
 // Preview
 // ---------------------------------------------------------------------------
 
-export interface BuildPreviewParams {
-  filename: string;
-  buffer: Buffer;
+/** The household's custom categories, as the category suggestions need them. */
+async function loadCustomCategories(householdId: string): Promise<CustomCategoryRef[]> {
+  const customsRaw = await prisma.category.findMany({
+    where: { householdId },
+    select: { id: true, name: true, type: true },
+  });
+  return customsRaw.map((c) => ({
+    id: c.id,
+    name: c.name,
+    type: c.type as 'INCOME' | 'EXPENSE',
+  }));
+}
+
+export interface PreviewFromGridParams {
+  grid: Grid;
+  /** What the parser knows about the sheet's name, to find its month (see MaxFinParseOptions). */
+  naming: Pick<MaxFinParseOptions, 'filename' | 'sheetName' | 'fileYear' | 'fallbackYear'>;
   accounts: MaxFinAccountsInput;
-  /** Already resolved and authorized by the route; resolved here when omitted. */
-  resolved?: MaxFinAccountsResolved;
+  /** Resolved (and authorized) by the caller. */
+  resolved: MaxFinAccountsResolved;
   options?: MaxFinPreviewOptionsInput;
+  /** The household's custom categories, or a loader that only runs once the sheet proved to have rows. */
+  customs: CustomCategoryRef[] | (() => Promise<CustomCategoryRef[]>);
   today?: Date;
 }
 
-export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<MaxFinPreviewResponse> {
-  const resolved = params.resolved ?? (await resolveMaxFinAccounts(params.accounts));
+/**
+ * Preview of one monthly sheet already read into a grid, shared by the CSV and the workbook paths: parse,
+ * classify every row against what is stored, suggest categories and the invoice payment. Nothing is persisted.
+ */
+export async function previewFromGrid(params: PreviewFromGridParams): Promise<MaxFinPreviewResponse> {
+  const { resolved } = params;
   const { householdId } = resolved;
 
-  const { grid } = bufferToGrid(params.buffer);
-  const parsed = parseMaxFinGrid(grid, {
-    filename: params.filename,
+  const parsed = parseMaxFinGrid(params.grid, {
+    ...params.naming,
     ...(params.options?.monthOverride ? { monthOverride: params.options.monthOverride } : {}),
   });
 
@@ -360,15 +402,7 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
   const key = month ? monthKey(month) : null;
 
   // Category suggestions.
-  const customsRaw = await prisma.category.findMany({
-    where: { householdId },
-    select: { id: true, name: true, type: true },
-  });
-  const customs: CustomCategoryRef[] = customsRaw.map((c) => ({
-    id: c.id,
-    name: c.name,
-    type: c.type as 'INCOME' | 'EXPENSE',
-  }));
+  const customs = Array.isArray(params.customs) ? params.customs : await params.customs();
   const categoryMap: MaxFinCategoryMapEntry[] = buildCategoryMap(parsed.rows, customs).map(
     (e: CategoryMapEntry) => ({
       key: e.key,
@@ -383,12 +417,12 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
   const refs = parsed.rows.map((r) => r.sourceRef);
   const existingRows = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: refs } },
-    select: { id: true, sourceRef: true, amount: true, paid: true },
+    select: { id: true, sourceRef: true, amount: true, paid: true, type: true },
   });
   const existingByRef = new Map<string, ExistingBySourceRef>(
     existingRows
       .filter((t) => t.sourceRef)
-      .map((t) => [t.sourceRef as string, { id: t.id, amount: t.amount.toNumber(), paid: t.paid }]),
+      .map((t) => [t.sourceRef as string, { id: t.id, amount: t.amount.toNumber(), paid: t.paid, type: String(t.type) }]),
   );
 
   // Installment plans already stored on the card (generated placeholders and real rows).
@@ -414,12 +448,13 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
     end.setHours(23, 59, 59, 999);
     const legacy = await prisma.transaction.findMany({
       where: { householdId, accountId: { in: accountIds }, sourceRef: null, date: { gte: start, lte: end } },
-      select: { id: true, accountId: true, date: true, amount: true, description: true },
+      select: { id: true, accountId: true, date: true, amount: true, description: true, type: true },
     });
     for (const t of legacy) {
       if (!t.accountId) continue;
       // Stored @db.Date values come back as UTC midnight; parsed rows are local midnight.
-      legacyByKey.set(legacyKey(t.accountId, storedDateString(t.date), t.amount.toNumber(), t.description ?? ''), t.id);
+      const key = legacyKey(t.accountId, storedDateString(t.date), t.amount.toNumber(), t.description ?? '', String(t.type));
+      legacyByKey.set(key, t.id);
     }
   }
 
@@ -428,10 +463,10 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
     const paid = options.closedMonth ? true : r.paid;
     const planInstallment = r.section === 'credit' ? r.installment : null;
     const cls = classifyRow(
-      { amount: r.amount, paid },
+      { amount: r.amount, paid, type: r.type, section: r.section },
       existingByRef.get(r.sourceRef),
       planInstallment ? placeholdersCovering(planInstallment, placeholdersByPlan) : [],
-      legacyByKey.get(legacyKey(accountId, toLocalDateString(r.date), r.amount, r.description)),
+      legacyByKey.get(legacyKey(accountId, toLocalDateString(r.date), r.amount, r.description, r.type)),
     );
     const futureInstallments =
       planInstallment && options.generateFutureInstallments && !options.closedMonth && cls.status !== 'duplicate'
@@ -494,7 +529,13 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
     const creditRows = rows.filter(
       (r) => r.section === 'credit' && (r.status === 'new' || r.status === 'changed' || r.status === 'replaces-future'),
     );
-    const amount = sumAmounts(creditRows);
+    // Purchases minus credits (refunds): the invoice pays the net.
+    const amount = invoiceNetAmount(creditRows);
+    if (options.closedMonth && options.payInvoice && creditRows.length > 0 && amount <= 0) {
+      warnings.push(
+        `Os créditos do cartão cobrem as compras de ${key} (saldo líquido ${amount.toFixed(2)}): o pagamento da fatura não será registrado.`,
+      );
+    }
     // The payment of a month is recorded once: say so in the preview instead of promising a second one.
     const alreadyPaid = !!(await prisma.transaction.findFirst({
       where: { householdId, attachmentUrl: invoiceTechnicalId(resolved.credit.id, month) },
@@ -536,6 +577,226 @@ export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<Ma
     invoice,
     warnings,
     totals,
+  };
+}
+
+export interface BuildPreviewParams {
+  filename: string;
+  buffer: Buffer;
+  accounts: MaxFinAccountsInput;
+  /** Already resolved and authorized by the route; resolved here when omitted. */
+  resolved?: MaxFinAccountsResolved;
+  options?: MaxFinPreviewOptionsInput;
+  today?: Date;
+}
+
+/** Preview of one monthly tab uploaded as CSV. */
+export async function buildMaxFinPreview(params: BuildPreviewParams): Promise<MaxFinPreviewResponse> {
+  const resolved = params.resolved ?? (await resolveMaxFinAccounts(params.accounts));
+  const { grid } = bufferToGrid(params.buffer);
+  // Google's download of one tab is named "<workbook> - <tab>.csv": the tab name wins over a stale title.
+  const sheetName = sheetNameFromCsvFilename(params.filename);
+  return previewFromGrid({
+    grid,
+    naming: { filename: params.filename, ...(sheetName ? { sheetName } : {}) },
+    accounts: params.accounts,
+    resolved,
+    options: params.options,
+    customs: () => loadCustomCategories(resolved.householdId),
+    today: params.today,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Workbook preview
+// ---------------------------------------------------------------------------
+
+const SKIP_NO_HEADER = 'sem cabeçalho "Descrição"';
+const SKIP_NO_MONTH = 'mês não identificado';
+const SKIP_NO_ROWS = 'sem linhas para importar';
+/**
+ * Rows one workbook preview returns across its selected months. The user's ten months of 2026 hold about 850;
+ * 60 full tabs would answer with tens of megabytes of JSON.
+ */
+export const MAX_WORKBOOK_PREVIEW_ROWS = 6_000;
+
+/** A tab of the workbook after the scan. */
+interface WorkbookTab {
+  sheet: WorkbookSheet;
+  /** What the parser gets to find the tab's month (the same in the scan and in the preview). */
+  naming: Pick<MaxFinParseOptions, 'sheetName' | 'fileYear' | 'fallbackYear'>;
+  monthKey: string | null;
+  rowCount: number;
+  /** Why the tab is skipped; null for a month tab. */
+  reason: string | null;
+}
+
+/**
+ * Month and status of every tab, in tab order. The month follows the parser's rule (tab name, then title), and
+ * so does its year (see MaxFinParseOptions.sheetName), with the 4-digit year of the uploaded file name as the
+ * file-name year and the single year the titled tabs share as the last resort. The file name never gives a
+ * month: a workbook named after one month would pour that month into every tab. The first tab of a month wins.
+ */
+function scanWorkbookTabs(sheets: WorkbookSheet[], filename: string): WorkbookTab[] {
+  const hasHeader = sheets.map((sheet) => findMaxFinHeaderIndex(sheet.grid) >= 0);
+  const titleYears = new Set<number>();
+  sheets.forEach((sheet, index) => {
+    if (!hasHeader[index]) return;
+    const titled = parseMaxFinGrid(sheet.grid);
+    if (titled.monthSource === 'title' && titled.month) titleYears.add(titled.month.year);
+  });
+  const sharedTitleYear = titleYears.size === 1 ? [...titleYears][0] : undefined;
+  const fileYear = detectYearFromName(filename);
+
+  const firstTabOfMonth = new Map<string, string>();
+  return sheets.map((sheet, index) => {
+    const naming = {
+      sheetName: sheet.name,
+      ...(fileYear !== null ? { fileYear } : {}),
+      ...(sharedTitleYear !== undefined ? { fallbackYear: sharedTitleYear } : {}),
+    };
+    const parsed = parseMaxFinGrid(sheet.grid, naming);
+    const key = parsed.month ? monthKey(parsed.month) : null;
+    let reason: string | null = null;
+    if (!hasHeader[index]) reason = SKIP_NO_HEADER;
+    else if (key === null) reason = SKIP_NO_MONTH;
+    else if (parsed.rows.length === 0) reason = SKIP_NO_ROWS;
+    else if (firstTabOfMonth.has(key)) reason = `mês repetido (vale a aba "${firstTabOfMonth.get(key)}")`;
+    else firstTabOfMonth.set(key, sheet.name);
+    return { sheet, naming, monthKey: key, rowCount: reason === null ? parsed.rows.length : 0, reason };
+  });
+}
+
+/** `requested` when given (each must be a month tab), otherwise every month tab up to the current month; oldest first. */
+function selectMonths(
+  requested: string[] | undefined,
+  monthTabs: ReadonlyMap<string, WorkbookTab>,
+  currentMonthKey: string,
+): string[] {
+  const available = [...monthTabs.keys()].sort();
+  if (requested === undefined) return available.filter((key) => key <= currentMonthKey);
+  const selected = [...new Set(requested)].sort();
+  const unknown = selected.filter((key) => !monthTabs.has(key));
+  if (unknown.length > 0) {
+    throw new BadRequestError(
+      `Not a month tab of this workbook: ${unknown.join(', ')} (available: ${available.join(', ')}).`,
+    );
+  }
+  return selected;
+}
+
+export interface BuildWorkbookPreviewParams {
+  filename: string;
+  buffer: Buffer;
+  accounts: MaxFinAccountsInput;
+  /** Already resolved and authorized by the route; resolved here when omitted. */
+  resolved?: MaxFinAccountsResolved;
+  options?: MaxFinWorkbookOptionsInput;
+  today?: Date;
+}
+
+/**
+ * Preview of a whole MaxFin workbook (.xlsx). Every tab is read and classified (selected, available, or skipped
+ * with a reason); every selected month becomes the same preview its CSV export would give, with its own options:
+ * closed up to `closedThrough`, the invoice payment as asked, and future installments only from the latest month.
+ * Nothing is persisted; the client confirms month by month.
+ */
+export async function buildMaxFinWorkbookPreview(
+  params: BuildWorkbookPreviewParams,
+): Promise<MaxFinWorkbookPreviewResponse> {
+  const resolved = params.resolved ?? (await resolveMaxFinAccounts(params.accounts));
+  const today = params.today ?? new Date();
+  const input = params.options ?? {};
+
+  const tabs = scanWorkbookTabs(await readWorkbookSheets(params.buffer), params.filename);
+  const monthTabs = new Map<string, WorkbookTab>();
+  for (const tab of tabs) {
+    if (tab.reason === null && tab.monthKey !== null) monthTabs.set(tab.monthKey, tab);
+  }
+  if (monthTabs.size === 0) {
+    const reasons = tabs.slice(0, 10).map((tab) => `${tab.sheet.name}: ${tab.reason}`);
+    throw new BadRequestError(`No month tab found in the workbook (${reasons.join('; ') || 'it has no sheets'}).`);
+  }
+
+  const currentMonth: MaxFinMonth = { year: today.getFullYear(), month: today.getMonth() + 1 };
+  const selected = selectMonths(input.months, monthTabs, monthKey(currentMonth));
+  const rowsOf = (keys: readonly string[]) => keys.reduce((sum, key) => sum + (monthTabs.get(key)?.rowCount ?? 0), 0);
+  const selectionWarnings: string[] = [];
+  if (input.months === undefined && rowsOf(selected) > MAX_WORKBOOK_PREVIEW_ROWS) {
+    // The default selection leaves its oldest months out until it fits, so the user still gets the month picker.
+    const leftOut: string[] = [];
+    while (selected.length > 1 && rowsOf(selected) > MAX_WORKBOOK_PREVIEW_ROWS) leftOut.push(selected.shift()!);
+    const labels = leftOut.map((key) => monthLabel({ year: Number(key.slice(0, 4)), month: Number(key.slice(5, 7)) }));
+    selectionWarnings.push(
+      `Os meses mais antigos ficaram desmarcados (${labels.join(', ')}): com eles a seleção passava de ` +
+        `${MAX_WORKBOOK_PREVIEW_ROWS.toLocaleString('pt-BR')} linhas. Importe estes meses e depois marque os outros.`,
+    );
+  }
+  const selectedRows = rowsOf(selected);
+  if (selectedRows > MAX_WORKBOOK_PREVIEW_ROWS) {
+    throw new BadRequestError(
+      `The selected months hold ${selectedRows.toLocaleString('en-US')} rows, more than one preview returns ` +
+        `(${MAX_WORKBOOK_PREVIEW_ROWS.toLocaleString('en-US')}); select fewer months.`,
+    );
+  }
+  const closedThrough =
+    input.closedThrough === undefined ? monthKey(addMonths(currentMonth, -1)) : input.closedThrough;
+  const payInvoice = input.payInvoice ?? true;
+  const generateFutureInstallments = input.generateFutureInstallments ?? true;
+  const latest = selected[selected.length - 1];
+
+  // One query for the whole workbook, none when no month is selected.
+  const customs = selected.length > 0 ? await loadCustomCategories(resolved.householdId) : [];
+  const months: MaxFinPreviewResponse[] = [];
+  for (const key of selected) {
+    const tab = monthTabs.get(key)!;
+    const closedMonth = closedThrough !== null && key <= closedThrough;
+    months.push(
+      await previewFromGrid({
+        grid: tab.sheet.grid,
+        naming: tab.naming,
+        accounts: params.accounts,
+        resolved,
+        options: {
+          closedMonth,
+          payInvoice,
+          // Only the latest month generates the installments still to come, and only while it is open.
+          generateFutureInstallments: key === latest && !closedMonth ? generateFutureInstallments : false,
+        },
+        customs,
+        today,
+      }),
+    );
+  }
+
+  const isSelected = new Set(selected);
+  const { maxRows, maxColumns } = DEFAULT_WORKBOOK_LIMITS;
+  return {
+    filename: params.filename,
+    householdId: resolved.householdId,
+    accounts: params.accounts,
+    options: { months: selected, closedThrough, payInvoice, generateFutureInstallments },
+    sheets: tabs.map(
+      (tab): MaxFinWorkbookSheet => ({
+        name: tab.sheet.name,
+        monthKey: tab.monthKey,
+        status: tab.reason !== null ? 'skipped' : isSelected.has(tab.monthKey ?? '') ? 'selected' : 'available',
+        reason: tab.reason,
+        rowCount: tab.rowCount,
+        hidden: tab.sheet.hidden,
+      }),
+    ),
+    months,
+    categoryMap: mergeCategoryMaps(months.map((month) => month.categoryMap)),
+    warnings: [
+      ...selectionWarnings,
+      ...tabs
+      .filter((tab) => tab.sheet.truncated)
+      .map(
+        (tab) =>
+          `A aba "${tab.sheet.name}" tem valores além de ${maxRows} linhas ou ${maxColumns} colunas; só esse trecho foi lido.`,
+      ),
+    ],
   };
 }
 
@@ -745,8 +1006,9 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
             {
               householdId,
               accountId: resolved.credit.id,
-              type: TransactionType.EXPENSE,
-              categoryName: categories.categoryNameFor(draft.categoryKey, 'EXPENSE'),
+              // A refund paid back in installments (INCOME row) generates INCOME installments.
+              type: row.type === 'INCOME' ? TransactionType.INCOME : TransactionType.EXPENSE,
+              categoryName: categories.categoryNameFor(draft.categoryKey, row.type),
               amount: draft.amount,
               description: draft.description.slice(0, 255),
               date: draft.date,
@@ -773,13 +1035,18 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   // Invoice payment for closed months.
   let invoicePayment: MaxFinConfirmResponse['invoicePayment'] = null;
   if (options.closedMonth && options.payInvoice) {
-    const amount = sumAmounts(importedCreditRows);
+    // Purchases minus credits (refunds) imported in this call.
+    const amount = invoiceNetAmount(importedCreditRows);
     if (resolved.credit.type !== AccountType.CREDIT) {
       warnings.push('Pagamento de fatura não registrado: a conta do cartão não é do tipo crédito.');
     } else if (resolved.bills.type === AccountType.CREDIT || resolved.bills.id === resolved.credit.id) {
       warnings.push('Pagamento de fatura não registrado: a conta de contas fixas é um cartão de crédito (ou o próprio cartão).');
-    } else if (amount <= 0) {
+    } else if (importedCreditRows.length === 0) {
       warnings.push('Pagamento de fatura não registrado: nenhuma compra de cartão foi importada nesta confirmação.');
+    } else if (amount <= 0) {
+      warnings.push(
+        `Pagamento de fatura não registrado: os créditos do cartão importados nesta confirmação cobrem as compras (saldo líquido ${amount.toFixed(2)}).`,
+      );
     } else {
       const technicalIdentifier = invoiceTechnicalId(resolved.credit.id, month);
       const already = await prisma.transaction.findFirst({

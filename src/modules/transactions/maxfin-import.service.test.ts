@@ -75,6 +75,7 @@ const REF = {
   lojaA: 'maxfin:2026-03:credit:17', // "Loja A 3/10": 7 installments to come
   cursoB: 'maxfin:2026-03:credit:18', // "Curso B 5/12 +7": plan settled by the prepayment
   remedios: 'maxfin:2026-03:credit:19', // "Remédios 1/4 + 1": 2 installments to come
+  refund: 'maxfin:2026-03:credit:21', // "Estorno Loja A", -156.00 in the sheet: a credit on the card
   uber: 'maxfin:2026-03:credit:25',
   luz: 'maxfin:2026-03:debit:30',
   padaria: 'maxfin:2026-03:debit:33',
@@ -216,6 +217,8 @@ interface StoredRow {
   sourceRef?: string | null;
   amount?: number;
   paid?: boolean;
+  /** Defaults to INCOME for a sourceRef of the income block, EXPENSE otherwise. */
+  type?: 'INCOME' | 'EXPENSE';
   /** @db.Date columns come back from Prisma as UTC midnight. */
   date?: Date;
   description?: string | null;
@@ -278,6 +281,7 @@ function useStore(rows: StoredRow[]): void {
     installmentId: null,
     installmentNumber: null,
     ...row,
+    type: row.type ?? (row.sourceRef?.includes(':income:') ? 'INCOME' : 'EXPENSE'),
   }));
   db.transactionFindMany.mockImplementation(async (args: { where: TransactionWhere }) => {
     const unsupported = Object.keys(args.where).filter((key) => !SUPPORTED_WHERE_KEYS.has(key));
@@ -565,14 +569,14 @@ describe('validateConfirmRows', () => {
   });
 
   it.each<{ label: string; section: MaxFinSectionKey; type: 'INCOME' | 'EXPENSE' }>([
-    { label: 'an INCOME row under the credit section', section: 'credit', type: 'INCOME' },
-    { label: 'an INCOME row under the bills section', section: 'bills', type: 'INCOME' },
-    { label: 'an INCOME row under the debit section', section: 'debit', type: 'INCOME' },
-    { label: 'an EXPENSE row under the income section', section: 'income', type: 'EXPENSE' },
-  ])('rejects $label', ({ section, type }) => {
+    { label: 'an INCOME row (a credit) under the credit section', section: 'credit', type: 'INCOME' },
+    { label: 'an INCOME row (a credit) under the bills section', section: 'bills', type: 'INCOME' },
+    { label: 'an INCOME row (a credit) under the debit section', section: 'debit', type: 'INCOME' },
+    { label: 'an EXPENSE row (a debit) under the income section', section: 'income', type: 'EXPENSE' },
+  ])('accepts $label, which a negative value in the sheet produces', ({ section, type }) => {
     const row = makeConfirmRow({ section, type });
 
-    expect(() => validateConfirmRows([row], MARCH)).toThrow(isBadRequest('does not match section'));
+    expect(validateConfirmRows([row], MARCH).map((validated) => validated.type)).toEqual([type]);
   });
 
   it.each(['2026-04-01', '2026-02-28', '2025-03-01', '2026-03', '2026-13-01'])(
@@ -755,6 +759,34 @@ describe('confirmMaxFinImport: rows already stored', () => {
 
     expect(db.deleteTransaction).not.toHaveBeenCalled();
     expect(result).toMatchObject({ imported: 1, replaced: 0 });
+  });
+});
+
+describe('confirmMaxFinImport: a value whose sign flipped since the last import', () => {
+  const refund = () =>
+    makeConfirmRow({ section: 'credit', type: 'INCOME', sourceRef: REF.refund, description: 'Estorno Loja A', amount: 156 });
+
+  it('skips the row without replace, like any other stored row', async () => {
+    useStore([{ id: 'old-refund', sourceRef: REF.refund, amount: 156, type: 'EXPENSE' }]);
+
+    const result = await confirm([refund()]);
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, replaced: 0 });
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+    expect(db.createTransaction).not.toHaveBeenCalled();
+  });
+
+  it('with replace, deletes the stored expense and creates the credit in its place', async () => {
+    useStore([{ id: 'old-refund', sourceRef: REF.refund, amount: 156, type: 'EXPENSE' }]);
+
+    const result = await confirm([{ ...refund(), replace: true }]);
+
+    expect(db.deleteTransaction).toHaveBeenCalledWith('old-refund', HOUSEHOLD);
+    expect(callOrder(db.deleteTransaction)).toBeLessThan(callOrder(db.createTransaction));
+    expect(createdInputs()).toEqual([
+      expect.objectContaining({ sourceRef: REF.refund, type: 'INCOME', amount: 156, accountId: 'acc-credit' }),
+    ]);
+    expect(result).toMatchObject({ imported: 0, replaced: 1, skipped: 0 });
   });
 });
 
@@ -1428,6 +1460,75 @@ describe('confirmMaxFinImport: invoice payment', () => {
   });
 });
 
+describe('confirmMaxFinImport: credits (negative values in the sheet)', () => {
+  const purchase = (line: number, amount: number) =>
+    makeConfirmRow({ section: 'credit', sourceRef: `maxfin:2026-03:credit:${line}`, amount, categoryKey: 'Compras' });
+  const credit = (line: number, amount: number, overrides: Partial<MaxFinConfirmRow> = {}) =>
+    makeConfirmRow({
+      section: 'credit',
+      type: 'INCOME',
+      sourceRef: `maxfin:2026-03:credit:${line}`,
+      description: 'Estorno Loja Z',
+      categoryKey: 'Compras',
+      amount,
+      ...overrides,
+    });
+
+  it('creates a card credit as INCOME on the card account, paid', async () => {
+    await confirm([credit(21, 156)], { options: CLOSED });
+
+    expect(createdInputs()).toEqual([
+      expect.objectContaining({
+        accountId: 'acc-credit',
+        type: 'INCOME',
+        amount: 156,
+        paid: true,
+        categoryName: CategoryName.OTHER_INCOME,
+        sourceRef: 'maxfin:2026-03:credit:21',
+      }),
+    ]);
+  });
+
+  it('pays the invoice with the purchases minus the credits created in the call', async () => {
+    const result = await confirm([purchase(16, 100.1), credit(21, 30.05)], { options: CLOSED_WITH_INVOICE });
+
+    expect(db.payCreditCardInvoice).toHaveBeenCalledTimes(1);
+    expect(db.payCreditCardInvoice).toHaveBeenCalledWith(expect.objectContaining({ amount: 70.05 }));
+    expect(result.invoicePayment).toMatchObject({ amount: 70.05 });
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('records no payment, and says why, when the credits cover the purchases', async () => {
+    const result = await confirm([purchase(16, 50), credit(21, 50)], { options: CLOSED_WITH_INVOICE });
+
+    expect(db.payCreditCardInvoice).not.toHaveBeenCalled();
+    expect(result.invoicePayment).toBeNull();
+    expect(result.warnings).toEqual([expect.stringContaining('cobrem as compras')]);
+    expect(result.imported).toBe(2);
+  });
+
+  it('generates the future installments of a refund paid back in installments as INCOME', async () => {
+    const categoryMap: MaxFinCategoryMapInput[] = [
+      { key: 'Compras', type: 'INCOME', target: { kind: 'system', categoryName: CategoryName.SALES } },
+    ];
+    const row = credit(21, 30, {
+      description: 'Estorno Loja Z 1/3',
+      installment: makeInstallment('Estorno Loja Z', 1, 3),
+    });
+
+    const result = await confirm([row], { options: OPEN_WITH_FUTURES, categoryMap });
+
+    const [base, ...futures] = createdInputs();
+    expect(base).toMatchObject({ type: 'INCOME', installmentNumber: 1, categoryName: 'SALES' });
+    expect(futures.map((f) => [f.type, f.installmentNumber, f.amount, f.accountId, f.categoryName])).toEqual([
+      ['INCOME', 2, 30, 'acc-credit', 'SALES'],
+      ['INCOME', 3, 30, 'acc-credit', 'SALES'],
+    ]);
+    expect(futures.map((f) => f.description)).toEqual(['Estorno Loja Z 2/3', 'Estorno Loja Z 3/3']);
+    expect(result.futureInstallments).toBe(2);
+  });
+});
+
 describe('confirmMaxFinImport: nothing is written for an invalid request', () => {
   const withNewCategory: MaxFinCategoryMapInput[] = [
     { key: 'Casa', type: 'EXPENSE', target: { kind: 'create', name: 'Casa' } },
@@ -1488,14 +1589,14 @@ describe('confirmMaxFinImport: account resolution', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
-  it('lists the 17 readable rows as new', async () => {
+  it('lists the 18 readable rows as new', async () => {
     const preview = await previewSample();
 
-    expect(preview.rows).toHaveLength(17);
+    expect(preview.rows).toHaveLength(18);
     expect(preview.rows.every((row) => row.status === 'new')).toBe(true);
     expect(preview.rows.every((row) => row.statusDetail === null && row.existingTransactionId === null)).toBe(true);
-    expect(preview.totals).toEqual({ rows: 17, new: 17, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 5 });
-    expect(preview.skipped).toHaveLength(5);
+    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 4 });
+    expect(preview.skipped).toHaveLength(4);
   });
 
   it('detects the sheet month from its title', async () => {
@@ -1511,7 +1612,7 @@ describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
     expect(preview.sections.map((s) => [s.key, s.count, s.sum])).toEqual([
       ['income', 2, 6000],
       ['bills', 3, 1549.9],
-      ['credit', 10, 2072.5],
+      ['credit', 11, 1916.5],
       ['debit', 2, 245],
     ]);
     expect(preview.sections.map((s) => s.label)).toEqual(['Entradas', 'Contas fixas', 'Cartão', 'Débito/pix']);
@@ -1519,7 +1620,7 @@ describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
     expect(preview.sections.map((s) => [s.newCount, s.duplicateCount, s.changedCount])).toEqual([
       [2, 0, 0],
       [3, 0, 0],
-      [10, 0, 0],
+      [11, 0, 0],
       [2, 0, 0],
     ]);
   });
@@ -1539,7 +1640,7 @@ describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
       sourceAccountId: 'acc-bills',
       month: '2026-03',
       paymentDate: '2026-03-09',
-      amount: 2072.5,
+      amount: 1916.5,
       dueDay: 9,
       closingDay: 2,
       alreadyPaid: false,
@@ -1629,6 +1730,53 @@ describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
   });
 });
 
+describe('buildMaxFinPreview: negative values become credits', () => {
+  it('previews the refund of the card block as an INCOME row on the card account', async () => {
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.refund)).toMatchObject({
+      section: 'credit',
+      accountId: 'acc-credit',
+      type: 'INCOME',
+      amount: 156,
+      paid: true,
+      status: 'new',
+      notes: 'valor negativo na planilha: lançado como crédito',
+    });
+    expect(preview.categoryMap.find((e) => e.key === 'Compras' && e.type === 'INCOME')).toMatchObject({
+      count: 1,
+      sections: ['credit'],
+    });
+  });
+
+  it('pays the purchases minus the credits, which is the sheet Total of the card', async () => {
+    const preview = await previewSample();
+
+    // 2072.50 of purchases minus the 156.00 refund.
+    expect(preview.invoice).toMatchObject({ amount: 1916.5, willPay: true });
+    expect(preview.warnings.filter((w) => w.startsWith('Cartão'))).toEqual([]);
+  });
+
+  it('does not offer to pay, and says why, when the credits cover the purchases', async () => {
+    const sheet = Buffer.from(
+      [
+        '"Finanças Teste\nMês de março de 2026",,,,,,,,,',
+        ',Descrição,Categoria,Entrada - Previsto ,Recebido ,À receber,Saída - Previsto,Realizado ,Saldo,',
+        ',Total,,,,,"R$ 0,00",,,',
+        ',Loja Z,Compras,,,,"R$ 40,00","R$ 40,00",,',
+        ',Estorno Loja Z,Compras,,,,"-R$ 100,00","-R$ 100,00",,',
+        ',Total,,,,,"-R$ 60,00",,,',
+        ',Total,,,,,"R$ 0,00",,,',
+      ].join('\r\n'),
+    );
+
+    const preview = await previewSample({ buffer: sheet });
+
+    expect(preview.invoice).toMatchObject({ amount: -60, willPay: false });
+    expect(preview.warnings).toContainEqual(expect.stringContaining('cobrem as compras'));
+  });
+});
+
 describe('buildMaxFinPreview: rows that are already stored', () => {
   it('marks a row as duplicate when the same sourceRef is stored with the same amount and paid flag', async () => {
     useStore([{ id: 'old-rent', sourceRef: REF.rent, accountId: 'acc-bills', amount: 1300, paid: true }]);
@@ -1640,7 +1788,7 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
       statusDetail: null,
       existingTransactionId: 'old-rent',
     });
-    expect(preview.totals).toMatchObject({ rows: 17, new: 16, duplicate: 1, changed: 0 });
+    expect(preview.totals).toMatchObject({ rows: 18, new: 17, duplicate: 1, changed: 0 });
   });
 
   it('marks a row as changed, with both amounts, when the same sourceRef is stored with another amount', async () => {
@@ -1653,7 +1801,7 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
       statusDetail: 'valor 20.00 → 25.00',
       existingTransactionId: 'old-uber',
     });
-    expect(preview.totals).toMatchObject({ new: 16, duplicate: 0, changed: 1 });
+    expect(preview.totals).toMatchObject({ new: 17, duplicate: 0, changed: 1 });
   });
 
   it('marks a row as changed when only the paid flag differs from the (closed month) previewed one', async () => {
@@ -1678,15 +1826,15 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
 
     const preview = await previewSample();
 
-    expect(preview.totals).toEqual({ rows: 17, new: 13, duplicate: 2, changed: 2, legacyDuplicate: 0, skipped: 5 });
+    expect(preview.totals).toEqual({ rows: 18, new: 14, duplicate: 2, changed: 2, legacyDuplicate: 0, skipped: 4 });
     expect(preview.sections.map((s) => [s.key, s.newCount, s.duplicateCount, s.changedCount])).toEqual([
       ['income', 1, 0, 1],
       ['bills', 2, 1, 0],
-      ['credit', 8, 1, 1],
+      ['credit', 9, 1, 1],
       ['debit', 2, 0, 0],
     ]);
-    // The new and changed credit rows only: 2072.50 minus the 450.00 duplicate.
-    expect(preview.invoice).toMatchObject({ amount: 1622.5, willPay: true });
+    // The new and changed credit rows only: 1916.50 (purchases minus the refund) minus the 450.00 duplicate.
+    expect(preview.invoice).toMatchObject({ amount: 1466.5, willPay: true });
   });
 
   it('ignores a stored row of another household that has the same sourceRef', async () => {
@@ -1695,6 +1843,52 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
     const preview = await previewSample();
 
     expect(rowOf(preview, REF.rent).status).toBe('new');
+  });
+});
+
+describe('buildMaxFinPreview: a value whose sign flipped since the last import', () => {
+  it('reports an expense that became a refund as changed, not duplicate', async () => {
+    useStore([{ id: 'old-refund', sourceRef: REF.refund, amount: 156, paid: true, type: 'EXPENSE' }]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.refund)).toMatchObject({
+      type: 'INCOME',
+      status: 'changed',
+      statusDetail: 'tipo despesa → crédito',
+      existingTransactionId: 'old-refund',
+    });
+  });
+
+  it('reports a credit that became an expense as changed, and an income that became a debit', async () => {
+    useStore([
+      { id: 'old-market', sourceRef: REF.market, amount: 450, paid: true, type: 'INCOME' },
+      { id: 'old-salary', sourceRef: 'maxfin:2026-03:income:7', accountId: 'acc-income', amount: 5200, paid: true, type: 'EXPENSE' },
+    ]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.market)).toMatchObject({ status: 'changed', statusDetail: 'tipo crédito → despesa' });
+    expect(rowOf(preview, 'maxfin:2026-03:income:7')).toMatchObject({ status: 'changed', statusDetail: 'tipo débito → receita' });
+    expect(preview.totals).toMatchObject({ duplicate: 0, changed: 2 });
+  });
+
+  it('does not take a stored row of the opposite type for a legacy duplicate', async () => {
+    useStore([
+      {
+        id: 'legacy-credit',
+        sourceRef: null,
+        accountId: 'acc-debit',
+        amount: 35,
+        description: 'Pix Padaria',
+        type: 'INCOME',
+        date: new Date('2026-03-01T00:00:00.000Z'),
+      },
+    ]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.padaria).status).toBe('new');
   });
 });
 
@@ -1717,7 +1911,7 @@ describe('buildMaxFinPreview: rows imported without a sourceRef', () => {
 
     expect(rowOf(preview, REF.padaria)).toMatchObject({ status: 'legacy-duplicate', existingTransactionId: 'legacy-1' });
     expect(rowOf(preview, REF.padaria).statusDetail).toEqual(expect.stringContaining('sem identificador de origem'));
-    expect(preview.totals).toMatchObject({ rows: 17, new: 16, legacyDuplicate: 1 });
+    expect(preview.totals).toMatchObject({ rows: 18, new: 17, legacyDuplicate: 1 });
     expect(preview.sections.find((s) => s.key === 'debit')).toMatchObject({ newCount: 1, duplicateCount: 1 });
   });
 
@@ -1743,7 +1937,7 @@ describe('buildMaxFinPreview: rows imported without a sourceRef', () => {
     const preview = await previewSample();
 
     expect(rowOf(preview, REF.uber).status).toBe('legacy-duplicate');
-    expect(preview.invoice).toMatchObject({ amount: 2047.5 });
+    expect(preview.invoice).toMatchObject({ amount: 1891.5 });
   });
 
   it('looks for legacy rows without sourceRef only, in the household and in the four destination accounts', async () => {
@@ -1776,9 +1970,9 @@ describe('buildMaxFinPreview: generated future installments', () => {
     const row = rowOf(preview, REF.lojaA);
     expect(row).toMatchObject({ status: 'replaces-future', existingTransactionId: 'ph-3' });
     expect(row.statusDetail).toMatch(/\b3\b/);
-    expect(preview.totals).toEqual({ rows: 17, new: 17, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 5 });
-    expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 10, duplicateCount: 0 });
-    expect(preview.invoice).toMatchObject({ amount: 2072.5 });
+    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 4 });
+    expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 11, duplicateCount: 0 });
+    expect(preview.invoice).toMatchObject({ amount: 1916.5 });
   });
 
   it('covers every number a prepaid row pays (5/12 +7 covers 5..12)', async () => {
@@ -1803,7 +1997,7 @@ describe('buildMaxFinPreview: generated future installments', () => {
     const preview = await previewSample();
 
     expect(rowOf(preview, REF.cursoB).status).toBe('new');
-    expect(preview.totals.new).toBe(17);
+    expect(preview.totals.new).toBe(18);
   });
 });
 
@@ -1870,7 +2064,7 @@ describe('buildMaxFinPreview: open month', () => {
     const preview = await previewSample({ today: MARCH_15 });
 
     expect(preview.options).toEqual({ closedMonth: false, payInvoice: false, generateFutureInstallments: true });
-    expect(preview.invoice).toMatchObject({ amount: 2072.5, willPay: false });
+    expect(preview.invoice).toMatchObject({ amount: 1916.5, willPay: false });
   });
 
   it('keeps the paid flag of the sheet', async () => {
@@ -1950,7 +2144,7 @@ describe('buildMaxFinPreview: warnings', () => {
     const preview = await previewSample({ resolved: makeAccounts({ bills: { type: AccountType.CREDIT } }) });
 
     expect(preview.warnings).toContainEqual(expect.stringContaining('conta de contas fixas'));
-    expect(preview.invoice).toMatchObject({ amount: 2072.5, willPay: false });
+    expect(preview.invoice).toMatchObject({ amount: 1916.5, willPay: false });
   });
 
   it('warns, and offers no invoice, when the card account is not a credit account', async () => {
@@ -1958,6 +2152,63 @@ describe('buildMaxFinPreview: warnings', () => {
 
     expect(preview.warnings).toContainEqual(expect.stringMatching(/Nubank Teste.*não é um cartão de crédito/));
     expect(preview.invoice).toBeNull();
+  });
+});
+
+describe('buildMaxFinPreview: month of a CSV downloaded from one tab', () => {
+  it('takes the month of the tab in the file name over a stale title, with a warning', async () => {
+    const preview = await previewSample({ filename: 'FINANCAS_2026.xlsx - NOV.csv', today: new Date(2026, 11, 15) });
+
+    expect(preview).toMatchObject({ month: { year: 2026, month: 11 }, monthKey: '2026-11', monthSource: 'sheet' });
+    expect(preview.warnings).toContain(
+      'O título da aba diz março/2026, mas a aba se chama "NOV": usei novembro/2026 (ano do nome do arquivo).',
+    );
+    expect(preview.rows.every((row) => row.sourceRef.startsWith('maxfin:2026-11:') && row.date === '2026-11-01')).toBe(
+      true,
+    );
+  });
+
+  it('keeps the title month when the tab in the file name agrees with it', async () => {
+    const preview = await previewSample({ filename: 'FINANCAS_2026.xlsx - MAR.csv' });
+
+    expect(preview).toMatchObject({ monthKey: '2026-03', monthSource: 'title' });
+    expect(preview.warnings.filter((warning) => warning.includes('título da aba'))).toEqual([]);
+  });
+});
+
+describe('buildMaxFinPreview: CSV of a tab whose title names another month', () => {
+  const DECEMBER_TITLED = Buffer.from(SAMPLE_CSV.toString('utf8').replace('Mês de março de 2026', 'Mês de dezembro de 2026'));
+  const OCTOBER_TITLED = Buffer.from(SAMPLE_CSV.toString('utf8').replace('Mês de março de 2026', 'Mês de outubro de 2026'));
+
+  it('previews JAN copied from DEZ in a file named for the next year as January of that year', async () => {
+    const preview = await previewSample({
+      buffer: DECEMBER_TITLED,
+      filename: 'FINANCAS_2027.xlsx - JAN.csv',
+      today: new Date(2027, 1, 10),
+    });
+
+    expect(preview).toMatchObject({ monthKey: '2027-01', monthSource: 'sheet', options: { closedMonth: true } });
+    expect(preview.warnings).toContain(
+      'O título da aba diz dezembro/2026, mas a aba se chama "JAN": usei janeiro/2027 (ano do nome do arquivo).',
+    );
+    expect(preview.rows.every((row) => row.sourceRef.startsWith('maxfin:2027-01:') && row.date === '2027-01-01')).toBe(true);
+  });
+
+  it('keeps a backward copy in the year of the file name and December in the title year', async () => {
+    const backward = await previewSample({ buffer: OCTOBER_TITLED, filename: 'FINANCAS_2026.xlsx - SET.csv' });
+    const december = await previewSample({ buffer: DECEMBER_TITLED, filename: 'FINANCAS_2027.xlsx - DEZ.csv' });
+
+    expect(backward).toMatchObject({ monthKey: '2026-09', monthSource: 'sheet' });
+    expect(december).toMatchObject({ monthKey: '2026-12', monthSource: 'title' });
+  });
+
+  it('with no year but the title, moves JAN copied from DEZ to the next year', async () => {
+    const preview = await previewSample({ buffer: DECEMBER_TITLED, filename: 'Planilha.xlsx - JAN.csv', today: new Date(2027, 1, 10) });
+
+    expect(preview).toMatchObject({ monthKey: '2027-01', monthSource: 'sheet' });
+    expect(preview.warnings).toContain(
+      'O título da aba diz dezembro/2026, mas a aba se chama "JAN": usei janeiro/2027 (ano seguinte ao do título: a aba é uma cópia feita depois dele).',
+    );
   });
 });
 
@@ -2020,7 +2271,7 @@ describe('buildMaxFinPreview: invoice payment offer', () => {
       where: { householdId: HOUSEHOLD, attachmentUrl: 'invoice_pay:acc-credit:2026-2' },
       select: { id: true },
     });
-    expect(preview.invoice).toMatchObject({ alreadyPaid: true, willPay: false, amount: 2072.5 });
+    expect(preview.invoice).toMatchObject({ alreadyPaid: true, willPay: false, amount: 1916.5 });
   });
 
   it('looks for the payment of the sheet month only when the card is a credit account', async () => {
@@ -2048,6 +2299,7 @@ describe('buildMaxFinPreview: invoice payment offer', () => {
       [REF.lojaA, 90],
       [REF.cursoB, 640],
       [REF.remedios, 200],
+      [REF.refund, 156],
       ['maxfin:2026-03:credit:22', 180],
       ['maxfin:2026-03:credit:23', 75],
       ['maxfin:2026-03:credit:24', 320],
@@ -2055,11 +2307,19 @@ describe('buildMaxFinPreview: invoice payment offer', () => {
       ['maxfin:2026-03:credit:26', 32.5],
       ['maxfin:2026-03:credit:27', 60],
     ];
-    useStore(creditRows.map(([sourceRef, amount], index) => ({ id: `old-${index}`, sourceRef, amount, paid: true })));
+    useStore(
+      creditRows.map(([sourceRef, amount], index) => ({
+        id: `old-${index}`,
+        sourceRef,
+        amount,
+        paid: true,
+        type: sourceRef === REF.refund ? 'INCOME' : 'EXPENSE',
+      })),
+    );
 
     const preview = await previewSample();
 
-    expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 0, duplicateCount: 10 });
+    expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 0, duplicateCount: 11 });
     expect(preview.invoice).toMatchObject({ amount: 0, willPay: false });
   });
 });
@@ -2169,8 +2429,8 @@ describe('resolveImportOptions', () => {
 });
 
 describe('classifyRow', () => {
-  const row = { amount: 640.07, paid: true };
-  const stored = { id: 't1', amount: 640.07, paid: true };
+  const row = { amount: 640.07, paid: true, type: 'EXPENSE', section: 'credit' } as const;
+  const stored = { id: 't1', amount: 640.07, paid: true, type: 'EXPENSE' };
   const generated = [
     { id: 'ph-4', installmentNumber: 4 },
     { id: 'ph-5', installmentNumber: 5 },
@@ -2193,12 +2453,12 @@ describe('classifyRow', () => {
   });
 
   it('treats an amount that differs by less than a cent as the same amount', () => {
-    expect(classifyRow({ amount: 640.074, paid: true }, stored, [], undefined).status).toBe('duplicate');
-    expect(classifyRow({ amount: 640.08, paid: true }, stored, [], undefined).status).toBe('changed');
+    expect(classifyRow({ ...row, amount: 640.074 }, stored, [], undefined).status).toBe('duplicate');
+    expect(classifyRow({ ...row, amount: 640.08 }, stored, [], undefined).status).toBe('changed');
   });
 
   it('is changed when the amount differs, and says from what to what', () => {
-    expect(classifyRow({ amount: 11, paid: true }, { id: 't1', amount: 10, paid: true }, [], undefined)).toEqual({
+    expect(classifyRow({ ...row, amount: 11 }, { ...stored, amount: 10 }, [], undefined)).toEqual({
       status: 'changed',
       statusDetail: 'valor 10.00 → 11.00',
       existingTransactionId: 't1',
@@ -2214,10 +2474,28 @@ describe('classifyRow', () => {
   });
 
   it('describes both differences when the amount and the paid flag differ', () => {
-    const result = classifyRow({ amount: 12.5, paid: false }, { id: 't1', amount: 10, paid: true }, [], undefined);
+    const result = classifyRow({ ...row, amount: 12.5, paid: false }, { ...stored, amount: 10 }, [], undefined);
 
     expect(result.status).toBe('changed');
     expect(result.statusDetail).toBe('valor 10.00 → 12.50; pago sim → não');
+  });
+
+  it.each<{ label: string; from: 'INCOME' | 'EXPENSE'; to: 'INCOME' | 'EXPENSE'; section: MaxFinSectionKey; detail: string }>([
+    { label: 'an expense that became a refund', from: 'EXPENSE', to: 'INCOME', section: 'credit', detail: 'tipo despesa → crédito' },
+    { label: 'a refund that became an expense', from: 'INCOME', to: 'EXPENSE', section: 'debit', detail: 'tipo crédito → despesa' },
+    { label: 'an income that became a debit', from: 'INCOME', to: 'EXPENSE', section: 'income', detail: 'tipo receita → débito' },
+  ])('is changed, not duplicate, for $label with the same amount', ({ from, to, section, detail }) => {
+    expect(classifyRow({ ...row, type: to, section }, { ...stored, type: from }, [], undefined)).toEqual({
+      status: 'changed',
+      statusDetail: detail,
+      existingTransactionId: 't1',
+    });
+  });
+
+  it('lists the type change before the other differences', () => {
+    const result = classifyRow({ ...row, type: 'INCOME', amount: 12.5 }, { ...stored, amount: 10 }, [], undefined);
+
+    expect(result.statusDetail).toBe('tipo despesa → crédito; valor 10.00 → 12.50');
   });
 
   it('is replaces-future when generated future installments of the plan are superseded, listing their numbers', () => {
@@ -2238,7 +2516,7 @@ describe('classifyRow', () => {
 
   it('prefers the sourceRef match over generated installments and over a legacy match', () => {
     expect(classifyRow(row, stored, generated, 'old-1')).toMatchObject({ status: 'duplicate', existingTransactionId: 't1' });
-    expect(classifyRow({ amount: 1, paid: true }, stored, generated, 'old-1').status).toBe('changed');
+    expect(classifyRow({ ...row, amount: 1 }, stored, generated, 'old-1').status).toBe('changed');
   });
 
   it('prefers generated installments over a legacy match', () => {
