@@ -1,8 +1,9 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { BadRequestError } from '../../shared/errors/app-error.js';
-import { CategoryName, TransactionType } from '../../shared/enums/index.js';
+import { AccountType, CategoryName, TransactionType } from '../../shared/enums/index.js';
 import { parseCsv, type ParsedRow } from './parsers/csv.parser.js';
+import { isCardStatementOfx } from './parsers/ofx-card.parser.js';
 import { parseOfx } from './parsers/ofx.parser.js';
 import { createTransaction } from './transactions.service.js';
 
@@ -75,6 +76,21 @@ export function parseImportBuffer(filename: string, buffer: Buffer): ParsedRow[]
   }
 
   return rows;
+}
+
+/**
+ * A credit card invoice (an OFX holding CCSTMTRS) sent to a CREDIT account must go through the card importer:
+ * stored as raw statement rows it would duplicate everything the monthly sheet already put on the card.
+ * @throws BadRequestError (400) pointing to POST /transactions/import/card-ofx/preview.
+ */
+export function assertNotCardInvoice(accountType: string, filename: string, buffer: Buffer): void {
+  if (accountType !== AccountType.CREDIT || !filename.toLowerCase().endsWith('.ofx')) return;
+  // The tag is ASCII: any single-byte reading finds it, whatever the file's encoding.
+  if (!isCardStatementOfx(buffer.toString('latin1'))) return;
+  throw new BadRequestError(
+    'This OFX is a credit card invoice (CCSTMTRS): import it with POST /transactions/import/card-ofx/preview, ' +
+      'which reconciles it with the transactions already on the card instead of duplicating them.',
+  );
 }
 
 /**
