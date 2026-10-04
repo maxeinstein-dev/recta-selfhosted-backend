@@ -88,7 +88,7 @@ const installmentSchema = z
   })
   .nullable();
 
-const categoryTargetSchema = z.discriminatedUnion('kind', [
+export const categoryTargetSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('system'), categoryName: z.nativeEnum(CategoryName) }),
   z.object({ kind: z.literal('custom'), categoryId: uuid }),
   z.object({ kind: z.literal('create'), name: z.string().trim().min(1).max(100) }),
@@ -151,7 +151,7 @@ async function readMaxFinUpload(request: FastifyRequest): Promise<MaxFinUpload> 
   return upload;
 }
 
-function parseJsonField(name: string, raw: unknown): unknown {
+export function parseJsonField(name: string, raw: unknown): unknown {
   if (raw === undefined || raw === null || raw === '') return undefined;
   if (typeof raw !== 'string') return raw;
   try {
