@@ -349,7 +349,9 @@ describe('reconcileCardOfx: exact matches', () => {
     for (const [bank, row] of cases) {
       const result = run({ lines: [bank], sheetRows: [row] });
       expect(proposalsOf(result, 'enrich-exact'), bank.memo).toEqual([]);
-      expect(result.sheetOnly).toEqual([row]);
+      // Not an exact match, but a few cents apart: the near-amount step picks it up instead of leaving it unpaired.
+      expect(proposalsOf(result, 'enrich-near').map((p) => p.target!.id), bank.memo).toEqual([row.id]);
+      expect(result.sheetOnly).toEqual([]);
     }
   });
 
@@ -614,7 +616,8 @@ describe('reconcileCardOfx: new lines', () => {
 
     expect(result.monthHasSheet).toBe(true);
     expect(result.sheetOnly).toEqual([]);
-    expect(proposalsOf(result, 'create')[0]?.defaultSelected).toBe(false);
+    // Every sheet row found its bank line: nothing of the sheet can explain the new line, so it is selected.
+    expect(proposalsOf(result, 'create')[0]).toMatchObject({ defaultSelected: true, reason: null });
   });
 
   it('keeps the lines of one purchase together and generates no futures when part of it is elsewhere', () => {
@@ -721,6 +724,236 @@ describe('reconcileCardOfx: payments', () => {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+describe('reconcileCardOfx: merges (one bank line = 2 to 4 sheet rows)', () => {
+  const zorbit = line('mg1', 'Zorbit*Loja Gama', -91.3, '2026-09-14');
+
+  it('keeps the first sheet row as the bank line and absorbs the others', () => {
+    const first = sheetRow('Zorbyt - Item A', 36.86);
+    const second = sheetRow('Zorbyt - Item B grande', 54.44);
+
+    const result = run({ lines: [zorbit], sheetRows: [first, second] });
+
+    const [merge] = proposalsOf(result, 'enrich-merge');
+    expect(merge).toMatchObject({
+      kind: 'enrich-merge',
+      refs: [zorbit.ref],
+      defaultSelected: true,
+      ambiguous: false,
+      target: { id: first.id },
+      absorbed: [{ id: second.id }],
+      result: { date: '2026-09-14', description: 'Zorbit*Loja Gama' },
+    });
+    expect(merge!.result!.notesAppend).toBe('Planilha (soma de 2 linhas): Zorbyt - Item A 36,86; Zorbyt - Item B grande 54,44');
+    expect(merge!.group).toBe(`enrich-merge|${zorbit.ref}|${first.id}+${second.id}`);
+    expect(result.lines[0]).toMatchObject({ status: 'proposed', group: merge!.group });
+    expect(result.sheetOnly).toEqual([]);
+    expect(proposalsOf(result, 'create')).toEqual([]);
+  });
+
+  it('merges three and four rows, and no more than four', () => {
+    const three = run({
+      lines: [line('mg3', 'Loja Tres', -60)],
+      sheetRows: [sheetRow('A', 10), sheetRow('B', 20), sheetRow('C', 30)],
+    });
+    expect(proposalsOf(three, 'enrich-merge')[0]!.absorbed).toHaveLength(2);
+
+    const four = run({
+      lines: [line('mg4', 'Loja Quatro', -100)],
+      sheetRows: [sheetRow('A', 10), sheetRow('B', 20), sheetRow('C', 30), sheetRow('D', 40)],
+    });
+    expect(proposalsOf(four, 'enrich-merge')[0]!.absorbed).toHaveLength(3);
+
+    const five = run({
+      lines: [line('mg5', 'Loja Cinco', -150)],
+      sheetRows: [sheetRow('A', 10), sheetRow('B', 20), sheetRow('C', 30), sheetRow('D', 40), sheetRow('E', 50)],
+    });
+    expect(proposalsOf(five, 'enrich-merge')).toEqual([]);
+  });
+
+  it('is ambiguous (unselected) when two combinations make the amount, and prefers the one sharing words', () => {
+    const bank = line('mga', 'Livraria Sol', -90);
+    const rows = [sheetRow('Mercado', 30), sheetRow('Padaria', 60), sheetRow('Livraria', 40), sheetRow('Sol', 50)];
+
+    const [merge] = proposalsOf(run({ lines: [bank], sheetRows: rows }), 'enrich-merge');
+
+    expect(merge).toMatchObject({ ambiguous: true, defaultSelected: false });
+    expect([merge!.target!.id, ...merge!.absorbed.map((r) => r.id)]).toEqual([rows[2]!.id, rows[3]!.id]);
+  });
+
+  it('is not ambiguous when the other combination uses a row that is already matched', () => {
+    const exact = line('mgb', 'Padaria Z', -60);
+    const bank = line('mgc', 'Loja Y', -90);
+    const rows = [sheetRow('Mercado', 30), sheetRow('Padaria', 60), sheetRow('Livraria', 40), sheetRow('Sol', 50)];
+
+    const result = run({ lines: [exact, bank], sheetRows: rows });
+
+    expect(proposalsOf(result, 'enrich-exact')).toHaveLength(1);
+    expect(proposalsOf(result, 'enrich-merge')[0]).toMatchObject({ ambiguous: false });
+  });
+
+  it('selects a merge only when the rows share a word with the bank line, fuzzy included (zorbit/zorbyt)', () => {
+    const rows = [sheetRow('Zorbyt - Item A', 36.86), sheetRow('Zorbyt - Item B', 54.44)];
+
+    const alike = proposalsOf(run({ lines: [line('mf1', 'Zorbit*Loja Gama', -91.3)], sheetRows: rows }), 'enrich-merge')[0]!;
+    const unrelated = proposalsOf(run({ lines: [line('mf2', 'Padaria Central', -91.3)], sheetRows: rows.map((r) => ({ ...r })) }), 'enrich-merge')[0]!;
+
+    expect(alike).toMatchObject({ defaultSelected: true, reason: null });
+    expect(unrelated).toMatchObject({ defaultSelected: false, ambiguous: false, reason: 'no-shared-words' });
+  });
+
+  it('does not select a merge across different categories, but still proposes it with a reason', () => {
+    const rows = [sheetRow('Zorbyt - Item A', 36.86, { categoryName: 'HOME' }), sheetRow('Zorbyt - Item B', 54.44, { categoryName: 'SHOPPING' })];
+
+    const [merge] = proposalsOf(run({ lines: [line('mf3', 'Zorbit Gama', -91.3)], sheetRows: rows }), 'enrich-merge');
+
+    expect(merge).toMatchObject({ defaultSelected: false, reason: 'mixed-categories' });
+  });
+
+  it('never merges a row with shares, splits, settlements, recurrences or attachments (mergeBlocked)', () => {
+    const rows = [sheetRow('Zorbyt - Item A', 36.86), sheetRow('Zorbyt - Item B', 54.44, { mergeBlocked: true })];
+
+    const result = run({ lines: [line('mf4', 'Zorbit Gama', -91.3)], sheetRows: rows });
+
+    expect(proposalsOf(result, 'enrich-merge')).toEqual([]);
+    expect(result.sheetOnly).toHaveLength(2);
+  });
+
+  it('reports no budget problem on a normal search', () => {
+    expect(run({ lines: [line('mf5', 'Loja', -10)], sheetRows: [sheetRow('A', 4), sheetRow('B', 6)] }).mergeBudgetExhausted).toBe(false);
+  });
+
+  it('never merges installments, credits, unpaid rows, nor a bank line with an installment', () => {
+    const bank = line('mgd', 'Loja W', -50);
+    const base = [sheetRow('A', 20)];
+    const none = (row: StoredCardRow) => proposalsOf(run({ lines: [bank], sheetRows: [...base, row] }), 'enrich-merge');
+
+    expect(none(sheetRow('B 2/5', 30))).toEqual([]);
+    expect(none(sheetRow('B', 30, { type: 'INCOME' }))).toEqual([]);
+    expect(none(sheetRow('B', 30, { paid: false }))).toEqual([]);
+    expect(none(sheetRow('B', 30))).toHaveLength(1);
+
+    const installmentLine = line('mge', 'Loja W - Parcela 1/3', -50);
+    expect(proposalsOf(run({ lines: [installmentLine], sheetRows: [sheetRow('A', 20), sheetRow('B', 30)] }), 'enrich-merge')).toEqual([]);
+  });
+
+  it('only uses rows and lines the earlier steps left (an exact match is not merged)', () => {
+    const exactLine = line('mgf', 'Item A', -36.86);
+    const bank = line('mgg', 'Zorbit Gama', -91.3);
+    const rows = [sheetRow('Item A', 36.86), sheetRow('Item B', 54.44)];
+
+    const result = run({ lines: [exactLine, bank], sheetRows: rows });
+
+    expect(proposalsOf(result, 'enrich-exact')).toHaveLength(1);
+    expect(proposalsOf(result, 'enrich-merge')).toEqual([]);
+    expect(proposalsOf(result, 'create')).toHaveLength(1);
+  });
+
+  it('absorbed rows are not candidates of anything else, and a row never serves two merges', () => {
+    const bankA = line('mgh', 'Loja Alfa', -50);
+    const bankB = line('mgi', 'Loja Beta', -50);
+    const rows = [sheetRow('A', 20), sheetRow('B', 30), sheetRow('C', 20), sheetRow('D', 30)];
+
+    const result = run({ lines: [bankA, bankB], sheetRows: rows });
+
+    const merges = proposalsOf(result, 'enrich-merge');
+    expect(merges).toHaveLength(2);
+    const used = merges.flatMap((m) => [m.target!.id, ...m.absorbed.map((r) => r.id)]);
+    expect(new Set(used).size).toBe(4);
+    expect(result.sheetOnly).toEqual([]);
+  });
+
+  it('round-trips the group id of a merge (targets joined by +)', () => {
+    const id = buildGroupId('enrich-merge', ['ofx:a:1'], 'tx-1+tx-2');
+
+    expect(parseGroupId(id)).toEqual({ kind: 'enrich-merge', refs: ['ofx:a:1'], targetId: 'tx-1+tx-2' });
+  });
+
+  it('keeps the longest merge group id far under the cap', () => {
+    const uuid = (n: number) => `${String(n).repeat(8)}-aaaa-bbbb-cccc-${String(n).repeat(12)}`;
+    const refs = [`ofx:${'f'.repeat(64)}:${'a'.repeat(8)}`];
+    expect(buildGroupId('enrich-merge', refs, [1, 2, 3, 4].map(uuid).join('+')).length).toBeLessThan(MAX_GROUP_ID_LENGTH / 50);
+  });
+});
+
+describe('reconcileCardOfx: history before the sheet', () => {
+  const november = line('hd', 'Loja Novembro', -80, '2025-11-20');
+  const december = line('he', 'Loja Dezembro', -60, '2025-12-15');
+  const january = line('hj', 'Loja Janeiro', -30, '2026-01-02');
+  const matched = line('hm', 'Banca Match', -1, '2026-01-03');
+  const sheet = () => [sheetRow('Banca Match', 1)];
+  const residue = () => [...sheet(), sheetRow('Sem par', 500)];
+  const before = { historyBefore: '2026-01-01' };
+
+  it('selects what is dated before the first sheet month, residue or not, and holds the rest while residue lasts', () => {
+    const result = run({ lines: [november, december, january, matched], sheetRows: residue(), ...before });
+
+    const byRef = new Map(proposalsOf(result, 'create').map((p) => [p.refs[0], p]));
+    expect(byRef.get(november.ref)).toMatchObject({ defaultSelected: true, reason: null });
+    expect(byRef.get(december.ref)).toMatchObject({ defaultSelected: true, reason: null });
+    expect(byRef.get(january.ref)).toMatchObject({ defaultSelected: false, reason: 'sheet-residue' });
+    expect(result.sheetOnly).toHaveLength(1);
+  });
+
+  it('holds history back when a row left over on the card looks like one of its lines (exact or within max(R$ 5, 10%))', () => {
+    const feb = line('hx', 'Loja Fevereiro', -148.6, '2026-02-10');
+    const rows = (amount: number, extra: Partial<StoredCardRow> = {}) => [...sheet(), sheetRow('Compra de 150', amount, extra)];
+    const held = (amount: number, extra: Partial<StoredCardRow> = {}) =>
+      proposalsOf(run({ lines: [feb, matched], sheetRows: rows(amount, extra), historyBefore: '2026-03-01' }), 'create')[0]!;
+
+    // The review's repro: sheet 150 against OFX 148,60, earliest sheet month March.
+    expect(held(150)).toMatchObject({ defaultSelected: false, reason: 'sheet-residue', counterpart: { amount: 150 } });
+    expect(held(160)).toMatchObject({ defaultSelected: false }); // within 10% (16,00)
+    expect(held(170)).toMatchObject({ defaultSelected: true, reason: null, counterpart: null }); // 21,40 apart
+    expect(held(150, { type: 'INCOME' })).toMatchObject({ defaultSelected: true }); // other type
+    const small = line('hy', 'Banca', -8.9, '2026-02-10');
+    const near = proposalsOf(run({ lines: [small, matched], sheetRows: [...sheet(), sheetRow('Meli', 12)], historyBefore: '2026-03-01' }), 'create')[0]!;
+    expect(near.defaultSelected).toBe(false); // 3,10 apart <= R$ 5
+    const far = proposalsOf(run({ lines: [small, matched], sheetRows: [...sheet(), sheetRow('Meli', 15)], historyBefore: '2026-03-01' }), 'create')[0]!;
+    expect(far.defaultSelected).toBe(true); // 6,10 apart
+  });
+
+  it('counts card rows the generic importer stored without ref as look-alikes too', () => {
+    const feb = line('hz', 'Loja Fevereiro', -100, '2026-02-10');
+    const legacyRow = storedRow({ id: 'leg-1', description: 'Compra antiga', amount: 101, date: '2026-02-11' });
+
+    const [create] = proposalsOf(run({ lines: [feb, matched], sheetRows: residue(), legacy: [legacyRow], historyBefore: '2026-03-01' }), 'create');
+
+    expect(create).toMatchObject({ defaultSelected: false, counterpart: { id: 'leg-1' } });
+  });
+
+  it('selects the sheet month leftovers too once no sheet row is left over', () => {
+    const result = run({ lines: [january, matched], sheetRows: sheet(), ...before });
+
+    expect(proposalsOf(result, 'create')[0]).toMatchObject({ defaultSelected: true, reason: null });
+  });
+
+  it('without a cutoff, a line before the sheet is held like any other while residue lasts; the cutoff day itself is not history', () => {
+    expect(proposalsOf(run({ lines: [november, matched], sheetRows: residue() }), 'create')[0]!.defaultSelected).toBe(false);
+    const onCutoff = line('hc', 'Loja Limite', -5, '2026-01-01');
+    expect(proposalsOf(run({ lines: [onCutoff, matched], sheetRows: residue(), ...before }), 'create')[0]!.defaultSelected).toBe(false);
+  });
+
+  it('selects a purchase group only when every line of it is before the cutoff (or nothing is left over)', () => {
+    const early = line('hp', 'Loja Parcelada - Parcela 1/3', -40, '2025-11-10');
+    const late = line('hp', 'Loja Parcelada - Parcela 2/3', -40, '2026-01-10');
+
+    const mixed = run({ lines: [early, late, matched], sheetRows: residue(), ...before });
+    const allEarly = run({ lines: [early, matched], sheetRows: residue(), ...before });
+
+    expect(proposalsOf(mixed, 'create')[0]!.defaultSelected).toBe(false);
+    expect(proposalsOf(allEarly, 'create')[0]).toMatchObject({ defaultSelected: true, futureNumbers: [] });
+  });
+
+  it('keeps reversal pairs unselected even before the sheet', () => {
+    const bought = line('hr', 'Loja Estorno', -25, '2025-11-02');
+    const refunded = line('hr', 'Estorno de "Loja Estorno"', 25, '2025-11-03');
+
+    const result = run({ lines: [bought, refunded, matched], sheetRows: sheet(), ...before });
+
+    expect(proposalsOf(result, 'reversal')[0]!.defaultSelected).toBe(false);
+  });
+});
 
 describe('countSubsetSums', () => {
   it('counts the subsets of two values or more that reach the target, capped', () => {
@@ -886,14 +1119,22 @@ describe('properties (seeded fuzz)', () => {
       const result = run({ lines, sheetRows: rows, futures });
 
       const refs = result.proposals.flatMap((p) => p.refs);
-      const targets = result.proposals.flatMap((p) => (p.target ? [p.target.id] : []));
+      const targets = result.proposals.flatMap((p) => (p.target ? [p.target.id, ...p.absorbed.map((r) => r.id)] : []));
       expect(new Set(refs).size, `iteration ${iteration}: a line is in two proposals`).toBe(refs.length);
       expect(new Set(targets).size, `iteration ${iteration}: a row is in two proposals`).toBe(targets.length);
       lines.forEach((l, i) => {
         if (result.lines[i]!.status === 'proposed') expect(refs, `iteration ${iteration}: orphan line`).toContain(l.ref);
       });
       for (const [index, p] of result.proposals.entries()) {
-        if (p.kind === 'enrich-sum' && p.ambiguous) expect(p.defaultSelected, `iteration ${iteration}: ambiguous but selected`).toBe(false);
+        if ((p.kind === 'enrich-sum' || p.kind === 'enrich-merge') && p.ambiguous) expect(p.defaultSelected, `iteration ${iteration}: ambiguous but selected`).toBe(false);
+        if (p.kind === 'enrich-merge') {
+          const bank = lines.find((l) => l.ref === p.refs[0])!;
+          const rowsCents = [p.target!, ...p.absorbed].reduce((total, r) => total + toCents(r.amount), 0);
+          expect(rowsCents, `iteration ${iteration}: merge does not add up`).toBe(toCents(bank.amount));
+          expect(p.absorbed.length, `iteration ${iteration}: merge size`).toBeGreaterThanOrEqual(1);
+          expect(p.absorbed.length).toBeLessThanOrEqual(3);
+          expect([p.target!, ...p.absorbed].every((r) => r.type === 'EXPENSE'), `iteration ${iteration}: merge of credits`).toBe(true);
+        }
         if (p.kind === 'enrich-exact') {
           const target = p.target!;
           const bank = lines.find((l) => l.ref === p.refs[0])!;

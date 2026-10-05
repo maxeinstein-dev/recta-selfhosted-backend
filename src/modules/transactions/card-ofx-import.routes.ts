@@ -12,6 +12,7 @@ import {
   confirmCardOfxImport,
   resolveCardAccount,
 } from './card-ofx-import.service.js';
+import { MAX_REVIEW_ACTIONS, MAX_REVIEW_LIMIT, applyReviewActions, listReviewQueue } from './card-ofx-review.service.js';
 import { categoryTargetSchema, maxfinMonthSchema, parseJsonField } from './maxfin-import.routes.js';
 import { MAX_GROUP_ID_LENGTH } from './ofx-reconcile.js';
 import { MAX_CARD_OFX_AMOUNT, MAX_CARD_OFX_FITID_LENGTH } from './parsers/ofx-card.parser.js';
@@ -74,6 +75,27 @@ export const cardOfxConfirmBodySchema = z.object({
     .nullable(),
 });
 
+export const cardOfxReviewQuerySchema = z.object({
+  accountId: z.string().uuid(),
+  monthKey: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'monthKey must be YYYY-MM').optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_REVIEW_LIMIT).optional(),
+  view: z.enum(['queue', 'kept']).optional(),
+});
+
+export const cardOfxReviewActionsSchema = z.object({
+  accountId: z.string().uuid(),
+  actions: z
+    .array(
+      z.object({
+        transactionId: z.string().uuid(),
+        action: z.enum(['keep', 'unkeep', 'move', 'delete']),
+        targetAccountId: z.string().uuid().optional(),
+      }),
+    )
+    .min(1)
+    .max(MAX_REVIEW_ACTIONS),
+});
+
 interface CardOfxUpload {
   filename: string | undefined;
   buffer: Buffer | null;
@@ -114,7 +136,7 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
   app.post('/import/card-ofx/preview', {
     schema: {
       description:
-        'Preview a credit card invoice OFX import (multipart/form-data: file field `file` (.ofx, max 5MB) + text fields `accountId` (the credit card) and optional `options` (JSON { monthOverride?: { year, month } })). Returns the invoice month (due month, from DTEND and the card due/closing days unless overridden), every OFX line with its status (reconciled, proposed, payment) and group, the reconciliation proposals (enrich-exact, enrich-plan, enrich-sum, consume-future, create, reversal), the sheet rows left without a line, the previous invoice payment proposal (ok, adjust, create) and the category map of the new purchases. Requires EDITOR+ on the card household.',
+        'Preview a credit card invoice OFX import (multipart/form-data: file field `file` (.ofx, max 5MB) + text fields `accountId` (the credit card) and optional `options` (JSON { monthOverride?: { year, month } })). Returns the invoice month (due month, from DTEND and the card due/closing days unless overridden), every OFX line with its status (reconciled, proposed, payment) and group, the reconciliation proposals (enrich-exact, enrich-plan, enrich-sum, enrich-merge, enrich-neighbour, enrich-group, enrich-near, consume-future, create, reversal), the sheet rows left without a line, the previous invoice payment proposal (ok, adjust, create) and the category map of the new purchases. Requires EDITOR+ on the card household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       consumes: ['multipart/form-data'],
@@ -185,5 +207,51 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
 
     const result = await confirmCardOfxImport({ request: input, account, userId: user.id });
     return reply.status(201).send({ success: true, data: result });
+  });
+
+  /**
+   * GET /transactions/import/card-ofx/review-queue — card sheet rows that found no bank line in a statement already
+   * imported for their month. Read-only.
+   */
+  app.get('/import/card-ofx/review-queue', {
+    schema: {
+      description:
+        'Review queue of a credit card: sheet rows with no bank counterpart in months whose OFX statement was imported (rows tied to an OFX line, merged or already reviewed are not listed). Query: accountId (the card), optional monthKey (YYYY-MM), limit (default 200, max 500) and view (queue, default, or kept: rows already marked without receipt). Requires EDITOR+ on the card household.',
+      tags: ['Transactions'],
+      security: [{ bearerAuth: [] }],
+      response: { 200: okResponseSchema, 400: errorResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
+    },
+  }, async (request, reply) => {
+    const query = cardOfxReviewQuerySchema.parse(request.query);
+    const account = await resolveCardAccount(query.accountId, (householdId) => requireEditor(request, householdId));
+    const queue = await listReviewQueue({ account, monthKey: query.monthKey, limit: query.limit, view: query.view });
+    return reply.send({ success: true, data: queue });
+  });
+
+  /**
+   * POST /transactions/import/card-ofx/review-queue/actions — keep ("sem comprovante"), move to another account, or
+   * delete rows of the queue. Idempotent: rows no longer in the queue are reported as skipped.
+   */
+  app.post('/import/card-ofx/review-queue/actions', {
+    schema: {
+      description:
+        'Apply review decisions to rows of the card review queue (application/json: { accountId, actions: [{ transactionId, action: keep | unkeep | move | delete, targetAccountId? }] }, up to 200). The request is partial, row by row: each result is done, skipped, blocked or failed, and one failing row does not stop the others. keep marks the row as reviewed without receipt and unkeep takes the mark away; move sends it to another non-card account of the household (the row is claimed first, balances and the card limit are updated once; moving a paid expense debits the destination now and moving a credit adds to it); delete removes it and registers a tombstone so re-importing the workbook does not bring it back. Rows not in the queue (already handled) are skipped; rows with shares, splits, settlements, recurrences or attachments refuse move and delete. Requires EDITOR+ on the card household.',
+      tags: ['Transactions'],
+      security: [{ bearerAuth: [] }],
+      body: {
+        type: 'object',
+        required: ['accountId', 'actions'],
+        properties: {
+          accountId: { type: 'string' },
+          actions: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        },
+      },
+      response: { 200: okResponseSchema, 400: errorResponseSchema, 403: errorResponseSchema, 404: errorResponseSchema },
+    },
+  }, async (request, reply) => {
+    const input = cardOfxReviewActionsSchema.parse(request.body);
+    const account = await resolveCardAccount(input.accountId, (householdId) => requireEditor(request, householdId));
+    const result = await applyReviewActions({ account, actions: input.actions });
+    return reply.send({ success: true, data: result });
   });
 }

@@ -34,6 +34,7 @@ const db = vi.hoisted(() => ({
   categoryFindMany: vi.fn(),
   transactionFindMany: vi.fn(),
   transactionFindFirst: vi.fn(),
+  externalRefFindMany: vi.fn(),
   createTransaction: vi.fn(),
   deleteTransaction: vi.fn(),
   payCreditCardInvoice: vi.fn(),
@@ -45,6 +46,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
     account: { findMany: db.accountFindMany },
     category: { findMany: db.categoryFindMany },
     transaction: { findMany: db.transactionFindMany, findFirst: db.transactionFindFirst },
+    transactionExternalRef: { findMany: db.externalRefFindMany },
   },
 }));
 vi.mock('./transactions.service.js', () => ({
@@ -343,6 +345,7 @@ beforeEach(() => {
   db.createCategory.mockImplementation(async (input: TxInput) => ({ id: `cat-new-${++categorySeq}`, ...input }));
   db.payCreditCardInvoice.mockResolvedValue({ paymentTransaction: { id: 'pay-1' } });
   db.transactionFindFirst.mockResolvedValue(null);
+  db.externalRefFindMany.mockResolvedValue([]);
   useStore([]);
   useCategories([]);
 });
@@ -719,6 +722,41 @@ describe('confirmMaxFinImport: rows already stored', () => {
     });
     expect(db.createTransaction).not.toHaveBeenCalled();
     expect(db.deleteTransaction).not.toHaveBeenCalled();
+  });
+
+  it('never brings back a row the card OFX import merged into another transaction, not even when replacing', async () => {
+    const merged = makeConfirmRow({ section: 'debit', sourceRef: REF.padaria, replace: true });
+    db.externalRefFindMany.mockResolvedValue([{ ref: REF.padaria, transactionId: 'kept-1' }]);
+
+    const result = await confirm([merged]);
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, replaced: 0, ids: [] });
+    expect(db.createTransaction).not.toHaveBeenCalled();
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+  });
+
+  it('never brings back a row the card review deleted (tombstone), even when replacing', async () => {
+    const row = makeConfirmRow({ section: 'debit', sourceRef: REF.padaria, replace: true });
+    db.externalRefFindMany.mockResolvedValue([{ ref: `deleted:${REF.padaria}`, transactionId: 'anchor-1' }]);
+
+    const result = await confirm([row]);
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, replaced: 0 });
+    expect(db.createTransaction).not.toHaveBeenCalled();
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+  });
+
+  it('refuses to replace the row that absorbed others, warning and deleting nothing', async () => {
+    const row = makeConfirmRow({ section: 'debit', sourceRef: REF.padaria, replace: true });
+    useStore([{ id: 'kept-1', sourceRef: REF.padaria, accountId: 'acc-debit' }]);
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'maxfin:2026-10:credit:99', transactionId: 'kept-1' }]);
+
+    const result = await confirm([row]);
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, replaced: 0 });
+    expect(result.warnings.some((w) => w.includes('absorveu'))).toBe(true);
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+    expect(db.createTransaction).not.toHaveBeenCalled();
   });
 
   it('imports the rows that are not stored and skips only the stored ones', async () => {
@@ -1235,6 +1273,18 @@ describe('confirmMaxFinImport: generated future installments superseded by a lat
 
     expect(result).toMatchObject({ imported: 0, skipped: 1, consumedFutureInstallments: 0, ids: [] });
     expect(result.warnings).toEqual([expect.stringContaining('Loja A 4/10')]);
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+    expect(db.createTransaction).not.toHaveBeenCalled();
+  });
+
+  it('never deletes a generated installment the card statement consumed, even with replace: the row is skipped with a warning', async () => {
+    useStore(generatedPlan());
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'ofx:abc:11111111', transactionId: 'ph-4' }]);
+
+    const result = await confirm([makeLojaARow(4, 0, { replace: true })], { options: OPEN_WITH_FUTURES });
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, consumedFutureInstallments: 0 });
+    expect(result.warnings).toEqual([expect.stringContaining('parcela futura consumida')]);
     expect(db.deleteTransaction).not.toHaveBeenCalled();
     expect(db.createTransaction).not.toHaveBeenCalled();
   });
@@ -1797,6 +1847,57 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
     expect(preview.totals).toMatchObject({ rows: 18, new: 17, duplicate: 1, changed: 0 });
   });
 
+  it('marks a row as duplicate when the card OFX import merged it into another transaction (external ref)', async () => {
+    db.externalRefFindMany.mockResolvedValue([{ ref: REF.rent, transactionId: 'kept-1' }]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.rent)).toMatchObject({ status: 'duplicate', existingTransactionId: 'kept-1' });
+    expect(preview.totals).toMatchObject({ duplicate: 1, new: 17 });
+  });
+
+  it('treats a row the card review deleted (tombstone) as already imported, with a different anchor row', async () => {
+    db.externalRefFindMany.mockResolvedValue([{ ref: `deleted:${REF.rent}`, transactionId: 'anchor-1' }]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.rent)).toMatchObject({ status: 'duplicate', existingTransactionId: 'anchor-1' });
+    expect(preview.totals).toMatchObject({ duplicate: 1, new: 17 });
+  });
+
+  it('does not call a row reconciled with the card statement "changed" when the bank amount differs by cents', async () => {
+    useStore([{ id: 'near-1', sourceRef: REF.rent, accountId: 'acc-bills', amount: 1299.98, paid: true }]);
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'ofx:abc:11111111', transactionId: 'near-1' }]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.rent)).toMatchObject({ status: 'duplicate', existingTransactionId: 'near-1' });
+    expect(preview.totals).toMatchObject({ changed: 0 });
+  });
+
+  it('refuses to replace a row reconciled with the card statement', async () => {
+    const row = makeConfirmRow({ section: 'debit', sourceRef: REF.padaria, replace: true });
+    useStore([{ id: 'near-1', sourceRef: REF.padaria, accountId: 'acc-debit' }]);
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'ofx:abc:11111111', transactionId: 'near-1' }]);
+
+    const result = await confirm([row]);
+
+    expect(result).toMatchObject({ imported: 0, skipped: 1, replaced: 0 });
+    expect(db.deleteTransaction).not.toHaveBeenCalled();
+    expect(db.createTransaction).not.toHaveBeenCalled();
+  });
+
+  it('does not call the row that absorbed others "changed" when its amount differs from the sheet', async () => {
+    useStore([{ id: 'kept-1', sourceRef: REF.rent, accountId: 'acc-bills', amount: 999, paid: true }]);
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'maxfin:2026-10:credit:99', transactionId: 'kept-1' }]);
+
+    const preview = await previewSample();
+
+    expect(rowOf(preview, REF.rent)).toMatchObject({ status: 'duplicate', existingTransactionId: 'kept-1' });
+    expect(preview.totals).toMatchObject({ changed: 0, duplicate: 1 });
+    expect(preview.warnings.some((w) => w.includes('mescladas'))).toBe(true);
+  });
+
   it('marks a row as changed, with both amounts, when the same sourceRef is stored with another amount', async () => {
     useStore([{ id: 'old-uber', sourceRef: REF.uber, amount: 20, paid: true }]);
 
@@ -1979,6 +2080,17 @@ describe('buildMaxFinPreview: generated future installments', () => {
     expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, matchesRecurring: 0, skipped: 4 });
     expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 11, duplicateCount: 0 });
     expect(preview.invoice).toMatchObject({ amount: 1916.5 });
+  });
+
+  it('treats a generated installment the card statement consumed (ofx: ref) as the real one: already imported, never a placeholder', async () => {
+    useStore([generatedFor(3, PLAN_LOJA_A, { sourceRef: 'maxfin:2026-02:credit:9:f1' })]);
+    db.externalRefFindMany.mockResolvedValue([{ ref: 'ofx:abc:11111111', transactionId: 'ph-3' }]);
+
+    const preview = await previewSample();
+
+    const row = rowOf(preview, REF.lojaA);
+    expect(row).toMatchObject({ status: 'duplicate', existingTransactionId: 'ph-3' });
+    expect(preview.warnings.some((w) => w.includes('conciliadas com o OFX') && w.includes('Loja A'))).toBe(true);
   });
 
   it('covers every number a prepaid row pays (5/12 +7 covers 5..12)', async () => {

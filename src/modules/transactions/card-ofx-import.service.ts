@@ -7,6 +7,7 @@
  * content, recomputes the reconciliation on fresh data and applies only the selected groups that still exist,
  * recording every OFX ref it uses in transaction_external_refs so a re-import shows everything reconciled.
  */
+import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../shared/errors/app-error.js';
 import { AccountType, CategoryName, CategoryType, TransactionType, getCategoriesByType } from '../../shared/enums/index.js';
@@ -45,6 +46,7 @@ import {
   type AuthorizeHousehold,
 } from './maxfin-import.service.js';
 import type { MaxFinCategoryMapEntry, MaxFinCategoryMapInput } from './maxfin-import.types.js';
+import { computeClosing } from './card-ofx-closing.js';
 import {
   parseGroupId,
   reconcileCardOfx,
@@ -153,6 +155,11 @@ export function formatBRL(amount: number): string {
   return `${cents < 0 ? '-' : ''}R$ ${integer},${String(abs % 100).padStart(2, '0')}`;
 }
 
+/** A date-only bound for @db.Date columns (stored as UTC midnight): the day itself, whatever the server's time zone. */
+function utcDay(date: string): Date {
+  return new Date(`${date}T00:00:00.000Z`);
+}
+
 function formatDay(date: string): string {
   return `${date.slice(8, 10)}/${date.slice(5, 7)}/${date.slice(0, 4)}`;
 }
@@ -196,7 +203,7 @@ function netCents(lines: Array<{ type: 'INCOME' | 'EXPENSE'; amount: number }>):
 // Loading what the card stores
 // ---------------------------------------------------------------------------
 
-const CARD_ROW_SELECT = {
+export const CARD_ROW_SELECT = {
   id: true,
   description: true,
   amount: true,
@@ -208,6 +215,10 @@ const CARD_ROW_SELECT = {
   installmentId: true,
   installmentNumber: true,
   totalInstallments: true,
+  categoryName: true,
+  isSplit: true,
+  recurringTransactionId: true,
+  attachmentUrl: true,
 } as const;
 
 interface CardRowRecord {
@@ -222,6 +233,10 @@ interface CardRowRecord {
   installmentId: string | null;
   installmentNumber: number | null;
   totalInstallments: number | null;
+  categoryName?: string | null;
+  isSplit?: boolean | null;
+  recurringTransactionId?: string | null;
+  attachmentUrl?: string | null;
 }
 
 function toStoredRow(t: CardRowRecord): StoredCardRow | null {
@@ -238,10 +253,25 @@ function toStoredRow(t: CardRowRecord): StoredCardRow | null {
     installmentId: t.installmentId,
     installmentNumber: t.installmentNumber,
     totalInstallments: t.totalInstallments,
+    categoryName: t.categoryName ?? null,
+    // Shares and settlements are added by markMergeBlocked.
+    mergeBlocked: !!t.isSplit || !!t.recurringTransactionId || !!t.attachmentUrl,
   };
 }
 
-function storedRows(records: CardRowRecord[]): StoredCardRow[] {
+/** Rows with shares of other people or a settlement are never merged (deleting one would lose that link). */
+export async function markMergeBlocked(rows: StoredCardRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  const ids = rows.map((r) => r.id);
+  const [shares, settlements] = await Promise.all([
+    prisma.transactionShare.findMany({ where: { transactionId: { in: ids } }, select: { transactionId: true } }),
+    prisma.settlement.findMany({ where: { transactionId: { in: ids } }, select: { transactionId: true } }),
+  ]);
+  const blocked = new Set<string>([...shares, ...settlements].map((r) => r.transactionId).filter((id): id is string => !!id));
+  for (const row of rows) if (blocked.has(row.id)) row.mergeBlocked = true;
+}
+
+export function storedRows(records: CardRowRecord[]): StoredCardRow[] {
   return records.map(toStoredRow).filter((row): row is StoredCardRow => row !== null);
 }
 
@@ -267,6 +297,26 @@ interface CardContext {
   input: Parameters<typeof reconcileCardOfx>[0];
   /** Payments recorded for the previous invoice, latest first. */
   recordedPayments: RecordedPayment[];
+  /**
+   * The previous invoice is older than the first sheet month of the card and has no recorded payment: Recta holds
+   * none of its purchases, so a payment for it would be recorded against nothing.
+   */
+  paymentBeforeSheet: boolean;
+}
+
+/** Earliest invoice month ('YYYY-MM') with sheet rows (not generated futures) on the card; null when there is none. */
+export async function loadEarliestSheetMonth(householdId: string, cardId: string): Promise<string | null> {
+  const rows = await prisma.transaction.findMany({
+    where: { householdId, accountId: cardId, sourceRef: { startsWith: 'maxfin:', contains: ':credit:' } },
+    select: { sourceRef: true },
+  });
+  let earliest: string | null = null;
+  for (const row of rows) {
+    if (isFutureDraftRef(row.sourceRef)) continue;
+    const match = /^maxfin:(\d{4}-\d{2}):credit:\d+$/.exec(row.sourceRef ?? '');
+    if (match && (earliest === null || match[1]! < earliest)) earliest = match[1]!;
+  }
+  return earliest;
 }
 
 async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, lines: CardOfxStatementLine[]): Promise<CardContext> {
@@ -283,6 +333,26 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
   )
     .filter((row) => !isFutureDraftRef(row.sourceRef))
     .sort((a, b) => sheetLine(a.sourceRef) - sheetLine(b.sourceRef));
+  await markMergeBlocked(sheetRows);
+
+  // Sheet rows of the adjacent invoice months (+-1): candidates of the neighbour step (the sheet may have typed a
+  // purchase in the wrong month).
+  const neighbourRows = storedRows(
+    await prisma.transaction.findMany({
+      where: {
+        householdId,
+        accountId: card.id,
+        OR: [
+          { sourceRef: { startsWith: `maxfin:${monthKey(previous)}:credit:` } },
+          { sourceRef: { startsWith: `maxfin:${monthKey(addMonths(month, 1))}:credit:` } },
+        ],
+      },
+      select: CARD_ROW_SELECT,
+    }),
+  )
+    .filter((row) => !isFutureDraftRef(row.sourceRef))
+    .sort((a, b) => compareText(a.sourceRef ?? '', b.sourceRef ?? '') || sheetLine(a.sourceRef) - sheetLine(b.sourceRef));
+  await markMergeBlocked(neighbourRows);
 
   const futures = storedRows(
     await prisma.transaction.findMany({
@@ -318,7 +388,7 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
     where: { householdId, sourceRef: { in: refs } },
     select: { id: true, sourceRef: true },
   });
-  const candidateIds = [...sheetRows, ...futures, ...legacy].map((row) => row.id);
+  const candidateIds = [...sheetRows, ...neighbourRows, ...futures, ...legacy].map((row) => row.id);
   const externalRefs = await prisma.transactionExternalRef.findMany({
     where: { householdId, OR: [{ ref: { in: refs } }, { transactionId: { in: candidateIds } }] },
     select: { ref: true, transactionId: true },
@@ -327,6 +397,7 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
   for (const t of createdFromRefs) if (t.sourceRef) knownRefs.set(t.sourceRef, t.id);
   for (const r of externalRefs) knownRefs.set(r.ref, r.transactionId);
   const linkedTransactionIds = new Set(externalRefs.map((r) => r.transactionId));
+  const ofxLinkedIds = new Set(externalRefs.filter((r) => r.ref.startsWith('ofx:')).map((r) => r.transactionId));
 
   const planIds = Array.from(new Set(lines.filter((l) => l.installment).map((l) => ofxPlanId(l.fitid))));
   const planNumbers = new Map<string, Set<number>>();
@@ -365,6 +436,10 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
     paymentReference = net > 0 ? net / 100 : null;
   }
 
+  const earliestSheetMonth = await loadEarliestSheetMonth(householdId, card.id);
+  // History = purchases dated before the calendar month of the first sheet month (the sheet never covered them).
+  const historyBefore = earliestSheetMonth ? `${earliestSheetMonth}-01` : null;
+
   return {
     input: {
       lines,
@@ -375,8 +450,17 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
       linkedTransactionIds,
       planNumbers,
       paymentReference,
+      historyBefore,
+      neighbourRows,
+      neighbourStatementMonths: new Set(
+        neighbourRows
+          .filter((row) => ofxLinkedIds.has(row.id))
+          .map((row) => /^maxfin:(\d{4}-\d{2}):/.exec(row.sourceRef ?? '')?.[1])
+          .filter((m): m is string => !!m),
+      ),
     },
     recordedPayments,
+    paymentBeforeSheet: recordedPayments.length === 0 && earliestSheetMonth !== null && monthKey(previous) < earliestSheetMonth,
   };
 }
 
@@ -405,6 +489,7 @@ function paymentDto(
   recorded: RecordedPayment[],
   month: MaxFinMonth,
   usableSource: string | null,
+  beforeSheet: boolean,
 ): CardOfxPayment | null {
   if (!result.payment) return null;
   const { line } = result.payment;
@@ -422,12 +507,12 @@ function paymentDto(
           sourceAccountId: usableSource,
         }
       : null,
-    proposal: paymentProposal(line, recorded),
+    proposal: beforeSheet ? 'ok' : paymentProposal(line, recorded),
   };
 }
 
 /** An account an invoice can be paid from: active, of the household, not a credit card. */
-async function payingAccount(accountId: string, householdId: string): Promise<'ok' | 'missing' | 'credit'> {
+export async function payingAccount(accountId: string, householdId: string): Promise<'ok' | 'missing' | 'credit'> {
   const account = await prisma.account.findFirst({
     where: { id: accountId, householdId, isActive: true },
     select: { type: true },
@@ -597,6 +682,9 @@ function toProposalDto(p: ReconcileProposal): CardOfxProposal {
     defaultSelected: p.defaultSelected,
     ambiguous: p.ambiguous,
     target: p.target ? toTransactionRef(p.target) : null,
+    absorbed: p.absorbed.map(toTransactionRef),
+    reason: p.reason,
+    counterpart: p.counterpart ? toTransactionRef(p.counterpart) : null,
     result: p.result,
     futureInstallments: p.futureNumbers.length,
   };
@@ -674,6 +762,53 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
   const creates = result.proposals.filter((p) => p.kind === 'create');
   const createLines = creates.flatMap((p) => p.refs.map((ref) => lineByRef.get(ref)!));
 
+  if (result.payment && context.paymentBeforeSheet) {
+    const { line } = result.payment;
+    warnings.push(
+      `O pagamento de ${formatBRL(line.amount)} em ${formatDay(line.date)} quita a fatura de ${monthKey(addMonths(month, -1))}, anterior à planilha: o Recta não tem as compras dela, então o pagamento não será registrado.`,
+    );
+  }
+  if (result.mergeBudgetExhausted) {
+    warnings.push('A busca por linhas da planilha que somam uma compra do banco foi interrompida por excesso de combinações: algumas compras ficaram sem proposta de mesclagem.');
+  }
+  const heldLinks = result.proposals.filter((p) => (p.kind === 'enrich-neighbour' || p.kind === 'enrich-group' || p.kind === 'enrich-near') && !p.defaultSelected);
+  if (heldLinks.length > 0) {
+    warnings.push(
+      `${heldLinks.length} pareamento(s) por mês vizinho, grupo do mesmo estabelecimento ou valor próximo vieram desmarcados (ambíguos, sem palavra em comum ou com lista grande demais): confira antes de aplicar.`,
+    );
+  }
+  const adoptions = result.proposals.filter((p) => p.kind === 'enrich-near' && p.defaultSelected);
+  if (adoptions.length > 0) {
+    const paid = await prisma.transaction.findMany({
+      where: { householdId: account.householdId, attachmentUrl: invoiceTechnicalId(account.id, month) },
+      select: { amount: true },
+    });
+    if (paid.length > 0) {
+      const sum = paid.reduce((total, p) => total + toCents(p.amount.toNumber()), 0) / 100;
+      warnings.push(
+        `${adoptions.length} linha(s) vão adotar o valor do banco (centavos de diferença), mas a fatura de ${monthKey(month)} já tem pagamento registrado (${formatBRL(sum)}): confira se o pagamento ainda bate com a fatura.`,
+      );
+    }
+  }
+  const heldMerges = result.proposals.filter((p) => p.kind === 'enrich-merge' && !p.defaultSelected);
+  if (heldMerges.length > 0) {
+    warnings.push(
+      `${heldMerges.length} mesclagem(ns) de linhas da planilha vieram desmarcadas (ambígua, sem palavras em comum com a compra, ou categorias diferentes): confira antes de aplicar.`,
+    );
+  }
+  const lookAlikes = result.proposals.filter((p) => p.kind === 'create' && p.counterpart);
+  if (lookAlikes.length > 0) {
+    const rows = new Map(lookAlikes.map((p) => [p.counterpart!.id, p.counterpart!]));
+    const listed = [...rows.values()].map((row) => `${row.description} (${formatBRL(row.amount)})`).join('; ');
+    warnings.push(
+      `${lookAlikes.length} compra(s) anterior(es) à planilha ficaram desmarcadas porque lembram linhas sem par do cartão: ${listed}. Se forem as mesmas compras, resolva a linha da planilha antes; se não, marque-as.`,
+    );
+  }
+  if (result.proposals.some((p) => p.kind === 'create' && p.reason === 'sheet-residue')) {
+    warnings.push(
+      'Há compras novas desmarcadas porque ainda sobram linhas da planilha sem par no OFX (elas podem ser as mesmas compras com outro valor ou data): resolva as sobras antes de importar.',
+    );
+  }
   if (result.payment?.legacyDuplicateId) {
     const { line } = result.payment;
     warnings.push(
@@ -706,9 +841,29 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       .flatMap((p) => p.refs.map((ref) => lineByRef.get(ref)!));
     warnings.push(
       `Sobram ${formatBRL(netCents(result.sheetOnly) / 100)} na planilha e ${formatBRL(netCents(leftoverLines) / 100)} no OFX. ` +
-        'As compras novas vêm desmarcadas porque a planilha pode agrupar compras de outro jeito: confira antes de importar para não duplicar.',
+        'As compras novas de meses cobertos pela planilha vêm desmarcadas porque a planilha pode agrupar compras de outro jeito: confira antes de importar para não duplicar.',
     );
   }
+
+  const storedInPeriod = storedRows(
+    await prisma.transaction.findMany({
+      where: {
+        householdId: account.householdId,
+        accountId: account.id,
+        attachmentUrl: null,
+        date: { gte: utcDay(period.start), lte: utcDay(period.end) },
+      },
+      select: CARD_ROW_SELECT,
+    }),
+  );
+  const closing = computeClosing({
+    period,
+    endInclusive: statement.lines.some((l) => l.kind !== 'payment' && l.date === period.end),
+    ofxTotalCents,
+    lines: statement.lines,
+    result,
+    stored: storedInPeriod,
+  });
 
   return {
     accountId: account.id,
@@ -721,7 +876,8 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     lines,
     proposals,
     sheetOnly: result.sheetOnly.map(toTransactionRef),
-    payment: paymentDto(result, context.recordedPayments, month, usableSource),
+    payment: paymentDto(result, context.recordedPayments, month, usableSource, context.paymentBeforeSheet),
+    closing,
     categoryMap: await buildCardCategoryMap(account.householdId, createLines),
     totals: {
       lines: lines.length,
@@ -827,8 +983,9 @@ async function planPayment(
   recorded: RecordedPayment[],
   householdId: string,
   invoiceMonth: MaxFinMonth,
+  beforeSheet: boolean,
 ): Promise<PaymentPlan> {
-  if (!input?.apply || !result.payment) return { kind: 'none' };
+  if (!input?.apply || !result.payment || beforeSheet) return { kind: 'none' };
   const { line } = result.payment;
   const proposal = paymentProposal(line, recorded);
   if (proposal === 'ok') return { kind: 'none' };
@@ -864,13 +1021,13 @@ async function requestedSource(sourceAccountId: string | undefined, householdId:
  * A write lost a race and wrote nothing: P2002, another confirm recorded a ref first; P2003 (the refs' foreign key) or
  * P2025, the target was deleted after the recompute.
  */
-function isAlreadyTakenOrGone(error: unknown): boolean {
+export function isAlreadyTakenOrGone(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
   return isUniqueViolation(error) || code === 'P2003' || code === 'P2025';
 }
 
 /** The transaction service's NotFoundError (404) or Prisma's P2025: the row to update is gone. */
-function isNotFound(error: unknown): boolean {
+export function isNotFound(error: unknown): boolean {
   const { code, statusCode } = (error ?? {}) as { code?: unknown; statusCode?: unknown };
   return code === 'NOT_FOUND' || code === 'P2025' || statusCode === 404;
 }
@@ -896,6 +1053,80 @@ async function claimAndUpdate(
   }
 }
 
+/**
+ * Merge: the first sheet row stays as the bank line (amount, date, description), the other rows are deleted and their
+ * detail is in the notes. One database transaction records the refs (the line's, and the sourceRef of every absorbed
+ * row, so a re-imported workbook does not bring them back), rewrites the kept row and deletes the others. The sum of
+ * the rows equals the bank amount and all of them are paid, so the card balance does not move and the transaction
+ * service's balance bookkeeping is not needed. False when that lost a race or the stored rows changed (nothing written).
+ */
+async function applyMerge(householdId: string, cardId: string, proposal: ReconcileProposal, amount: number): Promise<boolean> {
+  const target = proposal.target!;
+  const absorbed = proposal.absorbed;
+  const rows = [target, ...absorbed];
+  if (rows.some((row) => row.type !== 'EXPENSE' || !row.paid) || rows.reduce((total, row) => total + toCents(row.amount), 0) !== toCents(amount)) {
+    return false;
+  }
+  const data = { ...targetData(proposal), amount };
+  const absorbedRefs = absorbed.map((row) => row.sourceRef).filter((ref): ref is string => !!ref);
+  try {
+    await prisma.$transaction(async (tx) => {
+      // Shares or settlements that appeared since the preview: refuse (rollback), checked under the row locks.
+      await lockRowsOrThrowIfLinked(tx, rows.map((row) => row.id));
+      // Same rows, same amounts, still paid expenses on this card: otherwise nothing is written (rollback).
+      const kept = await tx.transaction.updateMany({
+        where: { id: target.id, householdId, accountId: cardId, type: TransactionType.EXPENSE, paid: true, amount: target.amount },
+        data,
+      });
+      if (kept.count !== 1) throw new MergeConflict();
+      await tx.transactionExternalRef.createMany({
+        data: [...proposal.refs, ...absorbedRefs].map((ref) => ({ householdId, transactionId: target.id, ref })),
+      });
+      const removed = await tx.transaction.deleteMany({
+        where: {
+          householdId,
+          accountId: cardId,
+          OR: absorbed.map((row) => ({ id: row.id, type: TransactionType.EXPENSE, paid: true, amount: row.amount })),
+        },
+      });
+      if (removed.count !== absorbed.length) throw new MergeConflict();
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof MergeConflict || error instanceof LinkedRowError || isAlreadyTakenOrGone(error)) return false;
+    throw error;
+  }
+}
+
+/** A row has shares or a settlement: it must be neither merged nor deleted by the import tools. */
+export class LinkedRowError extends Error {
+  constructor() {
+    super('The row has shares or a settlement');
+  }
+}
+
+/**
+ * Lock the rows (FOR UPDATE: a share or settlement being created for one waits for this transaction) and count what
+ * hangs on them. Run inside the transaction that deletes them, so the check and the delete cannot be split by a
+ * concurrent share.
+ * @throws LinkedRowError when any of the rows has a share or a settlement.
+ */
+export async function lockRowsOrThrowIfLinked(tx: Prisma.TransactionClient, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await tx.$queryRaw`SELECT id FROM transactions WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`;
+  const [shares, settlements] = await Promise.all([
+    tx.transactionShare.count({ where: { transactionId: { in: ids } } }),
+    tx.settlement.count({ where: { transactionId: { in: ids } } }),
+  ]);
+  if (shares + settlements > 0) throw new LinkedRowError();
+}
+
+class MergeConflict extends Error {
+  constructor() {
+    super('The rows of the merge changed meanwhile');
+  }
+}
+
 function targetData(proposal: ReconcileProposal) {
   const result = proposal.result!;
   return {
@@ -903,6 +1134,85 @@ function targetData(proposal: ReconcileProposal) {
     description: result.description.slice(0, MAX_DESCRIPTION),
     notes: joinNotes(proposal.target!.notes, result.notesAppend),
   };
+}
+
+/**
+ * Enrich with the strongest claim, for the kinds that can reach rows of another month or that sum several lines
+ * (neighbour, group): in one database transaction the row is locked (FOR UPDATE), must still have no external ref at all
+ * (a concurrent confirm that linked it first wins), and is rewritten only if it still has the state the recompute saw.
+ * False when any of that fails: nothing is written.
+ */
+async function applyEnrichClaimed(householdId: string, cardId: string, proposal: ReconcileProposal): Promise<boolean> {
+  const target = proposal.target!;
+  const data = targetData(proposal);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${target.id}::uuid FOR UPDATE`;
+      if ((await tx.transactionExternalRef.count({ where: { transactionId: target.id } })) > 0) throw new MergeConflict();
+      const claimed = await tx.transaction.updateMany({
+        where: {
+          id: target.id,
+          householdId,
+          accountId: cardId,
+          type: target.type,
+          paid: target.paid,
+          amount: target.amount,
+          sourceRef: target.sourceRef,
+        },
+        data,
+      });
+      if (claimed.count !== 1) throw new MergeConflict();
+      await tx.transactionExternalRef.createMany({
+        data: proposal.refs.map((ref) => ({ householdId, transactionId: target.id, ref })),
+      });
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof MergeConflict || isAlreadyTakenOrGone(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * Near amount: the sheet row adopts the BANK amount (a few cents of difference), so the card balance and limit must
+ * move by exactly that difference: the update goes through the transaction service, whose transaction claims and
+ * locks the row, adjusts the balance, recalculates the card limit — and, through the hook, requires that the row has
+ * no external ref yet, is still the row the recompute saw, and records the line's ref in the same transaction.
+ */
+async function applyNear(householdId: string, cardId: string, proposal: ReconcileProposal, bankAmount: number): Promise<boolean> {
+  const target = proposal.target!;
+  const data = targetData(proposal);
+  try {
+    await updateTransaction(
+      target.id,
+      householdId,
+      { amount: bankAmount, description: data.description, date: data.date, notes: data.notes },
+      {
+        beforeWrite: async (tx) => {
+          const same = await tx.transaction.count({
+            where: {
+              id: target.id,
+              householdId,
+              accountId: cardId,
+              type: target.type,
+              paid: target.paid,
+              amount: target.amount,
+              sourceRef: target.sourceRef,
+            },
+          });
+          if (same !== 1) throw new MergeConflict();
+          if ((await tx.transactionExternalRef.count({ where: { transactionId: target.id } })) > 0) throw new MergeConflict();
+          await tx.transactionExternalRef.createMany({
+            data: proposal.refs.map((ref) => ({ householdId, transactionId: target.id, ref })),
+          });
+        },
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof MergeConflict || isAlreadyTakenOrGone(error) || isNotFound(error) || (error as { statusCode?: number })?.statusCode === 409) return false;
+    throw error;
+  }
 }
 
 /** Enrich a sheet row (exact, plan or sum). */
@@ -931,8 +1241,8 @@ async function applyConsumeFuture(householdId: string, proposal: ReconcilePropos
     await updateTransaction(target.id, householdId, { ...data, amount, paid: true });
   } catch (error) {
     await prisma.transactionExternalRef.deleteMany({ where: { householdId, transactionId: target.id, ref: { in: proposal.refs } } });
-    // The row was deleted after the claim: nothing to consume, like a lost race in claimAndUpdate.
-    if (isNotFound(error)) return false;
+    // The row was deleted after the claim, or changed under another request (409): nothing consumed, like a lost race.
+    if (isNotFound(error) || (error as { statusCode?: number })?.statusCode === 409) return false;
     throw error;
   }
   return true;
@@ -1171,7 +1481,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   let skipped = selected.size - toApply.length;
 
   const warnings: string[] = [];
-  const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth);
+  const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth, context.paymentBeforeSheet);
   if (paymentPlan.kind === 'adjust') {
     const collapse = collapseWarning(paymentPlan.recorded, monthKey(invoiceMonth));
     if (collapse) warnings.push(collapse);
@@ -1192,6 +1502,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   };
 
   let enriched = 0;
+  let absorbedRows = 0;
   let consumedFutures = 0;
   let created = 0;
   let futureInstallments = 0;
@@ -1203,6 +1514,21 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
       case 'enrich-sum':
         if (await applyEnrich(householdId, proposal)) enriched += 1;
         else skipped += 1;
+        break;
+      case 'enrich-near':
+        if (await applyNear(householdId, account.id, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) enriched += 1;
+        else skipped += 1;
+        break;
+      case 'enrich-neighbour':
+      case 'enrich-group':
+        if (await applyEnrichClaimed(householdId, account.id, proposal)) enriched += 1;
+        else skipped += 1;
+        break;
+      case 'enrich-merge':
+        if (await applyMerge(householdId, account.id, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) {
+          enriched += 1;
+          absorbedRows += proposal.absorbed.length;
+        } else skipped += 1;
         break;
       case 'consume-future':
         if (await applyConsumeFuture(householdId, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) consumedFutures += 1;
@@ -1239,6 +1565,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
 
   return {
     enriched,
+    absorbedRows,
     consumedFutures,
     created,
     futureInstallments,
