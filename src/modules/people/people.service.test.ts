@@ -1,0 +1,633 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  fakePrisma,
+  fakeServices,
+  resetStore,
+  rowsOf,
+  seedAccount,
+  seedCategory,
+  seedPerson,
+  seedSettlement,
+  seedShare,
+  seedTransaction,
+} from './__fixtures__/people-fake-db.js';
+import { createPerson, deletePerson, getLedger, listBalances, listPeople, updatePerson } from './people.service.js';
+import { createSettlementSchema } from './people.schema.js';
+import { createSettlement, deleteSettlement, listSettlements } from './settlements.service.js';
+import { getTransactionShares, previewTransactionShares, putTransactionShares } from './shares.service.js';
+
+vi.mock('../../shared/db/prisma.js', async () => ({
+  prisma: (await import('./__fixtures__/people-fake-db.js')).fakePrisma,
+}));
+vi.mock('../transactions/transactions.service.js', async () => {
+  const { fakeServices: s } = await import('./__fixtures__/people-fake-db.js');
+  return { createTransaction: s.createTransaction, deleteTransaction: s.deleteTransaction };
+});
+
+// Invented data only: names, amounts and ids below are fictitious.
+
+const HH = 'hh-1';
+const OTHER = 'hh-2';
+
+beforeEach(() => {
+  resetStore();
+  vi.clearAllMocks();
+});
+
+function error(statusCode: number, message?: string | RegExp) {
+  return expect.objectContaining({
+    statusCode,
+    ...(message ? { message: typeof message === 'string' ? expect.stringContaining(message) : expect.stringMatching(message) } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('people: create, list, update, delete', () => {
+  it('creates a person with aliases and lists it', async () => {
+    const created = await createPerson({ householdId: HH, name: 'Bia Souza', aliases: ['Biazinha', 'B.'] });
+
+    expect(created).toEqual({
+      id: expect.any(String),
+      householdId: HH,
+      name: 'Bia Souza',
+      aliases: ['Biazinha', 'B.'],
+      userId: null,
+      isActive: true,
+    });
+    expect(await listPeople(HH)).toEqual([created]);
+  });
+
+  it('drops an alias that repeats the name or another alias under normalization', async () => {
+    const created = await createPerson({ householdId: HH, name: 'Ana', aliases: ['ANA', ' Aninha ', 'aninha', 'Ánia'] });
+    expect(created.aliases).toEqual(['Aninha', 'Ánia']);
+  });
+
+  it('lists active people by name, and inactive ones only when asked', async () => {
+    await createPerson({ householdId: HH, name: 'Zeca' });
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const caio = await createPerson({ householdId: HH, name: 'Caio' });
+    await updatePerson(HH, caio.id, { isActive: false });
+
+    expect((await listPeople(HH)).map((p) => p.name)).toEqual(['Bia', 'Zeca']);
+    expect((await listPeople(HH, true)).map((p) => p.name)).toEqual(['Bia', 'Caio', 'Zeca']);
+    expect(bia.isActive).toBe(true);
+  });
+
+  it('keeps households apart: another household lists none and can reuse a name', async () => {
+    await createPerson({ householdId: HH, name: 'Bia' });
+    expect(await listPeople(OTHER)).toEqual([]);
+    await expect(createPerson({ householdId: OTHER, name: 'Bia' })).resolves.toMatchObject({ name: 'Bia' });
+  });
+
+  it('answers 409 for a name or alias already used, whatever the case or accents', async () => {
+    await createPerson({ householdId: HH, name: 'João Lima', aliases: ['Jota'] });
+
+    await expect(createPerson({ householdId: HH, name: 'joao lima' })).rejects.toEqual(error(409, 'João Lima'));
+    await expect(createPerson({ householdId: HH, name: 'Outro', aliases: ['JOTA'] })).rejects.toEqual(error(409, 'Jota'));
+    await expect(createPerson({ householdId: HH, name: 'Jota' })).rejects.toEqual(error(409));
+    // nothing was left half created
+    expect((await listPeople(HH)).map((p) => p.name)).toEqual(['João Lima']);
+    expect(rowsOf('person')).toHaveLength(1);
+  });
+
+  it('answers 409 when the unique key is lost in a race (P2002)', async () => {
+    fakePrisma.personAlias.createMany.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    await expect(createPerson({ householdId: HH, name: 'Bia' })).rejects.toEqual(error(409));
+    expect(rowsOf('person')).toHaveLength(0);
+  });
+
+  it('renames, replaces the aliases and keeps the rest', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia', aliases: ['Biazinha'] });
+
+    const renamed = await updatePerson(HH, person.id, { name: 'Beatriz' });
+    expect(renamed).toMatchObject({ name: 'Beatriz', aliases: ['Biazinha'] });
+
+    const replaced = await updatePerson(HH, person.id, { aliases: ['Bê'] });
+    expect(replaced).toMatchObject({ name: 'Beatriz', aliases: ['Bê'] });
+
+    // the old keys are free again
+    await expect(createPerson({ householdId: HH, name: 'Biazinha' })).resolves.toMatchObject({ name: 'Biazinha' });
+    await expect(createPerson({ householdId: HH, name: 'Bê' })).rejects.toEqual(error(409));
+  });
+
+  it('lets a person keep its own name and aliases on update, but not take another person\'s', async () => {
+    const ana = await createPerson({ householdId: HH, name: 'Ana', aliases: ['Aninha'] });
+    await createPerson({ householdId: HH, name: 'Bia', aliases: ['Biazinha'] });
+
+    await expect(updatePerson(HH, ana.id, { name: 'Ana', aliases: ['Aninha', 'Ana Paula'] })).resolves.toMatchObject({ aliases: ['Aninha', 'Ana Paula'] });
+    await expect(updatePerson(HH, ana.id, { aliases: ['biazinha'] })).rejects.toEqual(error(409));
+    await expect(updatePerson(HH, ana.id, { name: 'BIA' })).rejects.toEqual(error(409));
+    // a failed update changes nothing
+    expect((await listPeople(HH)).find((p) => p.id === ana.id)).toMatchObject({ name: 'Ana', aliases: ['Aninha', 'Ana Paula'] });
+  });
+
+  it('deactivates and reactivates', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia' });
+    expect(await updatePerson(HH, person.id, { isActive: false })).toMatchObject({ isActive: false });
+    expect(await updatePerson(HH, person.id, { isActive: true })).toMatchObject({ isActive: true });
+  });
+
+  it('does not read or change a person of another household (404)', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia' });
+    await expect(updatePerson(OTHER, person.id, { name: 'X' })).rejects.toEqual(error(404));
+    await expect(deletePerson(OTHER, person.id)).rejects.toEqual(error(404));
+    expect(rowsOf('person')).toHaveLength(1);
+  });
+
+  it('deletes a person without data', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia', aliases: ['B'] });
+    expect(await deletePerson(HH, person.id)).toEqual({ deleted: true });
+    expect(rowsOf('person')).toHaveLength(0);
+    expect(rowsOf('personAlias')).toHaveLength(0);
+  });
+
+  it('only deactivates a person that has shares or settlements', async () => {
+    const withShare = await createPerson({ householdId: HH, name: 'Bia' });
+    const withSettlement = await createPerson({ householdId: HH, name: 'Caio' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: withShare.id, amount: 50 });
+    seedSettlement({ householdId: HH, personId: withSettlement.id, amount: 10 });
+
+    expect(await deletePerson(HH, withShare.id)).toEqual({ deleted: false, person: expect.objectContaining({ id: withShare.id, isActive: false }) });
+    expect(await deletePerson(HH, withSettlement.id)).toMatchObject({ deleted: false });
+    expect(rowsOf('person')).toHaveLength(2);
+    expect(rowsOf('transactionShare')).toHaveLength(1);
+    expect(rowsOf('settlement')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Shares of a transaction
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('transaction shares', () => {
+  async function setup() {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const caio = await createPerson({ householdId: HH, name: 'Caio' });
+    const tx = seedTransaction({ householdId: HH, amount: 100, description: 'Jantar', date: '2026-10-03' });
+    return { bia, caio, tx };
+  }
+
+  it('stores an exact split and reports my part', async () => {
+    const { bia, caio, tx } = await setup();
+
+    const result = await putTransactionShares(HH, tx.id, {
+      direction: 'THEY_OWE_ME',
+      strategy: 'exact',
+      entries: [{ personId: bia.id, amount: 30.5, note: 'entrada' }, { personId: caio.id, amount: 20 }],
+    });
+
+    expect(result).toMatchObject({ transactionId: tx.id, transactionAmount: 100, myPart: 49.5 });
+    expect(result.shares).toEqual([
+      { id: expect.any(String), transactionId: tx.id, personId: bia.id, personName: 'Bia', direction: 'THEY_OWE_ME', amount: 30.5, note: 'entrada', source: 'manual' },
+      { id: expect.any(String), transactionId: tx.id, personId: caio.id, personName: 'Caio', direction: 'THEY_OWE_ME', amount: 20, note: null, source: 'manual' },
+    ]);
+    expect(await getTransactionShares(HH, tx.id)).toEqual(result);
+  });
+
+  it('computes percent, shares and equal splits on the server, remainder to the first person', async () => {
+    const { bia, caio, tx } = await setup();
+    const entries = [{ personId: bia.id }, { personId: caio.id }];
+
+    const equal = await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries });
+    expect(equal.shares.map((s) => s.amount)).toEqual([33.34, 33.33]);
+    expect(equal.myPart).toBe(33.33);
+
+    const percent = await putTransactionShares(HH, tx.id, {
+      direction: 'THEY_OWE_ME',
+      strategy: 'percent',
+      entries: [{ personId: bia.id, percent: 25 }, { personId: caio.id, percent: 10 }],
+    });
+    expect(percent.shares.map((s) => s.amount)).toEqual([25, 10]);
+    expect(percent.myPart).toBe(65);
+
+    const cotas = await putTransactionShares(HH, tx.id, {
+      direction: 'THEY_OWE_ME',
+      strategy: 'shares',
+      myShares: 2,
+      entries: [{ personId: bia.id, shares: 1 }, { personId: caio.id, shares: 2 }],
+    });
+    expect(cotas.shares.map((s) => s.amount)).toEqual([20, 40]);
+    expect(cotas.myPart).toBe(40);
+  });
+
+  it('replaces only the shares of the same direction', async () => {
+    const { bia, caio, tx } = await setup();
+    await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 40 }] });
+    await putTransactionShares(HH, tx.id, { direction: 'I_OWE_THEM', strategy: 'exact', entries: [{ personId: caio.id, amount: 10 }] });
+
+    const replaced = await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 25 }] });
+
+    expect(replaced.shares.map((s) => [s.personName, s.direction, s.amount])).toEqual([
+      ['Caio', 'I_OWE_THEM', 10],
+      ['Bia', 'THEY_OWE_ME', 25],
+    ]);
+    // my part only counts what they owe me
+    expect(replaced.myPart).toBe(75);
+  });
+
+  it('removes the shares of a direction with an empty list, and only that direction', async () => {
+    const { bia, caio, tx } = await setup();
+    await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 40 }] });
+    await putTransactionShares(HH, tx.id, { direction: 'I_OWE_THEM', strategy: 'exact', entries: [{ personId: caio.id, amount: 10 }] });
+
+    const result = await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [] });
+
+    expect(result.shares.map((s) => s.direction)).toEqual(['I_OWE_THEM']);
+    expect(result.myPart).toBe(100);
+  });
+
+  it('previews without writing anything', async () => {
+    const { bia, tx } = await setup();
+    const preview = await previewTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] });
+
+    expect(preview).toEqual({ shares: [{ personId: bia.id, amount: 50 }], myPart: 50 });
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+    expect(fakePrisma.transactionShare.createMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects parts above the transaction amount and leaves the previous shares untouched', async () => {
+    const { bia, caio, tx } = await setup();
+    await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 40 }] });
+
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 60 }, { personId: caio.id, amount: 40.01 }] }),
+    ).rejects.toEqual(error(400, /more than the transaction amount/));
+    expect((await getTransactionShares(HH, tx.id)).shares.map((s) => s.amount)).toEqual([40]);
+  });
+
+  it('rejects a person twice, and transfers/allocations', async () => {
+    const { bia, tx } = await setup();
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }, { personId: bia.id }] }),
+    ).rejects.toEqual(error(400, /more than once/));
+
+    const transfer = seedTransaction({ householdId: HH, amount: 10, type: 'TRANSFER' });
+    await expect(putTransactionShares(HH, transfer.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] })).rejects.toEqual(
+      error(400, /income and expense/),
+    );
+  });
+
+  it('rejects an inactive person and a person or transaction of another household', async () => {
+    const { bia, tx } = await setup();
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    const foreignTx = seedTransaction({ householdId: OTHER, amount: 50 });
+    const inactive = await createPerson({ householdId: HH, name: 'Dora' });
+    await updatePerson(HH, inactive.id, { isActive: false });
+
+    await expect(putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: stranger.id }] })).rejects.toEqual(error(404));
+    await expect(putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: inactive.id }] })).rejects.toEqual(error(400, /inactive/));
+    await expect(putTransactionShares(HH, foreignTx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] })).rejects.toEqual(error(404));
+    await expect(getTransactionShares(HH, foreignTx.id)).rejects.toEqual(error(404));
+    await expect(previewTransactionShares(HH, foreignTx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [] })).rejects.toEqual(error(404));
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+  });
+
+  it('answers 409 when a concurrent write wins the unique key', async () => {
+    const { bia, tx } = await setup();
+    fakePrisma.transactionShare.createMany.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] }),
+    ).rejects.toEqual(error(409));
+  });
+
+  it('a shared income works the same way (the other side of a refund)', async () => {
+    const { bia } = await setup();
+    const income = seedTransaction({ householdId: HH, amount: 200, type: 'INCOME' });
+    const result = await putTransactionShares(HH, income.id, { direction: 'I_OWE_THEM', strategy: 'percent', entries: [{ personId: bia.id, percent: 50 }] });
+    expect(result.shares[0]).toMatchObject({ amount: 100, direction: 'I_OWE_THEM' });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('settlements', () => {
+  async function setup() {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    seedAccount({ id: 'acc-1', householdId: HH, balance: 1000 });
+    return { bia };
+  }
+  const base = { householdId: HH, amount: 80, date: '2026-10-05' } as const;
+
+  it('records only the settlement when no transaction is given', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', note: 'pix' });
+
+    expect(settlement).toEqual({ id: expect.any(String), personId: bia.id, direction: 'RECEIVED', amount: 80, date: '2026-10-05', transactionId: null, note: 'pix' });
+    expect(fakeServices.createTransaction).not.toHaveBeenCalled();
+    expect(rowsOf('transaction')).toHaveLength(0);
+  });
+
+  it('creates the income on the account when I receive, and the balance follows', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, {
+      ...base,
+      direction: 'RECEIVED',
+      createTransaction: { accountId: 'acc-1' },
+    });
+
+    expect(fakeServices.createTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ householdId: HH, accountId: 'acc-1', type: 'INCOME', categoryName: 'OTHER_INCOME', amount: 80, paid: true, description: 'Acerto recebido de Bia' }),
+    );
+    expect(settlement.transactionId).toEqual(expect.any(String));
+    expect(rowsOf('account')[0]!.balance).toBe(1080);
+    expect(rowsOf('transaction')).toHaveLength(1);
+  });
+
+  it('creates the expense on the account when I pay, with a custom description and category', async () => {
+    const { bia } = await setup();
+    seedCategory({ id: 'cat-1', householdId: HH, name: 'Rateios', type: 'EXPENSE' });
+    const settlement = await createSettlement(HH, bia.id, {
+      ...base,
+      direction: 'PAID',
+      createTransaction: { accountId: 'acc-1', description: 'Pix para Bia', categoryName: 'CUSTOM:cat-1' },
+    });
+
+    expect(fakeServices.createTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'EXPENSE', categoryName: 'CUSTOM:cat-1', description: 'Pix para Bia' }),
+    );
+    expect(settlement.transactionId).not.toBeNull();
+    expect(rowsOf('account')[0]!.balance).toBe(920);
+  });
+
+  it('rejects a category that does not fit the direction or does not exist', async () => {
+    const { bia } = await setup();
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1', categoryName: 'FOOD' } }),
+    ).rejects.toEqual(error(400, /not an income category/));
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'PAID', createTransaction: { accountId: 'acc-1', categoryName: 'CUSTOM:nope' } }),
+    ).rejects.toEqual(error(400, /Custom category/));
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('does not touch the balance or leave a settlement when the account is not usable', async () => {
+    const { bia } = await setup();
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-elsewhere' } }),
+    ).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('removes the transaction it created (and its balance effect) when the settlement cannot be saved', async () => {
+    const { bia } = await setup();
+    fakePrisma.settlement.create.mockRejectedValueOnce(new Error('database went away'));
+
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } }),
+    ).rejects.toThrow('database went away');
+
+    expect(fakeServices.deleteTransaction).toHaveBeenCalledTimes(1);
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('links an existing income (RECEIVED) or expense (PAID), once', async () => {
+    const { bia } = await setup();
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 80, description: 'Bia' });
+    const expense = seedTransaction({ householdId: HH, type: 'EXPENSE', amount: 80 });
+
+    const received = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id });
+    expect(received.transactionId).toBe(income.id);
+    const paid = await createSettlement(HH, bia.id, { ...base, direction: 'PAID', transactionId: expense.id });
+    expect(paid.transactionId).toBe(expense.id);
+    expect(fakeServices.createTransaction).not.toHaveBeenCalled();
+
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id })).rejects.toEqual(error(409, /already linked/));
+  });
+
+  it('answers 409 when a concurrent settlement links the same transaction first', async () => {
+    const { bia } = await setup();
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 80 });
+    fakePrisma.settlement.create.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id })).rejects.toEqual(error(409));
+  });
+
+  it('rejects a linked transaction of the wrong type or of another household', async () => {
+    const { bia } = await setup();
+    const expense = seedTransaction({ householdId: HH, type: 'EXPENSE', amount: 80 });
+    const foreign = seedTransaction({ householdId: OTHER, type: 'INCOME', amount: 80 });
+
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: expense.id })).rejects.toEqual(error(400, /income transaction/));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'PAID', transactionId: seedTransaction({ householdId: HH, type: 'INCOME', amount: 5 }).id })).rejects.toEqual(error(400, /expense transaction/));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: foreign.id })).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(0);
+  });
+
+  it('rejects a person of another household', async () => {
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    await expect(createSettlement(HH, stranger.id, { ...base, direction: 'RECEIVED' })).rejects.toEqual(error(404));
+    await expect(listSettlements(HH, stranger.id)).rejects.toEqual(error(404));
+  });
+
+  it('rejects an amount with sub-cent precision', async () => {
+    const { bia } = await setup();
+    await expect(createSettlement(HH, bia.id, { ...base, amount: 10.005, direction: 'RECEIVED' })).rejects.toEqual(error(400, /2 decimal/));
+  });
+
+  it('refuses both a linked and a created transaction at the schema level', () => {
+    const parsed = createSettlementSchema.safeParse({
+      householdId: '11111111-1111-4111-8111-111111111111',
+      direction: 'RECEIVED',
+      amount: 10,
+      date: '2026-10-05',
+      transactionId: '22222222-2222-4222-8222-222222222222',
+      createTransaction: { accountId: '33333333-3333-4333-8333-333333333333' },
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('deletes the settlement and keeps the transaction (and the account balance)', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } });
+
+    await deleteSettlement(HH, settlement.id);
+
+    expect(rowsOf('settlement')).toHaveLength(0);
+    expect(rowsOf('transaction')).toHaveLength(1);
+    expect(fakeServices.deleteTransaction).not.toHaveBeenCalled();
+    expect(rowsOf('account')[0]!.balance).toBe(1080);
+    await expect(deleteSettlement(HH, settlement.id)).rejects.toEqual(error(404));
+  });
+
+  it('does not delete a settlement of another household', async () => {
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    const settlement = await createSettlement(OTHER, stranger.id, { ...base, householdId: OTHER, direction: 'RECEIVED' });
+    await expect(deleteSettlement(HH, settlement.id)).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(1);
+  });
+
+  it('unlinks the settlement when its transaction is deleted (the settlement stays)', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } });
+    await fakeServices.deleteTransaction(settlement.transactionId!, HH);
+
+    expect((await listSettlements(HH, bia.id))[0]).toMatchObject({ id: settlement.id, transactionId: null });
+  });
+
+  it('lists the settlements of a person newest first', async () => {
+    const { bia } = await setup();
+    await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', date: '2026-09-01', amount: 10 });
+    await createSettlement(HH, bia.id, { ...base, direction: 'PAID', date: '2026-10-01', amount: 20 });
+    expect((await listSettlements(HH, bia.id)).map((s) => s.amount)).toEqual([20, 10]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Balances and ledger
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('balances', () => {
+  it('sums shares and settlements per person, in reais', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const caio = await createPerson({ householdId: HH, name: 'Caio' });
+    const a = seedTransaction({ householdId: HH, amount: 100 });
+    const b = seedTransaction({ householdId: HH, amount: 60 });
+    seedShare({ householdId: HH, transactionId: a.id, personId: bia.id, amount: 50.25 });
+    seedShare({ householdId: HH, transactionId: b.id, personId: bia.id, amount: 20, direction: 'I_OWE_THEM' });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 10.1, direction: 'RECEIVED' });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 3, direction: 'PAID' });
+    seedShare({ householdId: HH, transactionId: a.id, personId: caio.id, amount: 5 });
+
+    const balances = await listBalances(HH);
+
+    expect(balances.map((b2) => b2.person.name)).toEqual(['Bia', 'Caio']);
+    expect(balances[0]).toMatchObject({ owedToMe: 50.25, iOwe: 20, received: 10.1, paid: 3, balance: 23.15, openShares: 2 });
+    expect(balances[1]).toMatchObject({ owedToMe: 5, balance: 5, openShares: 1 });
+  });
+
+  it('keeps cents exact where doubles drift', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 10 });
+    for (let i = 0; i < 3; i++) seedShare({ householdId: HH, transactionId: seedTransaction({ householdId: HH, amount: 1 }).id, personId: bia.id, amount: 0.1 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: bia.id, amount: 0.2 });
+    expect((await listBalances(HH))[0]!.balance).toBe(0.5);
+  });
+
+  it('includes an inactive person only while the balance is not zero, and always the active ones', async () => {
+    const zero = await createPerson({ householdId: HH, name: 'Zero' });
+    const owing = await createPerson({ householdId: HH, name: 'Devendo' });
+    const settled = await createPerson({ householdId: HH, name: 'Quitada' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: owing.id, amount: 40 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: settled.id, amount: 40 });
+    seedSettlement({ householdId: HH, personId: settled.id, amount: 40 });
+    await updatePerson(HH, owing.id, { isActive: false });
+    await updatePerson(HH, settled.id, { isActive: false });
+
+    const names = (await listBalances(HH)).map((b) => b.person.name);
+    expect(names).toEqual(['Devendo', 'Zero']);
+    expect(zero.isActive).toBe(true);
+  });
+
+  it('is scoped to the household', async () => {
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    const tx = seedTransaction({ householdId: OTHER, amount: 100 });
+    seedShare({ householdId: OTHER, transactionId: tx.id, personId: stranger.id, amount: 40 });
+    expect(await listBalances(HH)).toEqual([]);
+  });
+
+  it('goes negative when I owe them', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: bia.id, amount: 100, direction: 'I_OWE_THEM' });
+    expect((await listBalances(HH))[0]!.balance).toBe(-100);
+  });
+});
+
+describe('ledger', () => {
+  async function history() {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const t1 = seedTransaction({ householdId: HH, amount: 100, description: 'Mercado', date: '2026-10-01' });
+    const t2 = seedTransaction({ householdId: HH, amount: 60, description: 'Padaria', date: '2026-10-01' });
+    const t3 = seedTransaction({ householdId: HH, amount: 80, description: 'Luz', date: '2026-10-04' });
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 70, description: 'Bia', date: '2026-10-03' });
+    seedShare({ householdId: HH, transactionId: t1.id, personId: bia.id, amount: 50, source: 'import', note: '*Dividir com Bia' });
+    seedShare({ householdId: HH, transactionId: t2.id, personId: bia.id, amount: 30 });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 70, date: '2026-10-03', transactionId: income.id });
+    seedShare({ householdId: HH, transactionId: t3.id, personId: bia.id, amount: 80, direction: 'I_OWE_THEM' });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 5, date: '2026-10-06', direction: 'PAID' });
+    return { bia };
+  }
+
+  it('returns the timeline newest first with the running balance computed over the whole history', async () => {
+    const { bia } = await history();
+    const page = await getLedger(HH, bia.id, { limit: 50, order: 'desc' });
+
+    expect(page.pagination).toEqual({ nextCursor: null, hasMore: false, total: 5 });
+    expect(page.data.map((e) => [e.date, e.description, e.signed, e.balanceAfter])).toEqual([
+      ['2026-10-06', 'Acerto pago', 5, 5 + (50 + 30 - 70 - 80)],
+      ['2026-10-04', 'Luz', -80, 50 + 30 - 70 - 80],
+      ['2026-10-03', 'Bia', -70, 50 + 30 - 70],
+      ['2026-10-01', 'Padaria', 30, 80],
+      ['2026-10-01', 'Mercado', 50, 50],
+    ]);
+  });
+
+  it('describes each entry: link to the transaction, its amount, note and source', async () => {
+    const { bia } = await history();
+    const page = await getLedger(HH, bia.id, { limit: 50, order: 'asc' });
+
+    const market = page.data[0]!;
+    expect(market).toMatchObject({
+      kind: 'share',
+      direction: 'THEY_OWE_ME',
+      amount: 50,
+      transactionAmount: 100,
+      note: '*Dividir com Bia',
+      source: 'import',
+    });
+    expect(market.transactionId).toEqual(expect.any(String));
+    const settlement = page.data.find((e) => e.kind === 'settlement' && e.direction === 'RECEIVED')!;
+    expect(settlement).toMatchObject({ amount: 70, transactionAmount: 70, source: null });
+    const bare = page.data.find((e) => e.kind === 'settlement' && e.direction === 'PAID')!;
+    expect(bare).toMatchObject({ transactionId: null, transactionAmount: null });
+  });
+
+  it('pages with a cursor in a total order, without skipping or repeating rows that share a day', async () => {
+    const { bia } = await history();
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 10; guard++) {
+      const page = await getLedger(HH, bia.id, { limit: 2, order: 'desc', cursor });
+      expect(page.pagination.total).toBe(5);
+      seen.push(...page.data.map((e) => e.id));
+      if (!page.pagination.hasMore) {
+        expect(page.pagination.nextCursor).toBeNull();
+        break;
+      }
+      cursor = page.pagination.nextCursor!;
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5);
+
+    const all = await getLedger(HH, bia.id, { limit: 50, order: 'desc' });
+    expect(seen).toEqual(all.data.map((e) => e.id));
+  });
+
+  it('the running balance does not depend on the page or the direction', async () => {
+    const { bia } = await history();
+    const desc = await getLedger(HH, bia.id, { limit: 50, order: 'desc' });
+    const asc = await getLedger(HH, bia.id, { limit: 50, order: 'asc' });
+    expect(asc.data.map((e) => e.id)).toEqual([...desc.data].reverse().map((e) => e.id));
+    const second = await getLedger(HH, bia.id, { limit: 2, order: 'asc', cursor: `${asc.data[1]!.kind}:${asc.data[1]!.id}` });
+    expect(second.data.map((e) => e.balanceAfter)).toEqual(asc.data.slice(2, 4).map((e) => e.balanceAfter));
+    // the last chronological balance is the person's balance
+    const balance = (await listBalances(HH))[0]!.balance;
+    expect(asc.data[asc.data.length - 1]!.balanceAfter).toBe(balance);
+  });
+
+  it('rejects a cursor that is not in the ledger, and a person of another household', async () => {
+    const { bia } = await history();
+    await expect(getLedger(HH, bia.id, { limit: 5, order: 'desc', cursor: 'share:nope' })).rejects.toEqual(error(400, /cursor/));
+    await expect(getLedger(OTHER, bia.id, { limit: 5, order: 'desc' })).rejects.toEqual(error(404));
+  });
+});
