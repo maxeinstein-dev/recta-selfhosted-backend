@@ -135,3 +135,46 @@ export async function putTransactionShares(
   );
   return buildResponse(prisma, householdId, transaction);
 }
+
+function formatReais(cents: number): string {
+  return fromCents(cents).toFixed(2);
+}
+
+/**
+ * Guard for the user-facing transaction update (called by the route, never by transactions.service, so internal flows
+ * such as the card OFX import or installment generation are not affected). A transaction that has shares cannot
+ * get an amount below the sum of the shares of either direction, nor turn from an expense into an income.
+ * @throws BadRequestError telling to reduce or remove the shares first.
+ */
+export async function assertUpdateKeepsShares(
+  householdId: string,
+  transactionId: string,
+  current: { type: string },
+  change: { amount?: number; type?: string },
+): Promise<void> {
+  const amountChanges = change.amount !== undefined;
+  const typeChanges = change.type !== undefined && change.type !== current.type;
+  if (!amountChanges && !typeChanges) return;
+
+  const shares = await prisma.transactionShare.findMany({
+    where: { householdId, transactionId },
+    select: { direction: true, amount: true },
+  });
+  if (shares.length === 0) return;
+
+  if (typeChanges && current.type === 'EXPENSE' && change.type === 'INCOME') {
+    throw new BadRequestError('This transaction has shares, so it cannot become an income. Remove the shares first.');
+  }
+  if (amountChanges) {
+    const newCents = Math.round(Math.abs(change.amount!) * 100);
+    for (const direction of ['THEY_OWE_ME', 'I_OWE_THEM'] as const) {
+      const sum = shares.filter((s) => s.direction === direction).reduce((total, s) => total + storedToCents(s.amount), 0);
+      if (sum > newCents) {
+        const who = direction === 'THEY_OWE_ME' ? 'people owe you' : 'you owe people';
+        throw new BadRequestError(
+          `The new amount (${formatReais(newCents)}) is lower than the shares of this transaction (${formatReais(sum)} that ${who}). Reduce the shares first.`,
+        );
+      }
+    }
+  }
+}

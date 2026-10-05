@@ -25,6 +25,7 @@ import {
 } from './transactions.schema.js';
 import { updateTransactionSplitSchema } from './transaction-splits.schema.js';
 import * as transactionsService from './transactions.service.js';
+import { assertUpdateKeepsShares } from '../people/shares.service.js';
 import * as transactionSplitsService from './transaction-splits.service.js';
 
 export async function transactionRoutes(app: FastifyInstance) {
@@ -492,6 +493,9 @@ export async function transactionRoutes(app: FastifyInstance) {
       // Get transaction to verify household access
       const existingTransaction = await transactionsService.getTransaction(transactionId);
       await requireEditor(request, existingTransaction.householdId);
+
+      // Shares of other people must keep fitting the transaction (route-level: internal flows are not blocked)
+      await assertUpdateKeepsShares(existingTransaction.householdId, transactionId, existingTransaction, input);
 
       const transaction = await transactionsService.updateTransaction(
         transactionId,
