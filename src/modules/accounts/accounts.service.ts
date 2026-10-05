@@ -73,11 +73,11 @@ export async function createAccount(input: CreateAccountInput) {
       ...(input.creditLimit && { creditLimit: new Prisma.Decimal(input.creditLimit) }),
       ...(input.dueDay && { dueDay: input.dueDay }),
       ...(input.closingDay && { closingDay: input.closingDay }),
-      // Default to 10 days when creating a credit card without an explicit offset
+      // Default to 7 days when creating a credit card without an explicit offset
       ...(input.bestDayOffset !== undefined
         ? { bestDayOffset: input.bestDayOffset }
         : input.type === 'CREDIT'
-          ? { bestDayOffset: 10 }
+          ? { bestDayOffset: 7 }
           : {}),
       ...(input.linkedAccountId && { linkedAccountId: input.linkedAccountId }),
     },
