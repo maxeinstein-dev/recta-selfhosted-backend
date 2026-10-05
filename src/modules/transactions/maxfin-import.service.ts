@@ -353,7 +353,7 @@ function placeholdersCovering(
 // ---------------------------------------------------------------------------
 
 /** The household's custom categories, as the category suggestions need them. */
-async function loadCustomCategories(householdId: string): Promise<CustomCategoryRef[]> {
+export async function loadCustomCategories(householdId: string): Promise<CustomCategoryRef[]> {
   const customsRaw = await prisma.category.findMany({
     where: { householdId },
     select: { id: true, name: true, type: true },
@@ -811,13 +811,13 @@ export interface ConfirmParams {
   resolved?: MaxFinAccountsResolved;
 }
 
-interface CategoryResolver {
+export interface CategoryResolver {
   categoryNameFor(key: string, type: 'INCOME' | 'EXPENSE'): string;
   created: Array<{ id: string; name: string; type: 'INCOME' | 'EXPENSE' }>;
 }
 
 /** Validate the mapping and create the requested custom categories (find-or-create by normalized name + type). */
-async function buildCategoryResolver(householdId: string, entries: MaxFinCategoryMapInput[]): Promise<CategoryResolver> {
+export async function buildCategoryResolver(householdId: string, entries: MaxFinCategoryMapInput[]): Promise<CategoryResolver> {
   const customsRaw = await prisma.category.findMany({ where: { householdId }, select: { id: true, name: true, type: true } });
   const customs = customsRaw.map((c) => ({ id: c.id, name: c.name, type: c.type as 'INCOME' | 'EXPENSE' }));
   const findCustom = (name: string, type: 'INCOME' | 'EXPENSE') =>

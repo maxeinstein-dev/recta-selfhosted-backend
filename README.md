@@ -152,7 +152,7 @@ Schedule this once per day (cron, systemd, or your host’s scheduler).
 
 ## Importing transactions
 
-Two importers live under `/transactions/import`. Both require authentication and EDITOR+ on the household that owns the destination accounts, both accept files up to 5 MB, and both work in two steps: a **preview** that parses the file without persisting anything, and a **confirm** that persists the rows the user kept.
+Three importers live under `/transactions/import`. All require authentication and EDITOR+ on the household that owns the destination accounts, all accept files up to 5 MB, and all work in two steps: a **preview** that parses the file without persisting anything, and a **confirm** that persists what the user kept.
 
 ### Bank statements (OFX / CSV)
 
@@ -162,6 +162,8 @@ Two importers live under `/transactions/import`. Both require authentication and
 | `POST /transactions/import/confirm` | JSON: `{ accountId, rows: [{ date, description, amount, type }] }` | Creates the rows through the regular transaction service (balances are updated); duplicates are re-checked and skipped. |
 
 The CSV flavour expects `date;description;amount` (`,` also accepted as delimiter), dates as `dd/MM/yyyy` or `yyyy-MM-dd`, and Brazilian or plain decimal amounts. Negative amounts become expenses.
+
+A credit card invoice (an OFX holding `CCSTMTRS`) sent to a `CREDIT` account is refused with a 400 that points to the card importer below: stored as raw rows it would duplicate the purchases the monthly sheet already put on the card.
 
 ### Monthly sheet ("MaxFin" format)
 
@@ -202,6 +204,45 @@ Rules applied:
 - `options.months` picks the months (each must be a month tab of the workbook); by default every month tab up to the current month is selected and later ones stay `available`. `closedThrough` (`YYYY-MM`, default the previous month, `null` for none) closes every selected month up to it; `payInvoice` (default `true`) applies to every closed month; `generateFutureInstallments` (default `true`) applies only to the latest selected month, and only when it is open.
 - Nothing is persisted: the client confirms month by month with `POST /transactions/import/maxfin/confirm`, oldest first, echoing each month's own options.
 - Limits: 5 MB per upload, 50 MB uncompressed (both the sizes the archive declares and the bytes actually inflated), at most 10,000 zip entries and 60 tabs, and 2,000 rows and 40 columns read per tab (a tab with values beyond them is read up to there, with a warning). A cell holds at most 50,000 characters (Google Sheets' limit) and the cells read from one workbook at most 5,000,000; the selected months of one preview hold at most 6,000 rows (select fewer months above that). Every part is read once, forward, and anything damaged or over a limit answers 400.
+
+### Card invoice (OFX)
+
+A credit card invoice in OFX (`CREDITCARDMSGSRSV1/CCSTMTRS`, OFX 1.x SGML or 2.x XML, UTF-8 with a windows-1252 fallback) is reconciled with what the card already holds: the rows the monthly sheet imported, the future installments stored for later months, and the rows an earlier import created.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/card-ofx/preview` | multipart: `file` (.ofx), `accountId` (the card), optional `options` (JSON `{ monthOverride?: { year, month } }`) | Returns the invoice month, every OFX line with its status (`reconciled`, `proposed`, `payment`) and group, the proposals, the sheet rows left without a line (`sheetOnly`), the previous invoice payment and the category map of the new purchases. Nothing is persisted. |
+| `POST /transactions/import/card-ofx/confirm` | JSON: `{ accountId, monthKey, lines, selectedGroups, categoryMap, payment }` | Recomputes the reconciliation on what is stored at that moment and applies the selected groups that still exist (the others are counted as `skipped`). |
+
+Lines and month:
+
+- Each `STMTTRN` becomes a line: its day (`DTPOSTED`, as printed), absolute amount, kind (`purchase` when negative, `refund` when positive, `discount` for "Desconto Antecipação", `payment` for "Pagamento recebido"; purchases are `EXPENSE`, the others `INCOME`), the installment written as `Parcela N/M`, and the merchant (the memo without ` - Parcela N/M` and ` - NuPay`). The special texts are Nubank's; other banks' card statements read as plain purchases and credits.
+- Each line has a stable ref `ofx:<FITID>:<first 8 hex of sha1(memo|signed amount|date)>` (identical lines are numbered in file order; long or unusual FITIDs are hashed).
+- The invoice month is the due month: the statement closes on `DTEND` and is due in the same month when the card's due day comes after its closing day (the `DTEND` day when the card has none), otherwise in the next month. Without a due day the closing month is used, with a warning. `options.monthOverride` wins.
+- Lines the confirm would reject are skipped with a warning instead: an amount above 1,000,000,000 (or not a finite number) and a FITID over 255 characters. At most 1,000 lines per invoice. A file without `CCSTMTRS`, an account that is not a credit card (checked after the household authorization) and a selected group whose refs are not among the lines sent are 400s.
+
+Proposals, in the order they are made (each step only sees what the previous ones left):
+
+1. **Already reconciled**: the line's ref is recorded (`transaction_external_refs`, or the `sourceRef` of a transaction an earlier import created), or the card has a transaction without ref with the same day, amount, type and description (what the generic importer stored; the next confirm records its ref).
+2. **Plan** (`enrich-plan`): a sheet row `N/M +K` is the installments `N..N+K` of one FITID minus its discount(s), within 2 cents; then a sheet expense equal to the net of every remaining line of one FITID (two lines or more), for plans the sheet wrote without `+K`.
+3. **Exact** (`enrich-exact`): same type and amount, one to one, or one cent apart when both sides carry the same installment `N/M` (installment rounding; the sheet row keeps its amount); ties go to the pair with the same `N/M`, then to the exact amount, then to more words in common. Payments other than the previous invoice's (advance payments) take part here, as credits, so they can pair with sheet credits.
+4. **Sum** (`enrich-sum`): a sheet expense equal to a subset of the remaining purchases, searched among at most 15 of them (those sharing words with the row first, then in file order), smaller rows first. The subset is unique only if no other subset of the whole pool of remaining purchases makes the same total: that is counted exactly (a knapsack over the cents) while a work budget lasts, and a pool larger than the search window counts as ambiguous once it is spent. More than one subset makes the proposal `ambiguous` and unselected.
+5. **Stored future installment** (`consume-future`): an installment line consumes a stored future installment (from the sheet or an earlier OFX) with the same `N/M` and an amount within one cent, preferring the plan the purchase itself generated; a prepayment's installments `N+1..N+K` consume the futures with those numbers, and its discount becomes a new credit.
+6. **Reversal** (`reversal`): a purchase and a refund of the same amount and a similar merchant (same FITID or words in common); unselected.
+7. **New** (`create`): the rest, one proposal per purchase (FITID). Selected by default only in months without sheet rows; in a month with sheet rows they come unselected and a warning compares what is left on each side, since the sheet often groups purchases its own way.
+
+Group ids are `kind|sorted refs|target transaction id`; a proposal covers at most 150 lines (a purchase with more lines comes in several `create` groups), so an id stays under the 16,000 characters the confirm accepts. The client sends back the preview's lines (in the preview's order) and the groups it keeps; the server derives every line again from its FITID, date, amount and memo (kind, type, merchant, installment, ref) and rejects what does not match.
+
+What confirm writes:
+
+- **Enrich** (exact, plan, sum): the refs are recorded and the sheet row is rewritten in one database transaction. One-to-one: the bank's date and memo, with the sheet text appended to the notes as `Planilha: ...`. Plan or sum: the sheet description is kept, the date becomes the first line's, and the OFX lines go to the notes. Category, amount and existing notes stay.
+- **Consume future**: the future installment (a placeholder an import generated) takes the line's date, memo, amount and paid flag, through the transaction service when the amount or the flag changes (the card balance moves); the ref is recorded.
+- **Create**: the future installments are stored first and the line last, so a failure halfway leaves the group in place and a retry regenerates the missing numbers. One card transaction per line (`EXPENSE` for purchases, `INCOME` for refunds and discounts), `sourceRef` = the line's ref, installments with `installmentId = ofx:<FITID>`; in months without sheet rows, the remaining installments `N+1..M` are generated for the following months (`<ref>:f<i>`, never a number the plan already stores). The category comes from the client's map; merchants the map does not cover get the suggestion (the category of the merchant's latest transaction, else the sheet's label rules, else the default; a merchant never suggests creating a category).
+- **Reversal**: both transactions are created (`reversalsImported` counts transactions, two per pair).
+- **Payment**: the "Pagamento recebido" closest to the previous invoice (its recorded payment, else the total of its sheet rows, else the largest line) pays the previous month's invoice. When no payment is recorded, confirm records it from `payment.sourceAccountId` (required then); when the recorded one differs in amount or date, it is undone and paid again from the same account, and the card purchases the undo marked unpaid outside that invoice are marked paid again. The adjust is all or nothing: if paying again (or a later undo) fails, the payments already undone are recorded again with their own amount, date and account before the error is returned. Recorded payments from different accounts become one payment from one account, and the preview and the confirm warn about it. When that account is gone or inactive, the preview reports `recorded.sourceAccountId: null` and the adjust pays from `payment.sourceAccountId` (400 without one). The other "Pagamento recebido" lines are advance payments: they pair with sheet credits or stay as information (never imported), with a warning.
+- A unique violation (another confirm got there first), a target deleted after the recompute, or a stored future deleted between the claim and its update skips the group. Re-importing the same invoice shows every line reconciled and the payment `ok`.
+
+To undo the migration that adds `transaction_external_refs` (nothing else depends on it; imports done meanwhile will no longer recognize their lines as reconciled): run `DROP TABLE transaction_external_refs;`, delete the folder `prisma/migrations/20261003200000_add_transaction_external_refs` and, if it was applied through Prisma, `npx prisma migrate resolve --rolled-back 20261003200000_add_transaction_external_refs`.
 
 ## Project structure
 

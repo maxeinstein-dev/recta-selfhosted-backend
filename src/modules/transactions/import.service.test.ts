@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { BadRequestError } from '../../shared/errors/index.js';
 import {
   amountsEqual,
+  assertNotCardInvoice,
   getDayRange,
   parseImportBuffer,
 } from './import.service.js';
@@ -100,5 +101,31 @@ describe('dedup pure helpers (DB-free)', () => {
     expect(amountsEqual(0.1 + 0.2, 0.3)).toBe(true);
     expect(amountsEqual(100, 100.01)).toBe(false);
     expect(amountsEqual(100, 101)).toBe(false);
+  });
+});
+
+const CARD_INVOICE = `OFXHEADER:100
+DATA:OFXSGML
+<OFX><CREDITCARDMSGSRSV1><CCSTMTTRNRS><CCSTMTRS><BANKTRANLIST>
+<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261105<TRNAMT>-10.00<FITID>c1<MEMO>Padaria Exemplo
+</STMTTRN>
+</BANKTRANLIST></CCSTMTRS></CCSTMTTRNRS></CREDITCARDMSGSRSV1></OFX>
+`;
+
+describe('assertNotCardInvoice (generic importer guard)', () => {
+  it('sends a card invoice on a credit card to the card importer with a 400', () => {
+    try {
+      assertNotCardInvoice('CREDIT', 'Fatura.OFX', Buffer.from(CARD_INVOICE, 'utf-8'));
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect((error as BadRequestError).statusCode).toBe(400);
+      expect((error as BadRequestError).message).toContain('/transactions/import/card-ofx/preview');
+    }
+  });
+
+  it('lets bank statements, CSV files and other account types through', () => {
+    expect(() => assertNotCardInvoice('CREDIT', 'extrato.ofx', Buffer.from(OFX_VALID, 'utf-8'))).not.toThrow();
+    expect(() => assertNotCardInvoice('CREDIT', 'fatura.csv', Buffer.from(CARD_INVOICE, 'utf-8'))).not.toThrow();
+    expect(() => assertNotCardInvoice('CHECKING', 'fatura.ofx', Buffer.from(CARD_INVOICE, 'utf-8'))).not.toThrow();
   });
 });

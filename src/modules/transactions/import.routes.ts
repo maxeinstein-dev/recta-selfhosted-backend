@@ -8,6 +8,7 @@ import {
 import { BadRequestError } from '../../shared/errors/app-error.js';
 import { getAccount } from '../accounts/accounts.service.js';
 import {
+  assertNotCardInvoice,
   parseImportBuffer,
   buildImportPreview,
   confirmImport,
@@ -65,7 +66,7 @@ export async function importRoutes(app: FastifyInstance) {
   app.post('/import/preview', {
     schema: {
       description:
-        'Preview a bank statement import (multipart/form-data only: text field `accountId` + file field `file` with a .ofx or .csv file, max 5MB). Returns parsed rows flagged as duplicate/new. Requires EDITOR+ on the account household.',
+        'Preview a bank statement import (multipart/form-data only: text field `accountId` + file field `file` with a .ofx or .csv file, max 5MB). Returns parsed rows flagged as duplicate/new. A credit card invoice OFX (CCSTMTRS) sent to a CREDIT account answers 400 pointing to POST /transactions/import/card-ofx/preview. Requires EDITOR+ on the account household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       consumes: ['multipart/form-data'],
@@ -120,6 +121,9 @@ export async function importRoutes(app: FastifyInstance) {
     // Fetch account first to resolve the household for authorization.
     const account = await getAccount(accountId);
     await requireEditor(request, account.householdId);
+
+    // A card invoice on a card goes to the card importer, which reconciles instead of duplicating.
+    assertNotCardInvoice(account.type, filename, buffer);
 
     const rows = parseImportBuffer(filename, buffer);
     const preview = await buildImportPreview(accountId, account.householdId, rows);
