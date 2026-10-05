@@ -53,6 +53,9 @@ export const MAX_CARD_INSTALLMENTS = 99;
 /** A FITID longer than this (or with characters outside [A-Za-z0-9._-]) is hashed in refs and plan ids. */
 const MAX_FITID_TOKEN = 64;
 const MAX_MEMO_LENGTH = 255;
+/** Largest amount of one line, and longest FITID: what the confirm endpoint accepts (a line over them is skipped). */
+export const MAX_CARD_OFX_AMOUNT = 1_000_000_000;
+export const MAX_CARD_OFX_FITID_LENGTH = 255;
 
 const CARD_STATEMENT_REGEX = /<CCSTMTRS>/i;
 const INSTALLMENT_IN_MEMO = /\bparcela\s+(\d{1,3})\s*\/\s*(\d{1,3})\b/i;
@@ -136,7 +139,14 @@ export function cardOfxLineType(kind: CardOfxKind): 'INCOME' | 'EXPENSE' {
   return kind === 'purchase' ? 'EXPENSE' : 'INCOME';
 }
 
-const NAMED_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const NAMED_ENTITIES = new Map<string, string>([
+  ['amp', '&'],
+  ['lt', '<'],
+  ['gt', '>'],
+  ['quot', '"'],
+  ['apos', "'"],
+  ['nbsp', ' '],
+]);
 
 /** Decodes the character references OFX uses in SGML and XML alike (&amp; &lt; &#233; &#xE9; ...). */
 function decodeEntities(text: string): string {
@@ -145,7 +155,7 @@ function decodeEntities(text: string): string {
       const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
       return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
     }
-    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
+    return NAMED_ENTITIES.get(body.toLowerCase()) ?? whole;
   });
 }
 
@@ -249,6 +259,10 @@ export function parseCardOfx(input: Buffer | string): CardOfxStatement {
       skipped.push({ position: i, reason: 'valor zero' });
       continue;
     }
+    if (!Number.isFinite(roundedCents) || Math.abs(roundedCents) > MAX_CARD_OFX_AMOUNT * 100) {
+      skipped.push({ position: i, reason: 'valor (TRNAMT) acima do limite de importação' });
+      continue;
+    }
 
     const memoRaw = tagValue(block, 'MEMO') ?? tagValue(block, 'NAME');
     const memoText = memoRaw === null ? '' : cutMemo(decodeEntities(memoRaw).replace(/\s+/g, ' ').trim());
@@ -256,6 +270,10 @@ export function parseCardOfx(input: Buffer | string): CardOfxStatement {
     const signedAmount = roundedCents / 100;
     const kind = classifyCardOfxLine(memo, signedAmount);
     const fitidValue = decodeEntities(fitid);
+    if (fitidValue.length > MAX_CARD_OFX_FITID_LENGTH) {
+      skipped.push({ position: i, reason: `identificador (FITID) com mais de ${MAX_CARD_OFX_FITID_LENGTH} caracteres` });
+      continue;
+    }
 
     const contentKey = cardOfxContentKey(fitidValue, memo, signedAmount, date);
     const occurrence = (occurrences.get(contentKey) ?? 0) + 1;

@@ -281,6 +281,56 @@ describe('parseCardOfx (SGML 1.x)', () => {
   });
 });
 
+describe('parseCardOfx: values the confirm would reject', () => {
+  it('skips amounts that are not finite once scaled to cents, or above the import cap, saying why', () => {
+    const result = parseCardOfx(
+      sgml([
+        { date: '20261112', amount: '-1e307', fitid: FIT_A, memo: 'Absurda' },
+        { date: '20261112', amount: '-5e9', fitid: FIT_B, memo: 'Acima do limite' },
+        { date: '20261112', amount: '1000000000.01', fitid: FIT_C, memo: 'Um centavo acima' },
+        { date: '20261112', amount: '-1000000000.00', fitid: FIT_D, memo: 'No limite' },
+      ]),
+    );
+
+    expect(result.lines.map((l) => [l.memo, l.amount])).toEqual([['No limite', 1_000_000_000]]);
+    expect(result.skipped).toEqual([
+      { position: 1, reason: expect.stringContaining('acima do limite') },
+      { position: 2, reason: expect.stringContaining('acima do limite') },
+      { position: 3, reason: expect.stringContaining('acima do limite') },
+    ]);
+  });
+
+  it('skips a FITID over 255 characters and keeps one of exactly 255', () => {
+    const result = parseCardOfx(
+      sgml([
+        { date: '20261112', amount: '-1.00', fitid: 'a'.repeat(300), memo: 'Longo demais' },
+        { date: '20261112', amount: '-2.00', fitid: 'b'.repeat(255), memo: 'No limite' },
+      ]),
+    );
+
+    expect(result.lines.map((l) => [l.memo, l.fitid.length])).toEqual([['No limite', 255]]);
+    expect(result.lines[0]!.ref.length).toBeLessThanOrEqual(120);
+    expect(result.skipped).toEqual([{ position: 1, reason: expect.stringContaining('255 caracteres') }]);
+  });
+
+  it('measures the FITID after decoding its character references', () => {
+    const encoded = '&amp;'.repeat(60); // 300 characters in the file, 60 once decoded
+    const result = parseCardOfx(sgml([{ date: '20261112', amount: '-1.00', fitid: encoded, memo: 'Entidades' }]));
+
+    expect(result.lines).toHaveLength(1);
+    expect(result.lines[0]!.fitid).toBe('&'.repeat(60));
+  });
+});
+
+describe('parseCardOfx: character references', () => {
+  it('decodes only the known named entities, never names that exist on Object.prototype', () => {
+    const memo = 'Loja &constructor; &toString; &__proto__; &hasOwnProperty; &amp; &LT;';
+    const [line] = parseCardOfx(sgml([{ date: '20261112', amount: '-1.00', memo }])).lines;
+
+    expect(line!.memo).toBe('Loja &constructor; &toString; &__proto__; &hasOwnProperty; & <');
+  });
+});
+
 describe('parseCardOfx (XML 2.x)', () => {
   it('reads one-line XML with closing tags like the SGML flavour', () => {
     const result = parseCardOfx(
