@@ -8,7 +8,7 @@ import {
   seedRecurrence,
   seedTransaction,
 } from './__fixtures__/recurring-fake-db.js';
-import { calculateNextRunDate, executeRecurringTransaction, listRecurringTransactions } from './recurring-transactions.service.js';
+import { calculateNextRunDate, executeRecurringTransaction, listRecurringTransactions, occurrenceDateFor } from './recurring-transactions.service.js';
 import { anchorDayOf, startDayFor } from './recurring-dates.js';
 import { fakePrisma } from './__fixtures__/recurring-fake-db.js';
 
@@ -133,14 +133,14 @@ describe('calculateNextRunDate: monthly, anchored to the day of startDate', () =
 describe('execute: the guard runs under the recurrence lock, inside the database transaction', () => {
   it('takes the lock before looking for the month occurrence and before creating anything', async () => {
     const rec = seedRecurrence({ householdId: HH, accountId: ACC, description: 'Energia', amount: 100, nextRunAt: '2026-10-05' });
-    fakePrisma.$queryRaw.mockClear();
+    fakePrisma.$executeRaw.mockClear();
     fakePrisma.transaction.findFirst.mockClear();
     fakePrisma.transaction.create.mockClear();
     await executeRecurringTransaction(rec.id, HH, {});
-    const lock = fakePrisma.$queryRaw.mock.invocationCallOrder[0]!;
+    const lock = fakePrisma.$executeRaw.mock.invocationCallOrder[0]!;
     expect(lock).toBeLessThan(fakePrisma.transaction.findFirst.mock.invocationCallOrder[0]!);
     expect(lock).toBeLessThan(fakePrisma.transaction.create.mock.invocationCallOrder[0]!);
-    expect(String(fakePrisma.$queryRaw.mock.calls[0]![1])).toBe(`recurring:${rec.id}`);
+    expect(String(fakePrisma.$executeRaw.mock.calls[0]![1])).toBe(`recurring:${rec.id}`);
   });
 });
 
@@ -163,5 +163,27 @@ describe('listRecurringTransactions: lastOccurrenceDate', () => {
     const list = await listRecurringTransactions({ householdId: HH } as never);
     const by = Object.fromEntries(list.map((r) => [r.id, r.lastOccurrenceDate]));
     expect(by).toEqual({ [a.id]: iso(25), [b.id]: iso(-10), [c.id]: null });
+  });
+});
+
+describe('occurrenceDateFor: a late run keeps the scheduled day', () => {
+  const today = new Date(2026, 9, 20);
+  const stored = new Date('2026-10-05T00:00:00.000Z');
+  const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+  it('monthly: the occurrence is dated nextRunAt, not the day the cron ran', () => {
+    expect(ymd(occurrenceDateFor('MONTHLY', stored, today))).toBe('2026-10-05');
+    expect(ymd(occurrenceDateFor('MONTHLY', new Date('2026-10-20T00:00:00.000Z'), today))).toBe('2026-10-20');
+  });
+
+  it('other frequencies keep dating on the processing day', () => {
+    expect(ymd(occurrenceDateFor('WEEKLY', stored, today))).toBe('2026-10-20');
+  });
+
+  it('executed late, a recurrence keeps its day for the following months (Oct 5, Nov 5 ...)', async () => {
+    const rec = seedRecurrence({ householdId: HH, accountId: ACC, description: 'Energia', amount: 100, nextRunAt: '2026-10-05', startDate: '2026-10-05' });
+    await executeRecurringTransaction(rec.id, HH, { date: occurrenceDateFor('MONTHLY', new Date('2026-10-05T00:00:00.000Z'), today) });
+    expect(rowsOf('transaction').map((t) => t.date)).toEqual(['2026-10-05']);
+    expect(rowById('recurringTransaction', rec.id).nextRunAt).toBe('2026-11-05');
   });
 });

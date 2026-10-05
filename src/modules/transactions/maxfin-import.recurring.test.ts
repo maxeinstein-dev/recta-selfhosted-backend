@@ -20,7 +20,7 @@ import {
   type MaxFinAccountsResolved,
   type ResolvedAccount,
 } from './maxfin-import.service.js';
-import { eligibleForRecurring } from './maxfin-recurring.js';
+import { eligibleForRecurring, loadRecurringMatcher } from './maxfin-recurring.js';
 import type {
   MaxFinAccountsInput,
   MaxFinConfirmRequest,
@@ -525,7 +525,7 @@ describe('confirm: atomic and anchored', () => {
     expect(rowsOf('transaction')).toEqual([]);
     expect(rowById('account', BILLS).balance).toBe(1000);
     expect(rowById('recurringTransaction', rec.id).nextRunAt).toBe('2026-10-05');
-    expect(fakePrisma.$queryRaw).toHaveBeenCalled();
+    expect(fakePrisma.$executeRaw).toHaveBeenCalled();
   });
 
   it('returns to the anchor day after a short month', async () => {
@@ -538,5 +538,43 @@ describe('confirm: atomic and anchored', () => {
     const jan = energyRecurrence({ nextRunAt: '2026-10-28', startDate: '2026-07-31' });
     await confirm(await previewCsv());
     expect(rowById('recurringTransaction', jan.id).nextRunAt).toBe('2026-11-30');
+  });
+});
+
+describe('re-confirming a row the sheet already took over', () => {
+  it('keeps the link to the recurrence when the changed row is replaced', async () => {
+    const rec = energyRecurrence();
+    const tx = generated(rec.id);
+    await confirm(await previewCsv());
+    const changed = await previewCsv({ bills: [['Energia', 'Casa', 150]] });
+    expect(rowNamed(changed, 'Energia')).toMatchObject({ status: 'changed', existingTransactionId: tx.id });
+    const result = await confirm(changed);
+    expect(result).toMatchObject({ replaced: 1, assumedRecurring: 0 });
+    const rows = rowsOf('transaction');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ amount: 150, sourceRef: 'maxfin:2026-10:bills:4', recurringTransactionId: rec.id });
+  });
+
+  it('does not invent a link for a row that never had one', async () => {
+    await confirm(await previewCsv());
+    await confirm(await previewCsv({ bills: [['Energia', 'Casa', 150]] }));
+    expect(rowsOf('transaction')[0]!.recurringTransactionId).toBeNull();
+  });
+});
+
+describe('loadRecurringMatcher: the recurrence-only branch stops at today + 31 days', () => {
+  it('does not offer a recurrence whose next run is farther than that, but does offer the one inside', async () => {
+    energyRecurrence({ nextRunAt: '2026-12-05' });
+    const far = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 9, 20));
+    expect(far.take(BILLS, 'Energia')).toBeUndefined();
+    const near = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 10, 20));
+    expect(near.take(BILLS, 'Energia')).toMatchObject({ kind: 'recurrence', day: '2026-12-05' });
+  });
+
+  it('a generated occurrence is still offered whatever its date', async () => {
+    const rec = energyRecurrence({ nextRunAt: '2027-01-05' });
+    generated(rec.id, { date: '2026-12-05' });
+    const m = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 9, 20));
+    expect(m.take(BILLS, 'Energia')).toMatchObject({ kind: 'generated' });
   });
 });

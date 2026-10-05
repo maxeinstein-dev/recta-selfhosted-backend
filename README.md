@@ -150,7 +150,7 @@ npm run cron:process-recurrences
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
 
-A monthly recurrence has at most one occurrence per month: executing it (cron, `POST /recurring-transactions/:id/execute`, or right after creating or editing it) does nothing but move `nextRunAt` on when a transaction of that recurrence already exists in the month (for example one the monthly sheet took over, see below). Weekly, biweekly and daily recurrences are not affected.
+A monthly recurrence has at most one occurrence per month: executing it (cron, `POST /recurring-transactions/:id/execute`, or right after creating or editing it) does nothing but move `nextRunAt` on when a transaction of that recurrence already exists in the month (for example one the monthly sheet took over, see below). Weekly, biweekly and daily recurrences are not affected. A monthly occurrence is dated on the recurrence's scheduled day (`nextRunAt`) even when the cron runs late.
 
 ### Detecting recurring expenses
 

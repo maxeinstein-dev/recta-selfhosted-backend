@@ -236,7 +236,7 @@ describe('applyDetectedRecurrences', () => {
     });
     await expect(applyDetectedRecurrences({ householdId: HH, items: [{ id: a }, { id: b }] }, NOW)).rejects.toThrow('boom');
     expect(rowsOf('recurringTransaction')).toEqual([]);
-    expect(fakePrisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(fakePrisma.$executeRaw).toHaveBeenCalledTimes(1);
   });
 
   it('never creates a recurrence in another household', async () => {

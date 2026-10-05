@@ -47,6 +47,21 @@ export function calculateNextRunDate(
 }
 
 /**
+ * Date a due occurrence is created with. A monthly recurrence runs on its scheduled day (nextRunAt) even when the cron
+ * is late, so a late run does not shift the day of every later month (Oct 5 executed on Oct 20 stays Oct 5, next Nov 5).
+ * Other frequencies keep dating the occurrence on the day it is processed.
+ */
+export function occurrenceDateFor(
+  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY',
+  nextRunAt: Date,
+  today: Date
+): Date {
+  if (frequency !== 'MONTHLY') return today;
+  const scheduled = localDate(dayString(nextRunAt));
+  return scheduled <= today ? scheduled : today;
+}
+
+/**
  * REGRA DE NEGÓCIO CRÍTICA:
  * Criar uma recorrência NÃO cria transações antecipadamente.
  * Recorrências são apenas REGRAS de geração futura.
@@ -452,7 +467,7 @@ export async function executeRecurringTransaction(
     // and the recurrence just moves on. The check runs under a per-recurrence lock, so two executions (cron, manual,
     // sheet confirm) cannot both see an empty month.
     if (recurring.frequency === 'MONTHLY') {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${recurring.id}`}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${recurring.id}`}))`;
       const { start, end } = monthBoundsUtc(dayString(transactionDate));
       const existing = await tx.transaction.findFirst({
         where: { householdId, recurringTransactionId: recurring.id, date: { gte: start, lt: end } },

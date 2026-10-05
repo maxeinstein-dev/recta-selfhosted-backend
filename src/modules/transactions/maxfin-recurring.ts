@@ -8,6 +8,7 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { normalizeDescription } from '../recurring-transactions/detect.js';
 import { anchorDayOf, dayString } from '../recurring-transactions/recurring-dates.js';
+import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from '../recurring-transactions/recurring-follow.js';
 import type { MaxFinInstallment, MaxFinSectionKey } from './parsers/maxfin.types.js';
 
 export type RecurringMatch =
@@ -71,6 +72,7 @@ export async function loadRecurringMatcher(
   householdId: string,
   accountIds: string[],
   monthKey: string,
+  now: Date = new Date(),
 ): Promise<RecurringMatcher> {
   if (accountIds.length === 0) return NO_MATCHER;
   const start = new Date(Date.UTC(Number(monthKey.slice(0, 4)), Number(monthKey.slice(5, 7)) - 1, 1));
@@ -92,7 +94,10 @@ export async function loadRecurringMatcher(
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
     select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true },
   });
-  const due = recurrences.filter((r) => inMonth(dayString(r.nextRunAt), monthKey));
+  // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
+  // followLastAmountInTx): a sheet of a far future month must not consume it.
+  const limit = plusDays(now, FOLLOW_LOOKAHEAD_DAYS);
+  const due = recurrences.filter((r) => inMonth(dayString(r.nextRunAt), monthKey) && dayString(r.nextRunAt) <= limit);
   const occupied = new Set<string>();
   if (due.length > 0) {
     const present = await prisma.transaction.findMany({

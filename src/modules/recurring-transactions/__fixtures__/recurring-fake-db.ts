@@ -182,9 +182,9 @@ export const fakePrisma = {
   account: table('account'),
   category: table('category'),
   /** The advisory lock apply takes (no real locking; tests look at the calls). */
-  $queryRaw: vi.fn(async (strings: TemplateStringsArray, ..._values: unknown[]) => {
+  $executeRaw: vi.fn(async (strings: TemplateStringsArray, ..._values: unknown[]) => {
     if (!strings.join('?').includes('pg_advisory_xact_lock')) throw new Error(`Unexpected raw query: ${strings.join('?')}`);
-    return [];
+    return 0;
   }),
   $transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
     const saved = snapshot();
@@ -253,7 +253,12 @@ export const fakeServices = {
       return { ...project(row), amount: row.amount };
     },
   ),
-  deleteTransaction: vi.fn(async () => undefined),
+  deleteTransaction: vi.fn(async (id: string, householdId: string) => {
+    const row = store.transaction!.find((t) => t.id === id && t.householdId === householdId);
+    if (!row) throw Object.assign(new Error('Transaction not found'), { statusCode: 404 });
+    if (row.paid) move(store.account!.find((a) => a.id === row.accountId), row.type, row.amount as number, -1);
+    store.transaction = store.transaction!.filter((t) => t !== row);
+  }),
   reset(): void {
     fakeServices.createTransaction.mockClear();
     fakeServices.updateTransaction.mockClear();

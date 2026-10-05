@@ -143,7 +143,7 @@ export async function applyDetectedRecurrences(
 
   return prisma.$transaction(
     async (tx: Prisma.TransactionClient) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring-detect:${householdId}`}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring-detect:${householdId}`}))`;
       const { candidates } = await runDetection(tx, householdId, minMonths, months, now);
       const byId = new Map(candidates.map((c) => [c.id, c]));
 

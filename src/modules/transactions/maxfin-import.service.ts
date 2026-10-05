@@ -478,7 +478,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
 
   // Recurrences that already cover the month (the sheet takes them over); a match serves one row.
   const recurringMatcher = key
-    ? await loadRecurringMatcher(householdId, accountIds, key)
+    ? await loadRecurringMatcher(householdId, accountIds, key, params.today)
     : { take: (_accountId: string, _description: string): RecurringMatch | undefined => undefined };
 
   const rows: MaxFinPreviewRow[] = parsed.rows.map((r) => {
@@ -955,9 +955,13 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   // Re-check what is already stored at write time (the preview is not trusted).
   const existingRows = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: rows.map((r) => r.sourceRef) } },
-    select: { id: true, sourceRef: true },
+    select: { id: true, sourceRef: true, recurringTransactionId: true },
   });
   const existingByRef = new Map(existingRows.map((t) => [t.sourceRef as string, t.id]));
+  // A row the sheet already took over keeps its link to the recurrence when it is replaced.
+  const recurrenceOfExisting = new Map(
+    existingRows.filter((t) => t.recurringTransactionId).map((t) => [t.sourceRef as string, t.recurringTransactionId as string]),
+  );
 
   // Recurrences that already cover the month, loaded only when a row could take one over.
   const takesRecurrence = rows.some(eligibleForRecurring);
@@ -1062,6 +1066,7 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
           paid: options.closedMonth || row.section === 'credit' ? true : row.paid,
           isSplit: false,
           sourceRef: row.sourceRef,
+          ...(recurrenceOfExisting.has(row.sourceRef) ? { recurringTransactionId: recurrenceOfExisting.get(row.sourceRef)! } : {}),
           ...installmentFields(row.installment),
         },
         userId,
@@ -1241,7 +1246,7 @@ async function assumeRecurrence(match: RecurringMatch, ctx: AssumeContext): Prom
     userId,
     {
       inTransaction: async (tx) => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${match.recurringId}`}))`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${match.recurringId}`}))`;
         await tx.recurringTransaction.update({
           where: { id: match.recurringId },
           data: {
