@@ -15,10 +15,21 @@
  *  4. sum: a sheet expense equal to a subset of the remaining purchases (searched among at most 15 of them, those
  *     sharing words with the row first, then in file order; smaller rows first); more than one subset anywhere in
  *     the pool of remaining purchases makes the proposal ambiguous (unselected);
+ *  4b. merge: a free purchase equal to the sum of 2 to 4 sheet expense rows (the first row stays and takes the bank
+ *     line's amount, the others are absorbed into it); more than one combination makes the proposal ambiguous;
  *  5. stored future installment (sheet or earlier OFX), same N/M, amount within 1 cent: the real line consumes it;
  *     a prepayment's lines N+1..N+K consume the futures with those numbers (its discount is left to step 7);
  *  6. reversal: a purchase and a refund of the same amount and a similar merchant (unselected);
- *  7. the rest of the OFX is new (grouped by FITID, selected only in months without sheet rows); what is left of
+ *  6b. neighbour: a left-over purchase line and an unlinked sheet row of the adjacent invoice month (+-1) with the
+ *     same type and amount, a word in common (fuzzy) and dates within 10 days: the sheet typed it in the wrong month;
+ *     selected only when each side has no other candidate;
+ *  6c. group: a sheet expense equal to a bounded subset (12 lines at most) of the left-over purchases that share a
+ *     merchant token with it (a sheet row "Uber/99" against several Uber and 99 lines); unique solution = selected;
+ *  6d. near amount: an unlinked paid sheet row of this month and a left-over line of the same type whose amounts differ
+ *     by 1 to 5 cents; unique both ways and (same N/M, or a shared word incl. fuzzy prefix, or an alias) = selected;
+ *     the row then adopts the bank amount;
+ *  7. the rest of the OFX is new (grouped by FITID, selected in months without sheet rows, when the purchase date is
+ *     before the earliest sheet month stored on the card, or when no sheet row of the month is left over); what is left of
  *     the month's sheet is reported, never deleted.
  */
 import { clampText, parseInstallment } from './parsers/maxfin.parser.js';
@@ -42,14 +53,32 @@ export interface StoredCardRow {
   installmentId: string | null;
   installmentNumber: number | null;
   totalInstallments: number | null;
+  /** Category of the row (a merge needs equal categories to be selected). */
+  categoryName?: string | null;
+  /** The row has shares, a split, a settlement, a recurrence or an attachment: never merged (see mergeBlocked). */
+  mergeBlocked?: boolean;
 }
 
-export type ProposalKind = 'enrich-exact' | 'enrich-plan' | 'enrich-sum' | 'consume-future' | 'create' | 'reversal';
+export type ProposalKind =
+  | 'enrich-exact'
+  | 'enrich-plan'
+  | 'enrich-sum'
+  | 'enrich-merge'
+  | 'enrich-neighbour'
+  | 'enrich-group'
+  | 'enrich-near'
+  | 'consume-future'
+  | 'create'
+  | 'reversal';
 
 export const PROPOSAL_KINDS: readonly ProposalKind[] = [
   'enrich-exact',
   'enrich-plan',
   'enrich-sum',
+  'enrich-merge',
+  'enrich-neighbour',
+  'enrich-group',
+  'enrich-near',
   'consume-future',
   'create',
   'reversal',
@@ -75,10 +104,30 @@ export interface ReconcileInput {
   planNumbers: ReadonlyMap<string, ReadonlySet<number>>;
   /** Amount of the previous invoice (its recorded payment, else its total); null: the largest payment line wins. */
   paymentReference: number | null;
+  /**
+   * First day ('YYYY-MM-DD') of the calendar month of the card's earliest sheet month. A leftover purchase dated
+   * before it is history the sheet never covered, so it is selected by default. Other leftovers of a sheet month are
+   * selected only when every sheet row found its bank line (no residue). Null/undefined: no such history.
+   */
+  historyBefore?: string | null;
+  /**
+   * Sheet rows of the adjacent invoice months (+-1) on the card, generated futures excluded. Only rows not linked to
+   * OFX lines are candidates of the neighbour step.
+   */
+  neighbourRows?: StoredCardRow[];
+  /**
+   * Sheet months ('YYYY-MM') among the neighbour rows whose statement was already imported (some row of the month is
+   * linked to an OFX line). A neighbour match is selected by default only for those months.
+   */
+  neighbourStatementMonths?: ReadonlySet<string>;
 }
 
 export interface ReconcileProposal {
-  /** `kind|sorted refs joined by ','|target id` (see buildGroupId). */
+  /** Why a proposal is not selected by default (machine code), or null. */
+  reason: string | null;
+  /** create held back as 'sheet-residue': the row left over on the card that its lines may be a re-dated copy of. */
+  counterpart: StoredCardRow | null;
+  /** `kind|sorted refs joined by ','|target id` (see buildGroupId; a merge lists its target ids joined by '+'). */
   group: string;
   kind: ProposalKind;
   /** Sorted. */
@@ -87,6 +136,8 @@ export interface ReconcileProposal {
   ambiguous: boolean;
   /** Sheet row (enrich) or stored future (consume) the proposal writes to; null for create and reversal. */
   target: StoredCardRow | null;
+  /** enrich-merge: the other sheet rows the target absorbs (deleted on apply), in sheet order. */
+  absorbed: StoredCardRow[];
   /** How the target ends up (enrich and consume); null otherwise. */
   result: { date: string; description: string; notesAppend: string | null } | null;
   /** create: numbers of the future installments to generate (months without sheet rows only). */
@@ -115,6 +166,8 @@ export interface ReconcileResult {
   /** Payment lines that are not the previous invoice's payment and paired with no sheet credit. */
   unpairedAdvances: ReconcileLine[];
   monthHasSheet: boolean;
+  /** The merge search ran out of its work budget: some bank lines got no merge proposal. */
+  mergeBudgetExhausted: boolean;
 }
 
 /** A +K plan or a FITID net may differ from the sheet by rounding of the prepayment discount. */
@@ -137,6 +190,21 @@ export const SUM_COUNT_BUDGET = 40_000_000;
 export const MAX_GROUP_REFS = 150;
 /** Longest group id the confirm endpoint accepts. */
 export const MAX_GROUP_ID_LENGTH = 16_000;
+/** Sheet rows one bank line may merge (2 to 4). */
+export const MERGE_MIN_ROWS = 2;
+export const MERGE_MAX_ROWS = 4;
+/** Combinations looked at per bank line before stopping (more than one already means ambiguous). */
+const MERGE_MAX_MATCHES = 20;
+/** Days apart a neighbour-month row and a bank line may be. */
+export const NEIGHBOUR_MAX_DAYS = 10;
+/** Largest amount difference, in cents, the near-amount step accepts (1..5). */
+export const NEAR_MAX_CENTS = 5;
+/** Lines searched per sheet row in the group step (2^12 subsets at most). */
+export const GROUP_MAX_CANDIDATES = 12;
+/** Cells of the knapsack table the group step may spend counting a pool larger than its window. */
+export const GROUP_COUNT_BUDGET = 5_000_000;
+/** Work the whole merge step may spend (one unit = one candidate row tried); past it, lines get no merge proposal. */
+export const MERGE_WORK_BUDGET = 5_000_000;
 const MAX_NOTES_APPEND = 1000;
 
 const STOP_WORDS = new Set(['parcela', 'nupay']);
@@ -336,20 +404,28 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
   const sheet = rowStates(input.sheetRows.filter((row) => !linked.has(row.id)));
   const monthHasSheet = input.sheetRows.length > 0;
   const proposals: ReconcileProposal[] = [];
+  const historyBefore = input.historyBefore ?? null;
+  /** A purchase dated before the first window the sheet covers: history the sheet never saw. */
+  const beforeSheetHistory = (date: string): boolean => historyBefore !== null && date < historyBefore;
 
   const propose = (
     kind: ProposalKind,
     states: LineState[],
     target: RowState | null,
-    extra: Partial<Pick<ReconcileProposal, 'defaultSelected' | 'ambiguous' | 'result' | 'futureNumbers' | 'futureBaseRef' | 'tieBroken'>> = {},
+    extra: Partial<Pick<ReconcileProposal, 'defaultSelected' | 'ambiguous' | 'result' | 'futureNumbers' | 'futureBaseRef' | 'tieBroken' | 'reason' | 'counterpart'>> & {
+      absorbed?: RowState[];
+    } = {},
   ): void => {
     const refs = states.map((s) => s.line.ref).sort();
-    const group = buildGroupId(kind, refs, target?.row.id ?? null);
+    const absorbed = extra.absorbed ?? [];
+    const targetKey = target ? [target.row.id, ...absorbed.map((a) => a.row.id).sort()].join('+') : null;
+    const group = buildGroupId(kind, refs, targetKey);
     for (const state of states) {
       state.status = 'proposed';
       state.group = group;
     }
     if (target) target.used = true;
+    for (const row of absorbed) row.used = true;
     proposals.push({
       group,
       kind,
@@ -357,10 +433,13 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       defaultSelected: extra.defaultSelected ?? true,
       ambiguous: extra.ambiguous ?? false,
       target: target?.row ?? null,
+      absorbed: absorbed.map((a) => a.row),
       result: extra.result ?? null,
       futureNumbers: extra.futureNumbers ?? [],
       futureBaseRef: extra.futureBaseRef ?? null,
       tieBroken: extra.tieBroken ?? false,
+      reason: extra.reason ?? null,
+      counterpart: extra.counterpart ?? null,
     });
   };
 
@@ -544,8 +623,49 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     propose('enrich-sum', states, row, {
       ambiguous,
       defaultSelected: !ambiguous,
+      reason: ambiguous ? 'ambiguous' : null,
       result: aggregateResult(states, row),
     });
+  }
+
+  // 4b. Merges: a purchase equal to the sum of 2 to 4 sheet expense rows (a purchase the sheet typed as several rows).
+  const mergeBudget = { left: MERGE_WORK_BUDGET };
+  let mergeBudgetExhausted = false;
+  const mergeRows = sheet
+    .filter((r) => !r.used && r.row.type === 'EXPENSE' && r.row.paid && !r.row.mergeBlocked && r.installment === null && r.cents > 0)
+    .sort((a, b) => a.cents - b.cents || a.index - b.index);
+  if (mergeRows.length >= MERGE_MIN_ROWS) {
+    for (const state of lines) {
+      if (state.status !== 'free' || state.line.kind !== 'purchase' || state.line.installment) continue;
+      const pool = mergeRows.filter((r) => !r.used && r.cents < state.cents);
+      if (pool.length < MERGE_MIN_ROWS) continue;
+      const found = findRowMerges(pool, state.cents, mergeBudget);
+      if (mergeBudget.left < 0) mergeBudgetExhausted = true;
+      if (found.length === 0) continue;
+      const scored = found
+        .map((rows) => ({
+          rows: [...rows].sort((a, b) => a.index - b.index),
+          shared: fuzzySharedCount(state.words, unionRowWords(rows)),
+        }))
+        .sort((a, b) => b.shared - a.shared || compareIndexes(a.rows, b.rows));
+      const best = scored[0]!.rows;
+      const ambiguous = found.length > 1;
+      const noWords = scored[0]!.shared === 0;
+      const mixedCategories = new Set(best.map((r) => r.row.categoryName ?? null)).size > 1;
+      const reason = ambiguous ? 'ambiguous' : noWords ? 'no-shared-words' : mixedCategories ? 'mixed-categories' : null;
+      const [kept, ...absorbed] = best as [RowState, ...RowState[]];
+      propose('enrich-merge', [state], kept, {
+        ambiguous,
+        defaultSelected: reason === null,
+        reason,
+        absorbed,
+        result: {
+          date: state.line.date,
+          description: state.line.memo,
+          notesAppend: mergeNote(best),
+        },
+      });
+    }
   }
 
   // 5. Stored future installments: same N/M, amount within a cent.
@@ -627,6 +747,121 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     if (purchase) propose('reversal', [purchase, refund], null, { defaultSelected: false });
   }
 
+  // 6b. Neighbour months: the same purchase typed in the adjacent invoice month of the sheet.
+  const neighbours = rowStates(
+    (input.neighbourRows ?? []).filter((r) => !linked.has(r.id) && r.paid && !r.mergeBlocked && r.installmentNumber == null),
+  );
+  if (neighbours.length > 0) {
+    const pairsN: Array<{ row: RowState; state: LineState; shared: number; days: number }> = [];
+    for (const state of lines) {
+      if (state.status !== 'free' || state.line.kind === 'payment' || state.line.installment) continue;
+      for (const row of neighbours) {
+        if (row.row.type !== state.line.type || row.cents !== state.cents) continue;
+        const shared = fuzzySharedCount(state.words, row.words);
+        const days = dayDistance(state.line.date, row.row.date);
+        if (shared > 0 && days <= NEIGHBOUR_MAX_DAYS) pairsN.push({ row, state, shared, days });
+      }
+    }
+    const rowsOfLine = new Map<LineState, number>();
+    const linesOfRow = new Map<RowState, number>();
+    for (const { row, state } of pairsN) {
+      rowsOfLine.set(state, (rowsOfLine.get(state) ?? 0) + 1);
+      linesOfRow.set(row, (linesOfRow.get(row) ?? 0) + 1);
+    }
+    pairsN.sort((a, b) => b.shared - a.shared || a.days - b.days || a.row.index - b.row.index || a.state.index - b.state.index);
+    for (const pair of pairsN) {
+      if (pair.row.used || pair.state.status !== 'free') continue;
+      const unique = rowsOfLine.get(pair.state) === 1 && linesOfRow.get(pair.row) === 1;
+      const month = /^maxfin:(\d{4}-\d{2}):/.exec(pair.row.row.sourceRef ?? '')?.[1] ?? '';
+      const imported = input.neighbourStatementMonths?.has(month) ?? false;
+      const strong = strongSignal(pair.row.row.description, pair.state.line.memo, null);
+      const reason = !unique ? 'neighbour-ambiguous' : !strong ? 'neighbour-weak' : !imported ? 'neighbour-month-not-imported' : null;
+      propose('enrich-neighbour', [pair.state], pair.row, {
+        ambiguous: !unique,
+        defaultSelected: reason === null,
+        reason,
+        result: {
+          date: pair.state.line.date,
+          description: pair.state.line.memo,
+          notesAppend: clampText(`Planilha: ${pair.row.row.description}`, MAX_NOTES_APPEND),
+        },
+      });
+    }
+  }
+
+  // 6c. Groups: a sheet row against several lines of the same merchant (bounded subset sum over that merchant only).
+  let groupBudget = GROUP_COUNT_BUDGET;
+  for (const row of [...sheet].sort((a, b) => a.cents - b.cents || a.index - b.index)) {
+    if (row.used || row.row.type !== 'EXPENSE' || row.row.mergeBlocked || row.installment !== null) continue;
+    const tokens = merchantTokens(row.row.description);
+    if (tokens.size === 0) continue;
+    const pool = lines
+      .filter((s) => s.status === 'free' && s.line.kind === 'purchase' && !s.line.installment && s.cents < row.cents)
+      .map((s) => ({ state: s, shared: fuzzySharedCount(tokens, merchantTokens(s.line.memo)) }))
+      .filter((c) => c.shared > 0)
+      .sort((a, b) => b.shared - a.shared || a.state.index - b.state.index)
+      .map((c) => c.state);
+    const candidates = pool.slice(0, GROUP_MAX_CANDIDATES);
+    if (candidates.length < 2 || candidates.reduce((t, s) => t + s.cents, 0) < row.cents) continue;
+    const { count, best } = subsetSumMatches(
+      candidates.map((s) => s.cents),
+      row.cents,
+    );
+    if (!best) continue;
+    let reason: string | null = count > 1 ? 'ambiguous' : null;
+    if (reason === null && pool.length > candidates.length) {
+      const cost = pool.length * row.cents;
+      if (cost <= groupBudget) {
+        groupBudget -= cost;
+        if (countSubsetSums(pool.map((s) => s.cents), row.cents) > 1) reason = 'ambiguous';
+      } else reason = 'pool-too-large';
+    }
+    const states = best.map((i) => candidates[i]!);
+    propose('enrich-group', states, row, {
+      ambiguous: reason === 'ambiguous',
+      defaultSelected: reason === null,
+      reason,
+      result: aggregateResult(states, row),
+    });
+  }
+
+  // 6d. Near amounts: the same purchase typed (or charged) a few cents apart.
+  const nearPairs: Array<{ row: RowState; state: LineState; diff: number; strong: boolean }> = [];
+  for (const row of sheet) {
+    if (row.used || !row.row.paid || row.row.mergeBlocked || (row.installment?.prepaid ?? 0) > 0) continue;
+    for (const state of lines) {
+      if (state.status !== 'free' || state.line.kind === 'payment' || state.line.type !== row.row.type) continue;
+      const diff = Math.abs(state.cents - row.cents);
+      if (diff < 1 || diff > NEAR_MAX_CENTS) continue;
+      const inst = state.line.installment;
+      const sameInstallment = row.installment !== null && inst !== null && row.installment.number === inst.number && row.installment.total === inst.total;
+      const strong = strongSignal(row.row.description, state.line.memo, sameInstallment);
+      nearPairs.push({ row, state, diff, strong });
+    }
+  }
+  const nearOfRow = new Map<RowState, number>();
+  const nearOfLine = new Map<LineState, number>();
+  for (const { row, state } of nearPairs) {
+    nearOfRow.set(row, (nearOfRow.get(row) ?? 0) + 1);
+    nearOfLine.set(state, (nearOfLine.get(state) ?? 0) + 1);
+  }
+  nearPairs.sort((a, b) => Number(b.strong) - Number(a.strong) || a.diff - b.diff || a.row.index - b.row.index || a.state.index - b.state.index);
+  for (const pair of nearPairs) {
+    if (pair.row.used || pair.state.status !== 'free') continue;
+    const unique = nearOfRow.get(pair.row) === 1 && nearOfLine.get(pair.state) === 1;
+    const reason = !unique ? 'near-ambiguous' : pair.strong ? null : 'near-amount';
+    propose('enrich-near', [pair.state], pair.row, {
+      ambiguous: !unique,
+      defaultSelected: reason === null,
+      reason,
+      result: {
+        date: pair.state.line.date,
+        description: pair.state.line.memo,
+        notesAppend: clampText(`Planilha: ${pair.row.row.description} ${formatCents(pair.row.cents)}`, MAX_NOTES_APPEND),
+      },
+    });
+  }
+
   // 7. The rest of the OFX is new, one proposal per purchase (FITID). Advances left are information only.
   const leftovers = new Map<string, LineState[]>();
   for (const state of lines) {
@@ -636,10 +871,26 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
   for (const [fitid, group] of leftovers) {
     const plan = monthHasSheet ? null : futurePlan(fitid, group, lines, input.planNumbers);
     group.sort(byFileOrder);
+    const sheetResidue = sheet.some((r) => !r.used);
+    const residueRows: StoredCardRow[] = [
+      ...sheet.filter((r) => !r.used).map((r) => r.row),
+      // Card rows the generic importer stored without ref that no line took also count as look-alikes.
+      ...[...legacyByKey.values()].flat(),
+    ];
     // A purchase with more lines than a group id can list (never seen in a real invoice) comes in several groups.
     for (let start = 0; start < group.length; start += MAX_GROUP_REFS) {
-      propose('create', group.slice(start, start + MAX_GROUP_REFS), null, {
-        defaultSelected: !monthHasSheet,
+      const part = group.slice(start, start + MAX_GROUP_REFS);
+      const history = monthHasSheet && part.every((s) => beforeSheetHistory(s.line.date));
+      // History is imported (the user wants it) unless a row left over on the card looks like one of its lines (same
+      // type, exact amount or within max(R$ 5, 10%)): then it may be the same purchase typed with another date.
+      const counterpart = history ? (residueRows.find((row) => part.some((s) => plausibleCounterpart(s, row))) ?? null) : null;
+      // Selected: a month without sheet, history without a look-alike, or no sheet row left that could explain the
+      // line (every row found its bank line, so what is left of the OFX is missing from Recta).
+      const selected = !monthHasSheet || (history && counterpart === null) || !sheetResidue;
+      propose('create', part, null, {
+        defaultSelected: selected,
+        reason: selected ? null : 'sheet-residue',
+        counterpart: selected ? null : counterpart,
         futureNumbers: plan?.numbers ?? [],
         futureBaseRef: plan?.baseRef ?? null,
       });
@@ -665,7 +916,149 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     payment: payment ? { line: payment.line, legacyDuplicateId: paymentLegacy?.id ?? null } : null,
     unpairedAdvances,
     monthHasSheet,
+    mergeBudgetExhausted,
   };
+}
+
+/** A row and a line could be the same purchase: same type, amount equal or within max(R$ 5, 10% of the row). */
+export function plausibleCounterpart(line: { cents: number; line: { type: 'INCOME' | 'EXPENSE' } }, row: StoredCardRow): boolean {
+  if (line.line.type !== row.type) return false;
+  const rowCents = toCents(row.amount);
+  return Math.abs(line.cents - rowCents) <= Math.max(500, Math.round(rowCents * 0.1));
+}
+
+/** Two words are alike when equal or when both are 4+ letters long and start the same 4 letters (zorbit/zorbyt). */
+function alike(a: string, b: string): boolean {
+  return a === b || (a.length >= 4 && b.length >= 4 && a.slice(0, 4) === b.slice(0, 4));
+}
+
+/** Words of `a` with a like word in `b`. */
+export function fuzzySharedCount(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+  let count = 0;
+  for (const word of a) {
+    for (const other of b) {
+      if (alike(word, other)) {
+        count += 1;
+        break;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Generic words that name a kind of shop, not a shop: never a signal that two texts are the same store (and never a
+ * group token). A shared 5+ letter word outside this list, an alias or the same installment N/M are the strong signals.
+ */
+export const GENERIC_WORDS = new Set([
+  'posto', 'mercado', 'padaria', 'loja', 'restaurante', 'farmacia', 'supermercado',
+  'acougue', 'hamburgueria', 'sorveteria', 'drogaria', 'oficina', 'bar', 'cafe', 'ltda', 'comercio',
+  'pagamento', 'compra', 'parcela', 'nupay', 'center', 'shopping', 'store', 'online',
+]);
+
+/**
+ * "Same store" strong enough to select a pairing whose amounts or months do not match exactly: same installment N/M,
+ * an alias, or an exact shared word of 5+ letters that is not a generic shop word. The 4-letter fuzzy prefix is NOT
+ * enough here (it stays for the merge and group proposals, which are protected by their uniqueness).
+ */
+export function strongSignal(a: string, b: string, sameInstallment: boolean | null): boolean {
+  if (sameInstallment) return true;
+  if (aliasAlike(a, b)) return true;
+  const wordsA = wordsOf(a);
+  for (const word of wordsOf(b)) if (word.length >= 5 && !GENERIC_WORDS.has(word) && wordsA.has(word)) return true;
+  return false;
+}
+
+/** Tiny alias table: names a bank and a sheet write differently for the same store. Keep it short and tested. */
+const ALIASES: string[][] = [
+  ['ifood', 'ifd'],
+  ['mercado livre', 'meli+'],
+  ['uber', 'dluber'],
+];
+
+function hasAlias(text: string, rawMember: string): boolean {
+  const member = rawMember.replace(/\s+/g, '');
+  if (member.endsWith('+')) return text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().includes(member);
+  const compact = text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (member.length >= 5) return compact.includes(member);
+  return merchantTokens(text).has(member) || new Set(text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[a-z0-9]+/g) ?? []).has(member);
+}
+
+/** True when the two texts name the same store through one alias group (ifood ~ ifd, mercado livre ~ meli+...). */
+export function aliasAlike(a: string, b: string): boolean {
+  return ALIASES.some((group) => group.some((m) => hasAlias(a, m)) && group.some((m) => hasAlias(b, m)));
+}
+
+const MERCHANT_STOP = new Set(['com', ...GENERIC_WORDS]);
+
+/** Merchant tokens of a text: accent-free lower case, 3+ letters or 2+ digits, no generic words. */
+export function merchantTokens(text: string): Set<string> {
+  const raw = text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return new Set(raw.filter((t) => (/^\d+$/.test(t) ? t.length >= 2 : t.length >= 3) && !MERCHANT_STOP.has(t)));
+}
+
+/** Days between two YYYY-MM-DD dates. */
+function dayDistance(a: string, b: string): number {
+  const toDay = (d: string) => Date.UTC(Number(d.slice(0, 4)), Number(d.slice(5, 7)) - 1, Number(d.slice(8, 10))) / 86_400_000;
+  return Math.abs(toDay(a) - toDay(b));
+}
+
+function compareIndexes(a: RowState[], b: RowState[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i]!.index !== b[i]!.index) return a[i]!.index - b[i]!.index;
+  return a.length - b.length;
+}
+
+function unionRowWords(rows: RowState[]): Set<string> {
+  const words = new Set<string>();
+  for (const row of rows) for (const word of row.words) words.add(word);
+  return words;
+}
+
+/** "36,86" (unsigned). */
+function formatCents(cents: number): string {
+  return formatSigned(cents, false).slice(1);
+}
+
+/** Notes of the row that stays after a merge: what the absorbed rows said, so the detail is not lost. */
+function mergeNote(rows: RowState[]): string {
+  const parts = rows.map((r) => `${r.row.description} ${formatCents(r.cents)}`);
+  return clampText(`Planilha (soma de ${rows.length} linhas): ${parts.join('; ')}`, MAX_NOTES_APPEND);
+}
+
+/**
+ * Combinations of 2 to MERGE_MAX_ROWS rows (all of `pool`, sorted by amount) adding up to `target` cents, at most
+ * MERGE_MAX_MATCHES of them (reaching that already means ambiguous). The last row of a combination is found by a
+ * lookup, so the search costs about pool^(max-1) steps; `budget` bounds the total, and an exhausted budget yields no
+ * combination at all (never a half-searched, possibly non-unique one).
+ */
+function findRowMerges(pool: RowState[], target: number, budget: { left: number }): RowState[][] {
+  const byCents = new Map<number, number[]>();
+  pool.forEach((row, position) => byCents.set(row.cents, [...(byCents.get(row.cents) ?? []), position]));
+  const found: RowState[][] = [];
+  let exhausted = false;
+  const walk = (start: number, remaining: number, chosen: RowState[]): boolean => {
+    if (chosen.length >= 1) {
+      for (const position of byCents.get(remaining) ?? []) {
+        if (position < start) continue;
+        found.push([...chosen, pool[position]!]);
+        if (found.length >= MERGE_MAX_MATCHES) return true;
+      }
+    }
+    if (chosen.length + 2 > MERGE_MAX_ROWS) return false;
+    for (let position = start; position < pool.length; position++) {
+      const row = pool[position]!;
+      if (row.cents >= remaining) break;
+      budget.left -= 1;
+      if (budget.left < 0) {
+        exhausted = true;
+        return true;
+      }
+      if (walk(position + 1, remaining - row.cents, [...chosen, row])) return true;
+    }
+    return false;
+  };
+  walk(0, target, []);
+  return exhausted ? [] : found;
 }
 
 /** The sheet row keeps its description and gets the date of the first line and the list of lines in its notes. */

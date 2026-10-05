@@ -1,6 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { NotFoundError, BadRequestError, ForbiddenError } from '../../shared/errors/index.js';
+import { NotFoundError, BadRequestError, ForbiddenError, ConflictError } from '../../shared/errors/index.js';
 import {
   createPaginatedResponse,
   buildPaginationArgs,
@@ -729,16 +729,65 @@ export async function listTransactions(query: ListTransactionsQuery) {
 /** Server-side extras of an update (not part of the HTTP schema): the importer re-points the source of a row. */
 export type InternalUpdateTransactionInput = UpdateTransactionInput & { sourceRef?: string | null };
 
-/** Hooks of updateTransaction. `inTransaction` runs inside the same database transaction as the update. */
-export interface UpdateTransactionHooks {
+/** Hooks of updateTransaction, both run inside the same database transaction as the update. */
+export interface UpdateTransactionOptions {
+  /**
+   * Runs right after the row was locked and read again, before any balance is touched; throwing aborts the whole
+   * update with nothing written (callers record external refs here).
+   */
+  beforeWrite?: (tx: Prisma.TransactionClient) => Promise<void>;
+  /** Runs after the row was written, still inside the transaction. */
   inTransaction?: (tx: Prisma.TransactionClient) => Promise<void>;
 }
+/** Kept for the callers that name the hooks type. */
+export type UpdateTransactionHooks = UpdateTransactionOptions;
 
+/** The row changed between the read and the lock in a way this update does not depend on: read again and retry. */
+class StaleRowError extends Error {
+  constructor() {
+    super('The transaction changed meanwhile');
+  }
+}
+
+const MAX_UPDATE_ATTEMPTS = 3;
+
+/** Postgres deadlock detected: two transactions locked rows (or accounts) in opposite orders; one was rolled back. */
+function isDeadlock(error: unknown): boolean {
+  const e = (error ?? {}) as { code?: unknown; meta?: { code?: unknown }; message?: unknown };
+  return e.code === '40P01' || e.meta?.code === '40P01' || (typeof e.message === 'string' && e.message.includes('40P01'));
+}
+
+/**
+ * Update a transaction and adjust balances. The row is locked (SELECT ... FOR UPDATE) inside the database transaction
+ * and read again: when it still is what this call read, the update goes on; when someone changed it, the update
+ * answers 409 only if what changed is what this call intends to change or depends on to move money (the account, the
+ * amount or the type when the request sets them); any other concurrent change (a description, a note, a paid flag
+ * already set) just makes the call read the row again and apply its update on top, so independent PATCHes all apply.
+ * A deadlock between two moves that cross (A to B and B to A) rolls one back: it is retried like a stale read.
+ */
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
   input: InternalUpdateTransactionInput,
-  hooks?: UpdateTransactionHooks
+  options: UpdateTransactionOptions = {}
+) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await updateTransactionOnce(transactionId, householdId, input, options);
+    } catch (error) {
+      if (!(error instanceof StaleRowError) && !isDeadlock(error)) throw error;
+      if (attempt >= MAX_UPDATE_ATTEMPTS) {
+        throw new ConflictError('A transação está sendo alterada por outra pessoa; tente de novo.');
+      }
+    }
+  }
+}
+
+async function updateTransactionOnce(
+  transactionId: string,
+  householdId: string,
+  input: InternalUpdateTransactionInput,
+  options: UpdateTransactionOptions
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
@@ -806,6 +855,32 @@ export async function updateTransaction(
 
   // Update transaction and adjust balances
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Lock the row and read it again: what the balance math below uses must be what is stored now.
+    await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
+    const fresh = await tx.transaction.findFirst({ where: { id: transactionId, householdId } });
+    if (!fresh) throw new NotFoundError('Transaction');
+    const unchanged =
+      fresh.accountId === existingTransaction.accountId &&
+      fresh.type === existingTransaction.type &&
+      fresh.paid === existingTransaction.paid &&
+      fresh.categoryName === existingTransaction.categoryName &&
+      fresh.amount.equals(existingTransaction.amount);
+    if (!unchanged) {
+      const intentChanged =
+        (input.accountId !== undefined && fresh.accountId !== existingTransaction.accountId) ||
+        (input.amount !== undefined && !fresh.amount.equals(existingTransaction.amount)) ||
+        (input.type !== undefined && fresh.type !== existingTransaction.type);
+      if (intentChanged) {
+        throw new ConflictError('A transação foi alterada por outra pessoa; recarregue e tente de novo.');
+      }
+      throw new StaleRowError();
+    }
+    // Two moves that cross (A to B and B to A) would lock the two accounts in opposite orders: always take them by id.
+    if (accountChanged && oldAccountId && newAccountId) {
+      await tx.$queryRaw`SELECT id FROM accounts WHERE id IN (${Prisma.join([oldAccountId, newAccountId].sort())}) ORDER BY id FOR UPDATE`;
+    }
+    await options.beforeWrite?.(tx);
+
     // Case 1: Type changed (INCOME <-> EXPENSE) - need to reverse old balance and apply new balance
     // This handles type change alone or with other changes
     if (typeChanged && oldAccountId && oldAccountType && oldCategoryName) {
@@ -892,11 +967,15 @@ export async function updateTransaction(
       },
     });
 
-    if (hooks?.inTransaction) await hooks.inTransaction(tx);
+    if (options.inTransaction) await options.inTransaction(tx);
 
     // Recalculate credit card limit if transaction is on a credit card
     if (transaction.account?.type === AccountType.CREDIT) {
       await recalculateCreditCardLimit(tx, transaction.account.id);
+    }
+    // A row that left a credit card frees its limit there too.
+    if (accountChanged && oldAccountId && oldAccountType === AccountType.CREDIT) {
+      await recalculateCreditCardLimit(tx, oldAccountId);
     }
 
     return transaction;
@@ -1035,7 +1114,15 @@ export async function updateTransaction(
 /**
  * Delete transaction and revert account balance
  */
-export async function deleteTransaction(transactionId: string, householdId: string) {
+export interface DeleteTransactionOptions {
+  /**
+   * Runs first inside the database transaction of a plain income/expense delete; throwing aborts the delete with
+   * nothing written (used by callers that must recheck something under the same transaction, e.g. shares).
+   */
+  guard?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
+export async function deleteTransaction(transactionId: string, householdId: string, options: DeleteTransactionOptions = {}) {
   const transaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
     include: {
@@ -1137,6 +1224,7 @@ export async function deleteTransaction(transactionId: string, householdId: stri
         transaction.account.type
       );
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await options.guard?.(tx);
         if (transaction.accountId) {
           await updateBalanceForNormalTransaction(tx, transaction.accountId, reverseChange);
           if (transaction.account && transaction.account.type === AccountType.CREDIT) {
@@ -1148,6 +1236,7 @@ export async function deleteTransaction(transactionId: string, householdId: stri
     } else {
       // Just delete if no account or category
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await options.guard?.(tx);
         // Delete TransactionSplit records if they exist
         if (isSplit) {
           await tx.transactionSplit.deleteMany({
@@ -1160,6 +1249,7 @@ export async function deleteTransaction(transactionId: string, householdId: stri
   } else {
     // Just delete if it wasn't paid (no balance to revert)
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await options.guard?.(tx);
       // Delete TransactionSplit records if they exist
       if (isSplit) {
         await tx.transactionSplit.deleteMany({

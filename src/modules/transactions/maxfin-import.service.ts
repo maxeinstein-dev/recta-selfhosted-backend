@@ -316,6 +316,46 @@ export function validateConfirmRows(rows: MaxFinConfirmRow[], month: MaxFinMonth
   });
 }
 
+/**
+ * Sheet rows the card OFX import merged into another transaction (it records each deleted row's sourceRef in
+ * transaction_external_refs): `absorbed` maps that ref to the transaction that absorbed it, `targets` holds the
+ * transactions that absorbed rows. A sheet row is already represented there, so a new import must not bring it back,
+ * and the target (whose amount no longer equals its sheet row) is neither "changed" nor replaceable.
+ */
+async function loadMergeLinks(
+  householdId: string,
+  refs: string[],
+  existingIds: string[],
+): Promise<{ absorbed: Map<string, string>; targets: Set<string> }> {
+  const absorbed = new Map<string, string>();
+  const targets = new Set<string>();
+  if (refs.length === 0) return { absorbed, targets };
+  const rows = await prisma.transactionExternalRef.findMany({
+    where: {
+      householdId,
+      OR: [
+        { ref: { in: [...refs, ...refs.map((ref) => `deleted:${ref}`)] } },
+        { transactionId: { in: existingIds }, ref: { startsWith: 'maxfin:' } },
+        { transactionId: { in: existingIds }, ref: { startsWith: 'ofx:' } },
+      ],
+    },
+    select: { ref: true, transactionId: true },
+  });
+  for (const r of rows) {
+    if (r.ref.startsWith('deleted:maxfin:')) {
+      // Tombstone of a sheet row the card review deleted: already handled, nothing absorbed it.
+      absorbed.set(r.ref.slice('deleted:'.length), r.transactionId);
+    } else if (r.ref.startsWith('maxfin:')) {
+      targets.add(r.transactionId);
+      absorbed.set(r.ref, r.transactionId);
+    } else if (r.ref.startsWith('ofx:')) {
+      // Reconciled with the card statement (its amount may now be the bank's): neither "changed" nor replaceable.
+      targets.add(r.transactionId);
+    }
+  }
+  return { absorbed, targets };
+}
+
 // ---------------------------------------------------------------------------
 // Stored installment plans
 // ---------------------------------------------------------------------------
@@ -335,24 +375,57 @@ async function loadPlanRows(householdId: string, creditAccountId: string, planId
   });
 }
 
-function indexPlanRows(planRows: PlanRow[]): {
+/** Ids (of `ids`) that a card statement import already reconciled: they carry an `ofx:` external ref. */
+async function loadOfxLinkedIds(householdId: string, ids: string[]): Promise<Set<string>> {
+  if (ids.length === 0) return new Set();
+  const rows = await prisma.transactionExternalRef.findMany({
+    where: { householdId, transactionId: { in: ids }, ref: { startsWith: 'ofx:' } },
+    select: { transactionId: true },
+  });
+  return new Set(rows.map((r) => r.transactionId));
+}
+
+function indexPlanRows(
+  planRows: PlanRow[],
+  consumedIds: ReadonlySet<string> = new Set(),
+): {
   numbersByPlan: Map<string, Set<number>>;
   placeholdersByPlan: Map<string, Map<number, FuturePlaceholder>>;
+  /** Generated futures a card statement already consumed (real installments now): never placeholders. */
+  consumedByPlan: Map<string, Map<number, string>>;
 } {
   const numbersByPlan = new Map<string, Set<number>>();
   const placeholdersByPlan = new Map<string, Map<number, FuturePlaceholder>>();
+  const consumedByPlan = new Map<string, Map<number, string>>();
   for (const t of planRows) {
     if (!t.installmentId || t.installmentNumber == null) continue;
     const numbers = numbersByPlan.get(t.installmentId) ?? new Set<number>();
     numbers.add(t.installmentNumber);
     numbersByPlan.set(t.installmentId, numbers);
     if (isFutureDraftRef(t.sourceRef)) {
+      if (consumedIds.has(t.id)) {
+        const consumed = consumedByPlan.get(t.installmentId) ?? new Map<number, string>();
+        consumed.set(t.installmentNumber, t.id);
+        consumedByPlan.set(t.installmentId, consumed);
+        continue;
+      }
       const placeholders = placeholdersByPlan.get(t.installmentId) ?? new Map<number, FuturePlaceholder>();
       placeholders.set(t.installmentNumber, { id: t.id, installmentNumber: t.installmentNumber });
       placeholdersByPlan.set(t.installmentId, placeholders);
     }
   }
-  return { numbersByPlan, placeholdersByPlan };
+  return { numbersByPlan, placeholdersByPlan, consumedByPlan };
+}
+
+/** The consumed future (if any) a sheet installment row stands for: the row is then already imported. */
+function consumedCovering(installment: MaxFinInstallment, consumedByPlan: Map<string, Map<number, string>>): string | null {
+  const own = consumedByPlan.get(installment.installmentId);
+  if (!own) return null;
+  for (const n of coveredInstallmentNumbers(installment)) {
+    const id = own.get(n);
+    if (id) return id;
+  }
+  return null;
 }
 
 function placeholdersCovering(
@@ -443,6 +516,29 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
       .map((t) => [t.sourceRef as string, { id: t.id, amount: t.amount.toNumber(), paid: t.paid, type: String(t.type) }]),
   );
 
+  // Rows the card OFX import merged into another transaction (and the row that absorbed them) count as already
+  // imported, whatever their amounts now are.
+  const links = await loadMergeLinks(householdId, refs, existingRows.map((t) => t.id));
+  const rowByRef = new Map(parsed.rows.map((r) => [r.sourceRef, r]));
+  let mergedCount = 0;
+  const protectedRows: string[] = [];
+  for (const [ref, transactionId] of links.absorbed) {
+    const row = rowByRef.get(ref);
+    if (row && !existingByRef.has(ref)) {
+      existingByRef.set(ref, { id: transactionId, amount: row.amount, paid: row.paid, type: row.type });
+      mergedCount += 1;
+      protectedRows.push(row.description);
+    }
+  }
+  for (const [ref, existing] of existingByRef) {
+    const row = rowByRef.get(ref);
+    if (row && links.targets.has(existing.id) && (existing.amount !== row.amount || existing.type !== row.type || existing.paid !== row.paid)) {
+      existingByRef.set(ref, { id: existing.id, amount: row.amount, paid: row.paid, type: row.type });
+      mergedCount += 1;
+      protectedRows.push(row.description);
+    }
+  }
+
   // Installment plans already stored on the card (generated placeholders and real rows).
   const planIds = Array.from(
     new Set(
@@ -451,9 +547,12 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
         .map((r) => r.installment!.installmentId),
     ),
   );
-  const { numbersByPlan, placeholdersByPlan } = indexPlanRows(
-    await loadPlanRows(householdId, resolved.credit.id, planIds),
+  const planRows = await loadPlanRows(householdId, resolved.credit.id, planIds);
+  const consumedIds = await loadOfxLinkedIds(
+    householdId,
+    planRows.filter((t) => isFutureDraftRef(t.sourceRef)).map((t) => t.id),
   );
+  const { numbersByPlan, placeholdersByPlan, consumedByPlan } = indexPlanRows(planRows, consumedIds);
 
   // Legacy duplicates: same account/day/amount/description without a sourceRef.
   const accountIds = Array.from(new Set(MAXFIN_SECTION_KEYS.map((k) => resolved[k].id)));
@@ -485,7 +584,13 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     const accountId = resolved[r.section].id;
     const paid = options.closedMonth ? true : r.paid;
     const planInstallment = r.section === 'credit' ? r.installment : null;
-    const existing = existingByRef.get(r.sourceRef);
+    // A generated future a card statement already consumed IS this installment now: the row is already imported.
+    const consumedId = !existingByRef.has(r.sourceRef) && planInstallment ? consumedCovering(planInstallment, consumedByPlan) : null;
+    if (consumedId) {
+      mergedCount += 1;
+      protectedRows.push(r.description);
+    }
+    const existing = consumedId ? { id: consumedId, amount: r.amount, paid, type: r.type } : existingByRef.get(r.sourceRef);
     const placeholders = planInstallment ? placeholdersCovering(planInstallment, placeholdersByPlan) : [];
     const legacyMatchId = legacyByKey.get(legacyKey(accountId, toLocalDateString(r.date), r.amount, r.description, r.type));
     // Only a row that would otherwise be new may take a recurrence's occurrence.
@@ -526,6 +631,13 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
       existingAmount: cls.status === 'matches-recurring' && recurringMatch ? recurringMatch.amount : null,
     };
   });
+
+  if (mergedCount > 0) {
+    const listed = protectedRows.slice(0, 8).join('; ') + (protectedRows.length > 8 ? '; …' : '');
+    warnings.push(
+      `${mergedCount} linha(s) da planilha já foram conciliadas com o OFX (inclusive parcelas futuras que o OFX tornou reais), mescladas em outro lançamento ou removidas por uma importação/revisão de OFX e são tratadas como já importadas, mesmo que o valor da planilha tenha mudado: ${listed}. Para trocar uma delas, apague-a à mão no Recta e reimporte a planilha.`,
+    );
+  }
 
   const sections: MaxFinSectionPreview[] = parsed.sections.map((s) => {
     const own = rows.filter((r) => r.section === s.key);
@@ -922,7 +1034,7 @@ async function findFuturePlaceholders(
   householdId: string,
   creditAccountId: string,
   installment: MaxFinInstallment,
-): Promise<FuturePlaceholder[]> {
+): Promise<{ placeholders: FuturePlaceholder[]; consumed: string[] }> {
   const found = await prisma.transaction.findMany({
     where: {
       householdId,
@@ -933,9 +1045,16 @@ async function findFuturePlaceholders(
     },
     select: { id: true, installmentNumber: true, sourceRef: true },
   });
-  return found
-    .filter((t) => isFutureDraftRef(t.sourceRef) && t.installmentNumber != null)
-    .map((t) => ({ id: t.id, installmentNumber: t.installmentNumber as number }));
+  const drafts = found.filter((t) => isFutureDraftRef(t.sourceRef) && t.installmentNumber != null);
+  // A generated future that a card statement import already consumed is a real installment now: never a placeholder.
+  const consumedIds = await loadOfxLinkedIds(
+    householdId,
+    drafts.map((t) => t.id),
+  );
+  return {
+    placeholders: drafts.filter((t) => !consumedIds.has(t.id)).map((t) => ({ id: t.id, installmentNumber: t.installmentNumber as number })),
+    consumed: drafts.filter((t) => consumedIds.has(t.id)).map((t) => t.id),
+  };
 }
 
 export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFinConfirmResponse> {
@@ -958,6 +1077,11 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
     select: { id: true, sourceRef: true, recurringTransactionId: true },
   });
   const existingByRef = new Map(existingRows.map((t) => [t.sourceRef as string, t.id]));
+  const links = await loadMergeLinks(
+    householdId,
+    rows.map((r) => r.sourceRef),
+    existingRows.map((t) => t.id),
+  );
   // A row the sheet already took over keeps its link to the recurrence when it is replaced.
   const recurrenceOfExisting = new Map(
     existingRows.filter((t) => t.recurringTransactionId).map((t) => [t.sourceRef as string, t.recurringTransactionId as string]),
@@ -983,11 +1107,30 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   const importedFutureRows: MaxFinConfirmRow[] = [];
 
   for (const row of rows) {
+    // Merged into another transaction by the card OFX import: never brought back, not even by "replace".
+    if (links.absorbed.has(row.sourceRef) && !existingByRef.has(row.sourceRef)) {
+      skipped += 1;
+      continue;
+    }
     const existingId = existingByRef.get(row.sourceRef);
-    const placeholders =
+    // The row that absorbed others: replacing it would delete it (cascading its refs) and duplicate the purchase.
+    if (existingId && links.targets.has(existingId) && row.replace) {
+      skipped += 1;
+      warnings.push(`"${row.description}" não foi substituída: ela já foi conciliada com o OFX ou absorveu outras linhas da planilha.`);
+      continue;
+    }
+    const futures =
       row.section === 'credit' && row.installment
         ? await findFuturePlaceholders(householdId, resolved.credit.id, row.installment)
-        : [];
+        : { placeholders: [] as FuturePlaceholder[], consumed: [] as string[] };
+    const placeholders = futures.placeholders;
+    // The installment was already consumed by a card statement import: this row is imported, even with "replace"
+    // (deleting the consumed row would cascade its OFX refs and duplicate the purchase).
+    if (!existingId && futures.consumed.length > 0) {
+      skipped += 1;
+      warnings.push(`"${row.description}" não foi importada: a parcela já foi conciliada com o OFX (parcela futura consumida).`);
+      continue;
+    }
 
     if (existingId && !row.replace) {
       skipped += 1;
