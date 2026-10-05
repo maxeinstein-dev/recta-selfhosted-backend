@@ -9,6 +9,7 @@
  */
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
+import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { BadRequestError, NotFoundError } from '../../shared/errors/app-error.js';
 import { AccountType, CategoryName, CategoryType, TransactionType, getCategoriesByType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
@@ -119,7 +120,8 @@ export async function resolveCardAccount(accountId: string, authorize?: Authoriz
     type: account.type as AccountType,
     householdId: account.householdId,
     dueDay: account.dueDay ?? null,
-    closingDay: account.closingDay ?? null,
+    // Explicit closing day, or due day - 7 when the card has none
+    closingDay: effectiveClosingDay(account),
   };
 }
 
@@ -737,7 +739,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
   }
   if (!account.closingDay) {
     warnings.push(
-      `O cartão "${account.name}" não tem dia de fechamento configurado: no Recta as faturas seguem o mês calendário, e a data real de uma compra pode levá-la para outra fatura.`,
+      `O cartão "${account.name}" não tem dia de fechamento nem de vencimento configurado: no Recta as faturas seguem o mês calendário, e a data real de uma compra pode levá-la para outra fatura.`,
     );
   }
 

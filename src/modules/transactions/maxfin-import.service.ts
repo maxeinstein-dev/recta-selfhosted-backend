@@ -1,5 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
+import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { BadRequestError } from '../../shared/errors/app-error.js';
 import {
   AccountType,
@@ -130,7 +131,7 @@ export async function resolveMaxFinAccounts(
       type: a.type as AccountType,
       householdId: a.householdId,
       dueDay: a.dueDay ?? null,
-      closingDay: a.closingDay ?? null,
+      closingDay: effectiveClosingDay(a),
     };
   };
   return {
@@ -663,7 +664,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     warnings.push(`A conta escolhida para o cartão ("${resolved.credit.name}") não é um cartão de crédito; o pagamento de fatura não será registrado.`);
   } else {
     if (!resolved.credit.closingDay) {
-      warnings.push(`O cartão "${resolved.credit.name}" não tem dia de fechamento configurado; as faturas seguem o mês calendário.`);
+      warnings.push(`O cartão "${resolved.credit.name}" não tem dia de fechamento nem de vencimento configurado; as faturas seguem o mês calendário.`);
     } else if (resolved.credit.closingDay === 1) {
       warnings.push(`O cartão "${resolved.credit.name}" fecha no dia 1: as linhas datadas no dia 01 entram na fatura do mês seguinte.`);
     }

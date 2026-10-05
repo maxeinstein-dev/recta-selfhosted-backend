@@ -507,6 +507,16 @@ describe('resolveMaxFinAccounts', () => {
     expect(authorize).toHaveBeenCalledWith('hh-1');
   });
 
+  it('derives the card closing day from the due day (due - 7) when the card has none', async () => {
+    const rows = allInOneHousehold();
+    rows[2] = accountRow('a-credit', 'hh-1', { type: 'CREDIT', dueDay: 9, closingDay: null });
+    db.accountFindMany.mockResolvedValue(rows);
+
+    const resolved = await resolveMaxFinAccounts(requested);
+
+    expect(resolved.credit).toMatchObject({ dueDay: 9, closingDay: 2 });
+  });
+
   it('accepts one account serving two sections and authorizes its household once', async () => {
     const authorize = vi.fn().mockResolvedValue(undefined);
     const billsAndDebit: MaxFinAccountsInput = { ...requested, bills: 'a-debit' };
@@ -2246,8 +2256,8 @@ describe('buildMaxFinPreview: warnings', () => {
     expect(preview.warnings.filter((warning) => warning.includes('conta de contas fixas'))).toEqual([]);
   });
 
-  it('warns when the card has no closing day', async () => {
-    const preview = await previewSample({ resolved: makeAccounts({ credit: { closingDay: null } }) });
+  it('warns when the card has neither closing day nor due day', async () => {
+    const preview = await previewSample({ resolved: makeAccounts({ credit: { closingDay: null, dueDay: null } }) });
 
     expect(preview.warnings).toContainEqual(expect.stringMatching(/Nubank Teste.*dia de fechamento/));
   });

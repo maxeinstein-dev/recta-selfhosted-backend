@@ -65,4 +65,29 @@ describe('calculateCreditCardInvoice window', () => {
     const before = db.transactionFindMany.mock.calls.map(([args]) => JSON.stringify(args.where)).filter((t) => t.includes('"lt"'));
     for (const text of before) expect(text).toContain('"lt":"2026-09-02T00:00:00.000Z"');
   });
+
+  it('uses the closing day derived from the due day (due 9 -> closing 2) when the card has none stored', async () => {
+    db.accountFindFirst.mockResolvedValue({ ...CARD, closingDay: null, dueDay: 9 });
+
+    await calculateCreditCardInvoice(CARD.id, '2026-10', CARD.householdId, { limit: 5 });
+
+    const inWindow = db.transactionFindMany.mock.calls.map(([args]) => JSON.stringify(args.where)).filter((t) => t.includes('"gte"'));
+    expect(inWindow.length).toBeGreaterThan(0);
+    for (const text of inWindow) {
+      expect(text).toContain('"gte":"2026-09-02T00:00:00.000Z"');
+      expect(text).toContain('"lte":"2026-10-01T00:00:00.000Z"');
+    }
+  });
+
+  it('keeps the calendar month when the card has neither closing nor due day', async () => {
+    db.accountFindFirst.mockResolvedValue({ ...CARD, closingDay: null, dueDay: null });
+
+    await calculateCreditCardInvoice(CARD.id, '2026-10', CARD.householdId, { limit: 5 });
+
+    const inWindow = db.transactionFindMany.mock.calls.map(([args]) => JSON.stringify(args.where)).filter((t) => t.includes('"gte"'));
+    for (const text of inWindow) {
+      expect(text).toContain('"gte":"2026-10-01T00:00:00.000Z"');
+      expect(text).toContain('"lte":"2026-10-31T00:00:00.000Z"');
+    }
+  });
 });
