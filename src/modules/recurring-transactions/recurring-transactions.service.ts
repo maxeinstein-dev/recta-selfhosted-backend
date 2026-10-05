@@ -4,6 +4,7 @@ import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
 import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
+import { dayString, monthBoundsUtc } from './recurring-dates.js';
 import type {
   CreateRecurringTransactionInput,
   UpdateRecurringTransactionInput,
@@ -73,6 +74,7 @@ export async function createRecurringTransaction(
     endDate,
     nextRunAt,
     isActive,
+    followLastAmount,
   } = input;
 
   // Verify account belongs to household
@@ -103,6 +105,7 @@ export async function createRecurringTransaction(
       endDate,
       nextRunAt,
       isActive,
+      followLastAmount,
     },
     include: {
       account: {
@@ -275,6 +278,7 @@ export async function updateRecurringTransaction(
       ...(input.endDate !== undefined && { endDate: input.endDate }),
       ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
       ...(input.isActive !== undefined && { isActive: input.isActive }),
+      ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
     },
     include: {
       account: {
@@ -395,6 +399,25 @@ export async function executeRecurringTransaction(
   const transactionDate = input.date || recurring.nextRunAt;
   const isPaid = input.paid ?? false; // Default: false (pendente)
 
+  // Idempotency guard: a monthly recurrence has at most one occurrence per month. When the month already holds a
+  // transaction of this recurrence (generated earlier, or taken over by an imported sheet row), nothing is created
+  // and the recurrence just moves on.
+  if (recurring.frequency === 'MONTHLY') {
+    const { start, end } = monthBoundsUtc(dayString(transactionDate));
+    const existing = await prisma.transaction.findFirst({
+      where: { householdId, recurringTransactionId: recurring.id, date: { gte: start, lt: end } },
+      include: { account: { select: { id: true, name: true, type: true } } },
+    });
+    if (existing) {
+      const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency);
+      await prisma.recurringTransaction.update({
+        where: { id: recurringId },
+        data: { lastRunDate: transactionDate, nextRunAt },
+      });
+      return { transaction: existing, nextRunAt, skipped: true as boolean };
+    }
+  }
+
   let isIncome: boolean;
   if (isCustomCategoryName(recurring.categoryName)) {
     const cat = await prisma.category.findFirst({
@@ -469,6 +492,7 @@ export async function executeRecurringTransaction(
     return {
       transaction,
       nextRunAt,
+      skipped: false as boolean,
     };
   });
 
