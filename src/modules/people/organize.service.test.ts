@@ -674,3 +674,153 @@ describe('organize: volume and odd data', () => {
     expect(result.settlements).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// The contract the assistant's client relies on
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('organize apply: how the client resolves people and adjusts amounts', () => {
+  it('resolves proposals of an unknown person to an entry of people[] by name or by alias, whatever the final name', async () => {
+    const a = expense({ notes: '*Dividir com Lúcia' });
+    const b = expense({ notes: '*Dividir com Lulu', date: '2026-10-02' });
+    const c = expense({ notes: 'Pagar a Lu', date: '2026-10-03' });
+    const p = await preview();
+    expect(p.proposals.map((x) => x.person.id)).toEqual([null, null, null]);
+
+    // The final name is none of the detected ones; all three detected names are its aliases (accent/case ignored)
+    const result = await apply({ people: [{ name: 'Amor', aliases: ['LUCIA', 'lulu', 'Lu'] }], proposalIds: p.proposals.map((x) => x.id) });
+
+    expect(result).toMatchObject({ peopleCreated: 1, sharesCreated: 3, skipped: 0 });
+    const [person] = rowsOf('person');
+    expect(rowsOf('person')).toHaveLength(1);
+    expect(rowsOf('transactionShare').map((s) => [s.transactionId, s.personId])).toEqual([
+      [a.id, person!.id],
+      [b.id, person!.id],
+      [c.id, person!.id],
+    ]);
+  });
+
+  it('resolves a proposal through the name itself when the final name equals the detected one', async () => {
+    expense({ notes: '*Dividir com Lúcia' });
+    const p = await preview();
+    const result = await apply({ people: [{ name: 'lucia' }], proposalIds: p.proposals.map((x) => x.id) });
+    expect(result).toMatchObject({ peopleCreated: 1, sharesCreated: 1 });
+  });
+
+  it('existingId merges the detected name into a registered person, for shares and settlements alike', async () => {
+    const amor = seedPerson({ householdId: HH, name: 'Amor' });
+    expense({ notes: '*Dividir com Lulu' });
+    income({ description: 'Lulu', amount: 33 });
+    const p = await preview();
+    expect(p.proposals[0]!.person.id).toBeNull();
+    expect(p.settlements[0]!.person.id).toBeNull();
+
+    const result = await apply({
+      people: [{ name: 'Lulu', existingId: amor.id }],
+      proposalIds: p.proposals.map((x) => x.id),
+      settlementIds: p.settlements.map((x) => x.id),
+    });
+
+    expect(result).toMatchObject({ peopleCreated: 0, sharesCreated: 1, settlementsCreated: 1, skipped: 0 });
+    expect(rowsOf('person')).toHaveLength(1);
+    expect(rowsOf('transactionShare')[0]!.personId).toBe(amor.id);
+    expect(rowsOf('settlement')[0]).toMatchObject({ personId: amor.id, amount: 33 });
+  });
+
+  it('settlement proposals of an unknown person resolve like share proposals: by name or alias of a people[] entry', async () => {
+    const tx = income({ description: 'Reembolso - Otto', amount: 25 });
+    const p = await preview();
+    expect(p.settlements[0]!.person).toEqual({ id: null, name: 'Otto' });
+
+    const result = await apply({ people: [{ name: 'Tio', aliases: ['otto'] }], settlementIds: p.settlements.map((x) => x.id) });
+
+    expect(result).toMatchObject({ peopleCreated: 1, settlementsCreated: 1 });
+    expect(rowsOf('settlement')[0]).toMatchObject({ transactionId: tx.id, personId: rowsOf('person')[0]!.id, direction: 'RECEIVED' });
+  });
+
+  it('accepts a manual line (by the final name in people[]) for a transaction whose proposal is unselected: the adjusted amount', async () => {
+    const tx = expense({ amount: 100, notes: '*Dividir com Lulu' });
+    const p = await preview();
+
+    const result = await apply({
+      people: [{ name: 'Amor', aliases: ['Lulu'] }],
+      proposalIds: [], // the client unselected it to adjust the amount
+      manual: [{ transactionId: tx.id, personName: 'Amor', direction: 'THEY_OWE_ME', amount: 35 }],
+    });
+
+    expect(p.proposals).toHaveLength(1);
+    expect(result).toMatchObject({ peopleCreated: 1, sharesCreated: 1, skipped: 0 });
+    expect(rowsOf('transactionShare').map((s) => [s.transactionId, s.amount, s.source])).toEqual([[tx.id, 35, 'manual']]);
+  });
+
+  it('also accepts it by personId, and by the detected name when the final name has it as an alias', async () => {
+    const amor = seedPerson({ householdId: HH, name: 'Amor', aliases: ['Lulu'] });
+    const a = expense({ notes: '*Dividir com Lulu' });
+    const b = expense({ notes: '*Dividir com Lulu', date: '2026-10-02' });
+    const result = await apply({
+      manual: [
+        { transactionId: a.id, personId: amor.id, direction: 'THEY_OWE_ME', amount: 10 },
+        { transactionId: b.id, personName: 'Lulu', direction: 'THEY_OWE_ME', amount: 20 },
+      ],
+    });
+    expect(result).toMatchObject({ sharesCreated: 2 });
+  });
+
+  it('rejects (400) a selected proposal together with a manual line for the same transaction, person and direction: no silent double', async () => {
+    const tx = expense({ amount: 100, notes: '*Dividir com Lulu' });
+    const p = await preview();
+
+    await expect(
+      apply({
+        people: [{ name: 'Amor', aliases: ['Lulu'] }],
+        proposalIds: p.proposals.map((x) => x.id),
+        manual: [{ transactionId: tx.id, personName: 'Amor', direction: 'THEY_OWE_ME', amount: 35 }],
+      }),
+    ).rejects.toEqual(error(400, /selected proposal/));
+
+    // nothing was written, not even the person
+    expect(rowsOf('person')).toHaveLength(0);
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+  });
+
+  it('the double is caught whichever way the manual line names the person (id, final name, detected alias)', async () => {
+    const amor = seedPerson({ householdId: HH, name: 'Amor', aliases: ['Lulu'] });
+    const tx = expense({ notes: '*Dividir com Lulu' });
+    const p = await preview();
+    for (const person of [{ personId: amor.id }, { personName: 'Amor' }, { personName: 'lulu' }]) {
+      await expect(
+        apply({ proposalIds: p.proposals.map((x) => x.id), manual: [{ transactionId: tx.id, direction: 'THEY_OWE_ME', amount: 5, ...person }] }),
+      ).rejects.toEqual(error(400, /selected proposal/));
+    }
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+  });
+
+  it('a manual line for another person or the other direction of a selected proposal is not a double', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const amor = seedPerson({ householdId: HH, name: 'Amor', aliases: ['Lulu'] });
+    const tx = expense({ amount: 100, notes: '*Dividir com Lulu' });
+    const p = await preview();
+
+    const result = await apply({
+      proposalIds: p.proposals.map((x) => x.id),
+      manual: [
+        { transactionId: tx.id, personId: bia.id, direction: 'THEY_OWE_ME', amount: 20 },
+        { transactionId: tx.id, personId: amor.id, direction: 'I_OWE_THEM', amount: 5 },
+      ],
+    });
+
+    expect(result).toMatchObject({ sharesCreated: 3, skipped: 0 });
+  });
+
+  it('a selected proposal that no longer exists does not block a manual line for it', async () => {
+    const tx = expense({ amount: 100, notes: '*Dividir com Lulu' });
+    const p = await preview();
+    rowsOf('transaction').find((t) => t.id === tx.id)!.notes = 'sem divisão'; // the proposal vanished
+    const result = await apply({
+      people: [{ name: 'Lulu' }],
+      proposalIds: p.proposals.map((x) => x.id),
+      manual: [{ transactionId: tx.id, personName: 'Lulu', direction: 'THEY_OWE_ME', amount: 35 }],
+    });
+    expect(result).toMatchObject({ sharesCreated: 1, skipped: 1 });
+  });
+});

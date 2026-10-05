@@ -344,6 +344,7 @@ async function applyManual(
   input: OrganizeApplyInput,
   index: Map<string, string>,
   warnings: string[],
+  selectedKeys: ReadonlySet<string>,
 ): Promise<{ created: number; skipped: number }> {
   const { householdId } = input;
   if (input.manual.length === 0) return { created: 0, skipped: 0 };
@@ -386,6 +387,10 @@ async function applyManual(
     if (amountCents < 1) throw new BadRequestError(`${where}: amount must be at least 0.01`);
 
     const key = `${line.transactionId}|${person.id}|${line.direction}`;
+    if (selectedKeys.has(key)) {
+      // A selected proposal and a manual line for the same share would be a silent double: the client must pick one.
+      throw new BadRequestError(`${where}: the selected proposal for this transaction, person and direction already covers it; unselect the proposal to adjust the amount by hand`);
+    }
     if (seen.has(key)) throw new BadRequestError(`${where}: the same person and direction appear twice for this transaction`);
     seen.add(key);
     if (existingKeys.has(key)) {
@@ -509,7 +514,8 @@ export async function applyOrganize(input: OrganizeApplyInput): Promise<Organize
       }
 
       // Lines the user resolved by hand
-      const manual = await applyManual(tx, input, index, warnings);
+      const selectedKeys = new Set(shareRows.map(({ proposal, personId }) => `${proposal.transactionId}|${personId}|${proposal.direction}`));
+      const manual = await applyManual(tx, input, index, warnings, selectedKeys);
       sharesCreated += manual.created;
       skipped += manual.skipped;
 
