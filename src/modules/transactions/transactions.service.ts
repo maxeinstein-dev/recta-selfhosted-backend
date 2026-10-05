@@ -54,7 +54,11 @@ function calculateBalanceChange(amount: number, isIncome: boolean, accountType: 
  * @param input Transaction input data
  * @param userId Optional user ID - if provided, allows using personal accounts in shared household
  */
-export async function createTransaction(input: CreateTransactionInput, userId?: string) {
+export async function createTransaction(
+  input: CreateTransactionInput,
+  userId?: string,
+  hooks?: { inTransaction?: (tx: Prisma.TransactionClient, created: { id: string }) => Promise<void> }
+) {
   // householdId must be provided (resolved in routes via ensurePersonalHousehold)
   if (!input.householdId) {
     throw new BadRequestError('householdId is required');
@@ -447,6 +451,9 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
         }
       }
     }
+
+    // Caller's writes that must commit (or roll back) together with the transaction
+    if (hooks?.inTransaction) await hooks.inTransaction(tx, transaction);
 
     return transaction;
   });

@@ -128,7 +128,8 @@ describe('applyDetectedRecurrences', () => {
     seedSeries('Streaming Alfa', [6, 7, 8, 9, 10], 21.9, {}, 3);
     const id = await candidateId('Streaming Alfa');
     const result = await applyDetectedRecurrences({ householdId: HH, items: [{ id, dayOfMonth: 31 }] }, NOW);
-    expect(rowsOf('recurringTransaction')[0]).toMatchObject({ nextRunAt: '2026-11-30' });
+    // Day 31 with a 30-day first month: the first run clamps, the start date keeps the true anchor day.
+    expect(rowsOf('recurringTransaction')[0]).toMatchObject({ nextRunAt: '2026-11-30', startDate: '2026-10-31' });
     expect(result.warnings.join(' ')).toMatch(/dia 31/);
   });
 

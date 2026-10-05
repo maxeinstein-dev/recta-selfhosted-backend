@@ -25,37 +25,8 @@ import '../shared/config/env.js';
 
 import { prisma } from '../shared/db/prisma.js';
 import { AccountType } from '../shared/enums/index.js';
-import { executeRecurringTransaction } from '../modules/recurring-transactions/recurring-transactions.service.js';
-
-/**
- * Calculate next run date based on frequency
- */
-function calculateNextRunDate(
-  currentDate: Date,
-  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY'
-): Date {
-  const next = new Date(currentDate);
-
-  switch (frequency) {
-    case 'DAILY':
-      next.setDate(next.getDate() + 1);
-      break;
-    case 'WEEKLY':
-      next.setDate(next.getDate() + 7);
-      break;
-    case 'BIWEEKLY':
-      next.setDate(next.getDate() + 14);
-      break;
-    case 'MONTHLY':
-      next.setMonth(next.getMonth() + 1);
-      break;
-    case 'YEARLY':
-      next.setFullYear(next.getFullYear() + 1);
-      break;
-  }
-
-  return next;
-}
+import { anchorDayOf } from '../modules/recurring-transactions/recurring-dates.js';
+import { calculateNextRunDate, executeRecurringTransaction } from '../modules/recurring-transactions/recurring-transactions.service.js';
 
 /**
  * Process all due recurring transactions
@@ -114,7 +85,7 @@ async function processDueRecurringTransactions() {
           skippedCount++;
           
           // Still update nextRunAt and lastRunDate to prevent reprocessing
-          const nextRunAt = calculateNextRunDate(today, recurring.frequency);
+          const nextRunAt = calculateNextRunDate(today, recurring.frequency, anchorDayOf(recurring.startDate));
           const shouldDeactivate = recurring.endDate && nextRunAt > new Date(recurring.endDate);
           
           await prisma.recurringTransaction.update({

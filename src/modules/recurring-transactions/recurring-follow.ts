@@ -20,7 +20,7 @@ export interface FollowedUpdate {
 }
 
 /** 'YYYY-MM-DD' of today + n days (local calendar). */
-function plusDays(now: Date, n: number): string {
+export function plusDays(now: Date, n: number): string {
   const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + n);
   return dayString(d);
 }
@@ -39,8 +39,9 @@ export async function followLastAmountInTx(
 ): Promise<{ id: string; amount: number } | null> {
   const recurringId = update.recurringTransactionId !== undefined ? update.recurringTransactionId : before.recurringTransactionId;
   if (!recurringId || update.amount === undefined) return null;
-  const newAmount = Math.round(Math.abs(update.amount) * 100) / 100;
-  if (!(newAmount > 0)) return null;
+  // A non-positive value is not the price of the next occurrence (a refund or a mistake): never follow it.
+  if (!(update.amount > 0)) return null;
+  const newAmount = Math.round(update.amount * 100) / 100;
 
   const recurrence = await tx.recurringTransaction.findFirst({
     where: { id: recurringId, householdId: before.householdId, isActive: true, followLastAmount: true },

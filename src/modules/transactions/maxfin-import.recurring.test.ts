@@ -173,7 +173,7 @@ beforeEach(() => {
 
 describe('classifyRow: matches-recurring', () => {
   const row = { amount: 10, paid: true, type: 'EXPENSE' as const, section: 'bills' as const };
-  const match = { kind: 'recurrence', transactionId: null, recurringId: 'r', day: '2026-10-05', followLastAmount: true, endDate: null } as const;
+  const match = { kind: 'recurrence', transactionId: null, recurringId: 'r', day: '2026-10-05', followLastAmount: true, endDate: null, anchorDay: 5, amount: 100 } as const;
 
   it('comes after the stored-row and legacy checks and before new', () => {
     expect(classifyRow(row, undefined, [], undefined, match)).toEqual({
@@ -247,18 +247,32 @@ describe('preview: the sheet takes over a recurrence', () => {
     expect(rowNamed(preview, 'Curso 2/6').status).toBe('new');
   });
 
-  it('works on the card account too', async () => {
-    const rec = seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Streaming', amount: 20, nextRunAt: '2026-10-03' });
-    generated(rec.id, { accountId: CREDIT, description: 'Streaming', amount: 20, paid: true });
-    // A card occurrence is generated already paid: the recurrence alone is not matched (a transaction exists), the paid one is not pending.
+  it('takes over a PAID generated occurrence (a card occurrence is generated paid) so the sheet never double-counts', async () => {
+    const rec = seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Streaming', amount: 20, nextRunAt: '2026-11-03' });
+    const tx = generated(rec.id, { accountId: CREDIT, description: 'Streaming', amount: 20, date: '2026-10-03', paid: true });
     const preview = await previewCsv({ credit: [['Streaming', 'Lazer', 21]] });
-    expect(rowNamed(preview, 'Streaming').status).toBe('new');
-    const rec2 = seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Revista', amount: 20, nextRunAt: '2026-10-03' });
-    expect(rec2.id).toBeDefined();
-    const second = await previewCsv({ credit: [['Revista', 'Lazer', 21]] });
-    expect(rowNamed(second, 'Revista')).toMatchObject({ status: 'matches-recurring', statusDetail: expect.stringContaining('adianta') });
-    // The row is counted in the invoice amount, like any imported card row.
-    expect(second.invoice).toMatchObject({ amount: 21 });
+    expect(rowNamed(preview, 'Streaming')).toMatchObject({
+      status: 'matches-recurring',
+      statusDetail: 'atualiza a transação gerada de 03/10',
+      existingTransactionId: tx.id,
+      existingAmount: 20,
+    });
+    expect(preview.invoice).toMatchObject({ amount: 21 });
+  });
+
+  it('takes over a bill the user already paid by hand, and also a recurrence that only has its next run', async () => {
+    const rec = energyRecurrence();
+    const tx = generated(rec.id, { paid: true });
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ status: 'matches-recurring', existingTransactionId: tx.id, existingAmount: 100 });
+    resetStore();
+    for (const id of [BILLS, DEBIT, CREDIT, INCOME]) seedAccount({ id, householdId: HH, balance: 0 });
+    energyRecurrence({ nextRunAt: '2026-10-05', amount: 90 });
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ status: 'matches-recurring', existingTransactionId: null, existingAmount: 90 });
+  });
+
+  it('existingAmount is null for every other status', async () => {
+    const preview = await previewCsv({ bills: [['Energia', 'Casa', 10]], debit: [['Padaria', 'Casa', 5]] });
+    expect(preview.rows.map((r) => [r.status, r.existingAmount])).toEqual([['new', null], ['new', null]]);
   });
 
   it('serves one row per match: the second sheet row with the same name is new', async () => {
@@ -269,13 +283,10 @@ describe('preview: the sheet takes over a recurrence', () => {
     expect(statuses).toEqual(['matches-recurring', 'new']);
   });
 
-  it('does not match what a recurrence cannot take over', async () => {
+  it('does not match a transaction an import already took (it has a sourceRef)', async () => {
     const rec = energyRecurrence({ nextRunAt: '2026-10-05' });
-    // Already paid occurrence in the month, or one taken by an import (sourceRef): not pending-generated.
-    const paid = generated(rec.id, { paid: true });
-    expect(rowNamed(await previewCsv(), 'Energia').status).toBe('new');
-    paid.paid = false;
-    paid.sourceRef = 'maxfin:2026-10:bills:99';
+    const taken = generated(rec.id, { paid: false });
+    taken.sourceRef = 'maxfin:2026-10:bills:99';
     expect(rowNamed(await previewCsv(), 'Energia').status).toBe('new');
   });
 
@@ -471,5 +482,61 @@ describe('confirm: the sheet takes over', () => {
     expect(result.skipped).toBe(true);
     expect(rowsOf('transaction')).toHaveLength(1);
     expect(fakePrisma.recurringTransaction.update).toHaveBeenCalled();
+  });
+});
+
+describe('confirm: taking over a paid occurrence', () => {
+  it('moves the balance only by the difference (paid -> paid) and keeps the link', async () => {
+    const rec = energyRecurrence();
+    const tx = generated(rec.id, { paid: true });
+    rowById('account', BILLS).balance = 900; // the paid occurrence of 100 was already debited
+    const result = await confirm(await previewCsv());
+    expect(result).toMatchObject({ imported: 0, assumedRecurring: 1, ids: [tx.id] });
+    expect(rowsOf('transaction')).toHaveLength(1);
+    expect(rowById('transaction', tx.id)).toMatchObject({ amount: 132.4, paid: true, sourceRef: 'maxfin:2026-10:bills:4', recurringTransactionId: rec.id });
+    expect(rowById('account', BILLS).balance).toBe(867.6);
+  });
+
+  it('never un-pays an occurrence the app already settled, even if the sheet row is open', async () => {
+    const rec = energyRecurrence();
+    const tx = generated(rec.id, { paid: true });
+    const preview = await previewCsv();
+    const request = confirmRequest(preview);
+    request.rows[0]!.paid = false;
+    await confirmMaxFinImport({ request, resolved: RESOLVED });
+    expect(rowById('transaction', tx.id).paid).toBe(true);
+  });
+
+  it('takes over a paid card occurrence', async () => {
+    const rec = seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Streaming', amount: 20, nextRunAt: '2026-11-03' });
+    const tx = generated(rec.id, { accountId: CREDIT, description: 'Streaming', amount: 20, date: '2026-10-03', paid: true });
+    const result = await confirm(await previewCsv({ credit: [['Streaming', 'Lazer', 21]] }));
+    expect(result).toMatchObject({ assumedRecurring: 1, imported: 0 });
+    expect(rowById('transaction', tx.id)).toMatchObject({ amount: 21, paid: true });
+    expect(rowsOf('transaction')).toHaveLength(1);
+  });
+});
+
+describe('confirm: atomic and anchored', () => {
+  it('creating the row and moving the recurrence commit together: a failing move leaves nothing behind', async () => {
+    const rec = energyRecurrence({ nextRunAt: '2026-10-05' });
+    fakePrisma.recurringTransaction.update.mockRejectedValueOnce(new Error('boom'));
+    await expect(confirm(await previewCsv())).rejects.toThrow('boom');
+    expect(rowsOf('transaction')).toEqual([]);
+    expect(rowById('account', BILLS).balance).toBe(1000);
+    expect(rowById('recurringTransaction', rec.id).nextRunAt).toBe('2026-10-05');
+    expect(fakePrisma.$queryRaw).toHaveBeenCalled();
+  });
+
+  it('returns to the anchor day after a short month', async () => {
+    // Anchored on the 31st, currently clamped to the 30th of a 30-day month.
+    const rec = energyRecurrence({ nextRunAt: '2026-10-30', startDate: '2026-07-31' });
+    await confirm(await previewCsv());
+    expect(rowById('recurringTransaction', rec.id).nextRunAt).toBe('2026-11-30');
+    resetStore();
+    for (const id of [BILLS, DEBIT, CREDIT, INCOME]) seedAccount({ id, householdId: HH, balance: 0 });
+    const jan = energyRecurrence({ nextRunAt: '2026-10-28', startDate: '2026-07-31' });
+    await confirm(await previewCsv());
+    expect(rowById('recurringTransaction', jan.id).nextRunAt).toBe('2026-11-30');
   });
 });

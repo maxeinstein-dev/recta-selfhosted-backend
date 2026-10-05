@@ -36,3 +36,19 @@ export function addMonthsClamped(day: string, n: number, anchorDay?: number): st
   const d = Math.min(anchorDay ?? Number(day.slice(8, 10)), daysInMonth(y, m));
   return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 }
+
+/** Day of month a recurrence is anchored to: the day of its startDate (a short month clamps, the next one returns to it). */
+export function anchorDayOf(startDate: Date): number {
+  return Number(dayString(startDate).slice(8, 10));
+}
+
+/**
+ * Start date to store for a recurrence whose first run is `firstRunDay`: the anchor day must be a real day of the
+ * startDate month, so when the first run month is shorter than the anchor (day 31 in November) the startDate goes to
+ * the latest earlier month that has the day.
+ */
+export function startDayFor(firstRunDay: string, anchor: number): string {
+  let back = 0;
+  while (daysInMonth(Number(addMonthsClamped(firstRunDay, -back, 1).slice(0, 4)), Number(addMonthsClamped(firstRunDay, -back, 1).slice(5, 7))) < anchor) back += 1;
+  return addMonthsClamped(firstRunDay, -back, anchor);
+}

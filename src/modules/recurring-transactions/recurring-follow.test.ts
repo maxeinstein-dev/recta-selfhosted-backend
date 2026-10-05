@@ -113,6 +113,14 @@ describe('followLastAmountInTx', () => {
     expect(await followLastAmountInTx(fakePrisma as never, before(far), { amount: 70 }, NOW)).toBeNull();
   });
 
+  it('never follows a non-positive amount (a refund or a mistake is not the next price)', async () => {
+    const { rec, occ } = setup();
+    const latest = occ('2026-10-05');
+    expect(await followLastAmountInTx(fakePrisma as never, before(latest), { amount: -50 }, NOW)).toBeNull();
+    expect(await followLastAmountInTx(fakePrisma as never, before(latest), { amount: 0 }, NOW)).toBeNull();
+    expect(rowById('recurringTransaction', rec.id).amount).toBe(100);
+  });
+
   it('judges by the date the occurrence will have after the edit', async () => {
     const { rec, occ } = setup();
     const a = occ('2026-09-05');

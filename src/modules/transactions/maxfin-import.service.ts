@@ -523,6 +523,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
       futureInstallments,
       shareHint: r.shareHint,
       ...cls,
+      existingAmount: cls.status === 'matches-recurring' && recurringMatch ? recurringMatch.amount : null,
     };
   });
 
@@ -1009,7 +1010,11 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
         );
         continue;
       }
-      const paid = options.closedMonth || row.section === 'credit' ? true : row.paid;
+      // An occurrence already paid stays paid whatever the sheet says: never un-pay a bill the app has settled.
+      const paid =
+        options.closedMonth || row.section === 'credit' || (recurringMatch.kind === 'generated' && recurringMatch.paid)
+          ? true
+          : row.paid;
       const date = parseLocalDateString(row.date);
       try {
         const takenId = await assumeRecurrence(recurringMatch, {
@@ -1215,6 +1220,9 @@ async function assumeRecurrence(match: RecurringMatch, ctx: AssumeContext): Prom
     return match.transactionId;
   }
 
+  // The occurrence and the recurrence's move commit together: a crash between them would let the cron
+  // (or a second confirm) produce the month's charge again.
+  const nextRunDay = addMonthsClamped(match.day, 1, Math.max(match.anchorDay, Number(match.day.slice(8, 10))));
   const created = await createTransaction(
     {
       householdId,
@@ -1231,17 +1239,20 @@ async function assumeRecurrence(match: RecurringMatch, ctx: AssumeContext): Prom
       recurringTransactionId: match.recurringId,
     },
     userId,
-  );
-  // Move the recurrence on to the month after the sheet month (its next run was inside it).
-  const nextRunDay = addMonthsClamped(match.day, 1);
-  await prisma.recurringTransaction.update({
-    where: { id: match.recurringId },
-    data: {
-      lastRunDate: date,
-      nextRunAt: localDate(nextRunDay),
-      ...(match.followLastAmount ? { amount: new Prisma.Decimal(Math.round(row.amount * 100) / 100) } : {}),
-      ...(match.endDate && nextRunDay > match.endDate ? { isActive: false } : {}),
+    {
+      inTransaction: async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${match.recurringId}`}))`;
+        await tx.recurringTransaction.update({
+          where: { id: match.recurringId },
+          data: {
+            lastRunDate: date,
+            nextRunAt: localDate(nextRunDay),
+            ...(match.followLastAmount ? { amount: new Prisma.Decimal(Math.round(row.amount * 100) / 100) } : {}),
+            ...(match.endDate && nextRunDay > match.endDate ? { isActive: false } : {}),
+          },
+        });
+      },
     },
-  });
+  );
   return created.id;
 }

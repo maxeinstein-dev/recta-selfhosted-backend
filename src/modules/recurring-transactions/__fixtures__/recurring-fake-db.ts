@@ -147,6 +147,23 @@ function table(name: string) {
       Object.assign(row, next);
       return project(row);
     }),
+    groupBy: vi.fn(async (args: { by: string[]; where?: Where; _max: Record<string, boolean> }) => {
+      const field = args.by[0]!;
+      const groups = new Map<unknown, Row[]>();
+      for (const r of rows().filter((row) => matches(row, args.where))) {
+        const list = groups.get(r[field]) ?? [];
+        list.push(r);
+        groups.set(r[field], list);
+      }
+      return [...groups.entries()].map(([key, list]) => {
+        const out: Record<string, unknown> = { [field]: key, _max: {} };
+        for (const f of Object.keys(args._max)) {
+          const top = list.map((r) => r[f] as string).sort().pop();
+          (out._max as Record<string, unknown>)[f] = top === undefined ? null : new Date(`${top}T00:00:00.000Z`);
+        }
+        return out;
+      });
+    }),
     updateMany: vi.fn(async (args: { where?: Where; data: Record<string, unknown> }) => {
       const found = rows().filter((r) => matches(r, args.where));
       for (const row of found) for (const [field, value] of Object.entries(args.data)) row[field] = toStored(field, value);
@@ -165,7 +182,7 @@ export const fakePrisma = {
   account: table('account'),
   category: table('category'),
   /** The advisory lock apply takes (no real locking; tests look at the calls). */
-  $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+  $queryRaw: vi.fn(async (strings: TemplateStringsArray, ..._values: unknown[]) => {
     if (!strings.join('?').includes('pg_advisory_xact_lock')) throw new Error(`Unexpected raw query: ${strings.join('?')}`);
     return [];
   }),
@@ -190,7 +207,7 @@ function move(account: Row | undefined, type: unknown, amount: number, sign: 1 |
 }
 
 export const fakeServices = {
-  createTransaction: vi.fn(async (input: Record<string, unknown>) => {
+  createTransaction: vi.fn(async (input: Record<string, unknown>, _userId?: string, hooks?: { inTransaction?: (tx: unknown, created: { id: string }) => Promise<void> }) => {
     const account = store.account!.find((a) => a.id === input.accountId);
     if (!account) throw Object.assign(new Error('Account not found'), { statusCode: 404 });
     const row = build('transaction', {
@@ -199,8 +216,18 @@ export const fakeServices = {
       paid: input.paid !== false, sourceRef: input.sourceRef ?? null, recurringTransactionId: input.recurringTransactionId ?? null,
     });
     if (collides('transaction', row, store.transaction!)) throw prismaError('P2002', 'Unique constraint failed');
+    const saved = snapshot();
     store.transaction!.push(row);
     if (row.paid) move(account, row.type, row.amount as number, 1);
+    if (hooks?.inTransaction) {
+      try {
+        await hooks.inTransaction(fakePrisma, { id: row.id });
+      } catch (error) {
+        for (const key of Object.keys(store)) delete store[key];
+        Object.assign(store, saved);
+        throw error;
+      }
+    }
     return { ...project(row), amount: row.amount };
   }),
   /** Same balance rules as the real updateTransaction for amount and paid changes; hooks run in the transaction. */

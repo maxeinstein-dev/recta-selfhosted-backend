@@ -12,7 +12,7 @@ import {
   type RecurringCandidate,
   type DetectSkipped,
 } from './detect.js';
-import { addMonthsClamped, daysInMonth, dayString, localDate } from './recurring-dates.js';
+import { addMonthsClamped, daysInMonth, dayString, localDate, startDayFor } from './recurring-dates.js';
 import type { DetectApplyInput, DetectRecurringInput } from './recurring-transactions.schema.js';
 
 /** The slice of the Prisma client the detection reads from (the client itself, or a transaction's). */
@@ -189,7 +189,8 @@ export async function applyDetectedRecurrences(
             amount: new Prisma.Decimal(amount),
             description,
             frequency: 'MONTHLY',
-            startDate: localDate(firstRun),
+            // The anchor day must be a real day of startDate (day 31 with a 30-day first month: an earlier month).
+            startDate: localDate(startDayFor(firstRun, dayOfMonth)),
             nextRunAt: localDate(firstRun),
             isActive: true,
             followLastAmount: item.followLastAmount ?? candidate.followLastAmount,
@@ -207,7 +208,7 @@ export async function applyDetectedRecurrences(
 
         if (dayOfMonth > 28) {
           result.warnings.push(
-            `"${description}": dia ${dayOfMonth}; nos meses mais curtos a execução cai no último dia e o ciclo pode se deslocar.`,
+            `"${description}": dia ${dayOfMonth}; nos meses mais curtos a execução cai no último dia do mês.`,
           );
         }
       }

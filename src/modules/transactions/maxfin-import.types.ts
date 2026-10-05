@@ -76,6 +76,11 @@ export interface MaxFinPreviewRow {
   status: MaxFinRowStatus;
   statusDetail: string | null;
   existingTransactionId: string | null;
+  /**
+   * Status matches-recurring: the amount the generated transaction (or, with only the recurrence, the recurrence)
+   * has now, to show "old -> new" against `amount`. Null for every other status.
+   */
+  existingAmount: number | null;
 }
 
 export type MaxFinCategoryTargetKind = 'system' | 'custom' | 'create' | 'default';
