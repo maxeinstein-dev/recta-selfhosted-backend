@@ -244,6 +244,45 @@ What confirm writes:
 
 To undo the migration that adds `transaction_external_refs` (nothing else depends on it; imports done meanwhile will no longer recognize their lines as reconciled): run `DROP TABLE transaction_external_refs;`, delete the folder `prisma/migrations/20261003200000_add_transaction_external_refs` and, if it was applied through Prisma, `npx prisma migrate resolve --rolled-back 20261003200000_add_transaction_external_refs`.
 
+## People and shared expenses
+
+Splitting an expense with someone who has no Recta account: you pay 100%, a person owes you their part, and later they pay you back (or you pay them). This is **not** the household split (`isSplit` / `TransactionSplit`), which needs the other person to be a user and debits their part from their own account: nothing here moves money between accounts except the settlements below.
+
+Everything is scoped to a household. Reading needs membership, writing needs EDITOR+, and the household is authorized before any error that depends on data (404, 409, a rejected split); only an id that does not exist at all, on a route keyed by an id alone, is a 404 before it can be authorized. Amounts are reais with two decimals, computed on integer cents. Responses are wrapped as `{ success, data }` (the ledger adds `pagination`). Routes keyed by an id alone (`/people/:id`, `/transactions/:transactionId/shares`, `/settlements/:id`) read the household from the record; an optional `?householdId=` query is authorized first and scopes the lookup, and a caller who is not in the record's household gets the same 404 as for an id that does not exist.
+
+| Endpoint | Notes |
+|---|---|
+| `GET /people?householdId&includeInactive` | People with their aliases. |
+| `POST /people` `{ householdId, name, aliases? }` | 201. Names and aliases are unique per household after normalization (lower case, no accents, single spaces), across people: a repeat is a **409**. At most 20 aliases of 100 characters. |
+| `PATCH /people/:id` `{ name?, aliases?, isActive? }` | `aliases` replaces the list. |
+| `DELETE /people/:id` | 204 for a person with no data; a person with shares or settlements is only deactivated and answered with 200 and the person. |
+| `GET /people/balances?householdId` | Per person: `owedToMe`, `iOwe`, `received`, `paid`, `balance = owedToMe - iOwe - received + paid` (positive: they owe you), `openShares`. Inactive people only while their balance is not zero. |
+| `GET /people/:id/ledger?householdId&limit&cursor&order` | Shares and settlements with `signed` and a running `balanceAfter`, computed over the whole history in chronological order (day, creation time, id) and then paged with a cursor. Newest first by default (`order=asc` flips the list, not the balances); `limit` 1..200, default 50. |
+| `GET /transactions/:transactionId/shares` | The shares and `myPart` (amount minus what people owe me). |
+| `PUT /transactions/:transactionId/shares` `{ direction, strategy, entries, myShares? }` | Replaces the shares **of that direction** (`THEY_OWE_ME` or `I_OWE_THEM`) in one database transaction; no entries removes them. Only income and expense transactions; the people must be active and of the household. |
+| `POST /transactions/:transactionId/shares/preview` | Same body, computes without saving: `{ shares: [{ personId, amount }], myPart }`. |
+| `GET /people/:id/settlements`, `POST /people/:id/settlements` | See below. |
+| `DELETE /settlements/:id` | 204. Never deletes the transaction. |
+| `POST /people/organize/preview`, `POST /people/organize/apply` | See below. |
+
+**Split strategies** are shortcuts to type a split; what is stored is always an amount per person. `exact`: each entry has its `amount`. `percent`: each entry has its `percent` of the transaction total (two decimals; what is left stays with me, and when the percents add up to 100 the cents lost to rounding go to the first person). `shares`: each entry has its `shares` (whole cotas), mine are `myShares` (default 1). `equal`: the people listed and I split evenly. Cents left by a division go to the first person listed, so the parts and my part always add up to the transaction amount. Every part is at least 0.01, nobody is listed twice, the parts of a direction never exceed the transaction amount, and at most 50 people.
+
+**Settlements** record money that changed hands: `RECEIVED` (they paid me) or `PAID` (I paid them), with an amount, a day and a note. Three ways: only the record; `transactionId`, linking an existing transaction (an income for `RECEIVED`, an expense for `PAID`) that no other settlement uses (409 otherwise); or `createTransaction: { accountId, description?, categoryName? }`, which creates the real transaction through the regular transaction service, so the account balance moves like for any transaction, and links it. If the settlement cannot be saved after the transaction was created, the transaction is removed again. Deleting a settlement keeps its transaction; deleting a transaction unlinks its settlement and removes its shares.
+
+### Organize splits
+
+For data that came from the monthly sheet importer, which keeps free-text notes on the transactions. `preview` reads the household's transactions (optionally `startDate`, `endDate`, `onlyImported` for the sheet importer's rows) and proposes; `apply` creates what the user picked. Nothing is written by `preview`.
+
+- **Standard notes** (the importer's own vocabulary, read through `parseShareHint`) become share proposals, selected by default: `*Dividir com X` is half of the amount (an odd cent goes to X) owed to me, `*X` the whole amount owed to me, `Pagar a X` the whole amount I owe. The typo `*Divivir`, a stray `*` inside a name and the remarks the importer appends after ` · ` are handled; `*Dividir` with no name is not a person called "Dividir".
+- **Review lines**: a `*Reembolsar` with no person, a split note on an income, and free text that mentions a known person (by name or alias) or the words *dividido*, *dividir*, *divivir*, *reembolso* or *pagar*, each with a `reason` and, when exactly one known person is mentioned, a `suggestedPersonId`. The assistant never guesses amounts for them: the user resolves them as `manual` lines on apply.
+- **Settlement proposals**: an income whose description is a person's name or alias, or `Reembolso - Name`, proposed as a `RECEIVED` settlement linked to that income, selected by default. Names the notes introduce count as known, so an income called like a person who only exists in the notes is proposed too.
+- **People** are resolved through names and aliases (one person, several nicknames). Names that exist nowhere come back in `newPeople`; the user decides in `apply.people` which to create, which to merge (`{ name: 'A', aliases: ['B'] }` creates one person answering to both) and which to attach to an existing person (`existingId`). A proposal whose person was not chosen is skipped with a warning.
+- **Idempotent**: a share already stored for the same transaction, person and direction, a transaction already linked to a settlement, and a review line whose transaction already has shares are counted in `alreadyDone` and not proposed again. Proposal ids are deterministic (transaction, person as written, direction).
+- **Apply recomputes everything from the database** and never trusts what the client sends for proposals: only ids are read, and an id that no longer exists (already done, note edited, transaction deleted) counts as `skipped`. `manual` lines are validated like `PUT` shares (transaction of the household, income or expense, active person, amount at most the transaction amount and the parts of a direction at most its amount, no repeated person). People, shares and settlements are written in one database transaction (shares in chunks of 1,000 rows), so a failure leaves nothing behind. Applying the same selection twice creates nothing the second time.
+- Limits: 20,000 transactions read per run (a warning asks for a narrower period), 10,000 proposal ids and 2,000 manual lines per apply.
+
+To undo the migration `20261005120000_add_people_and_shares` (the shares, settlements and people are lost): `DROP TABLE settlements, transaction_shares, person_aliases, people; DROP TYPE "SettlementDirection", "ShareDirection";`, delete the folder and, if it was applied through Prisma, `npx prisma migrate resolve --rolled-back 20261005120000_add_people_and_shares`.
+
 ## Project structure
 
 ```
