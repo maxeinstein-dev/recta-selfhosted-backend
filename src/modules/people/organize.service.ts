@@ -2,8 +2,18 @@ import { prisma } from '../../shared/db/prisma.js';
 import { BadRequestError, ConflictError } from '../../shared/errors/app-error.js';
 import { parseLocalDateString, storedDateString } from '../transactions/maxfin-import.helpers.js';
 import type { ShareHint } from '../transactions/parsers/maxfin.types.js';
-import { capWarnings, chunks, cleanPersonName, decimalFromCents, labelKey, type Db } from './people.common.js';
-import { classifyNote, readFreeText, reimbursementName, type NoteClass } from './organize.notes.js';
+import {
+  MAX_PEOPLE_PER_HOUSEHOLD,
+  assertKeyUsable,
+  buildKeyRows,
+  capWarnings,
+  chunks,
+  cleanPersonName,
+  decimalFromCents,
+  labelKey,
+  type Db,
+} from './people.common.js';
+import { buildFreeTextMatcher, classifyNote, reimbursementName, type NoteClass } from './organize.notes.js';
 import type { OrganizeApplyInput, OrganizeOptions } from './organize.schema.js';
 import { findPersonOrThrow } from './people.service.js';
 import type {
@@ -200,12 +210,21 @@ export async function computeOrganize(db: Db, options: OrganizeOptions): Promise
       amount: fromCents(amountCents),
       amountCents,
       percent,
-      defaultSelected: true,
+      // Creating a person is a decision for the user; proposals for people already registered are safe to pre-select
+      defaultSelected: personId !== null,
     });
   }
 
   // Pass 2: everything that needs a human look goes to review.
-  const knownKeys = new Set<string>([...aliasIndex.keys(), ...newPeople.keys()]);
+  // Names an income introduces ("Reembolso - Ana") are known before any note is read, whatever the order of the rows.
+  for (const tx of transactions) {
+    if (tx.type !== 'INCOME' || linkedTransactions.has(tx.id)) continue;
+    const name = reimbursementName(tx.description);
+    const key = name === null ? '' : labelKey(name);
+    if (name !== null && key !== '' && !aliasIndex.has(key) && !newPeople.has(key)) newPeople.set(key, cleanPersonName(name));
+  }
+
+  const matcher = buildFreeTextMatcher([...aliasIndex.keys(), ...newPeople.keys()]);
   for (const tx of transactions) {
     const noteClass = classes.get(tx.id);
     if (!noteClass || noteClass.kind === 'none') continue;
@@ -217,8 +236,10 @@ export async function computeOrganize(db: Db, options: OrganizeOptions): Promise
       reason = 'Nota de divisão numa receita';
     } else if (noteClass.kind === 'reimbursable') {
       reason = 'Reembolsável, sem pessoa informada';
+    } else if (noteClass.reason) {
+      reason = noteClass.reason;
     } else {
-      const reading = readFreeText(noteClass.text, knownKeys);
+      const reading = matcher.read(noteClass.text);
       if (reading.mentionedKeys.length === 0 && reading.sharingWord === null) continue;
       const parts: string[] = [];
       const personIds = [...new Set(reading.mentionedKeys.flatMap((k) => (aliasIndex.has(k) ? [aliasIndex.get(k)!] : [])))];
@@ -236,22 +257,21 @@ export async function computeOrganize(db: Db, options: OrganizeOptions): Promise
     reviewLine(tx, reason, suggested);
   }
 
-  // Pass 3: incomes named after a person are settlements.
+  // Pass 3: incomes named after a person are settlements. By now every name an income or a note introduces is in
+  // `newPeople`, so the result does not depend on the order of the rows.
   for (const tx of transactions) {
     if (tx.type !== 'INCOME') continue;
     const name = reimbursementName(tx.description) ?? tx.description.trim();
     const key = labelKey(name);
-    const personId = aliasIndex.get(key) ?? null;
-    const isReimbursement = reimbursementName(tx.description) !== null;
-    if (!personId && !isReimbursement && !newPeople.has(key)) continue;
     if (key === '') continue;
+    const personId = aliasIndex.get(key) ?? null;
+    if (!personId && !newPeople.has(key)) continue;
 
     if (linkedTransactions.has(tx.id)) {
       alreadyDone += 1;
       continue;
     }
     const cleaned = cleanPersonName(name);
-    if (!personId && !newPeople.has(key)) newPeople.set(key, cleaned);
     settlements.push({
       id: `${SETTLEMENT_ID_PREFIX}${tx.id}`,
       transactionId: tx.id,
@@ -261,7 +281,7 @@ export async function computeOrganize(db: Db, options: OrganizeOptions): Promise
       amountCents: tx.amountCents,
       person: { id: personId, name: personId ? (personById.get(personId)?.name ?? cleaned) : cleaned },
       direction: 'RECEIVED',
-      defaultSelected: true,
+      defaultSelected: personId !== null,
     });
   }
 
@@ -299,7 +319,7 @@ async function addAliases(
   const rows: Array<{ householdId: string; personId: string; label: string; key: string; isName: boolean }> = [];
   for (const raw of labels) {
     const label = raw.trim();
-    const key = labelKey(label);
+    const key = assertKeyUsable(label, false);
     if (key === '') continue;
     const owner = index.get(key);
     if (owner === personId) continue;
@@ -314,24 +334,30 @@ async function addAliases(
 async function applyPeople(tx: Db, input: OrganizeApplyInput, index: Map<string, string>): Promise<number> {
   const { householdId } = input;
   let created = 0;
+  let known: number | null = null;
   for (const entry of input.people) {
     const name = cleanPersonName(entry.name);
-    if (name === '') throw new BadRequestError('A person needs a name');
-    const labels = [name, ...(entry.aliases ?? []).map(cleanPersonName)];
+    // Validates the name (and every key's length) before anything is written for this entry
+    const rows = buildKeyRows(name, (entry.aliases ?? []).map(cleanPersonName));
+    const labels = rows.map((r) => r.label);
 
     if (entry.existingId) {
       await findPersonOrThrow(tx, householdId, entry.existingId);
       await addAliases(tx, householdId, entry.existingId, labels, index);
       continue;
     }
-    const existing = index.get(labelKey(name));
+    const existing = index.get(rows[0]!.key);
     if (existing) {
       await addAliases(tx, householdId, existing, labels, index);
       continue;
     }
-    const person = await tx.person.create({ data: { householdId, name } });
-    index.set(labelKey(name), person.id);
-    await tx.personAlias.createMany({ data: [{ householdId, personId: person.id, label: name, key: labelKey(name), isName: true }] });
+    known ??= await tx.person.count({ where: { householdId } });
+    if (known + created >= MAX_PEOPLE_PER_HOUSEHOLD) {
+      throw new BadRequestError(`A household can have at most ${MAX_PEOPLE_PER_HOUSEHOLD} people`);
+    }
+    const person = await tx.person.create({ data: { householdId, name: rows[0]!.label } });
+    index.set(rows[0]!.key, person.id);
+    await tx.personAlias.createMany({ data: [{ householdId, personId: person.id, label: rows[0]!.label, key: rows[0]!.key, isName: true }] });
     await addAliases(tx, householdId, person.id, labels.slice(1), index);
     created += 1;
   }

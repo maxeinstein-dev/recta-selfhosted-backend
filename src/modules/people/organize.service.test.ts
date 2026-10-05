@@ -42,12 +42,12 @@ function apply(over: Partial<OrganizeApplyInput> = {}) {
   return applyOrganize({ householdId: HH, people: [], proposalIds: [], settlementIds: [], manual: [], ...over });
 }
 
-/** Applies everything the preview selects by default, creating the new people as they came. */
+/** Applies every proposal the preview lists (new-person proposals come unselected: the user picks them), creating the new people as they came. */
 async function applyAll(p: OrganizePreview, over: Partial<OrganizeApplyInput> = {}) {
   return apply({
     people: p.newPeople.map((n) => ({ name: n.name, aliases: n.aliases })),
-    proposalIds: p.proposals.filter((x) => x.defaultSelected).map((x) => x.id),
-    settlementIds: p.settlements.filter((x) => x.defaultSelected).map((x) => x.id),
+    proposalIds: p.proposals.map((x) => x.id),
+    settlementIds: p.settlements.map((x) => x.id),
     ...over,
   });
 }
@@ -81,7 +81,7 @@ describe('organize preview: standard notes', () => {
         direction: 'THEY_OWE_ME',
         amount: 60.01,
         percent: 50,
-        defaultSelected: true,
+        defaultSelected: false, // a new person: the user decides
       },
     ]);
     expect(result.newPeople).toEqual([{ name: 'Bia', aliases: [] }]);
@@ -822,5 +822,180 @@ describe('organize apply: how the client resolves people and adjusts amounts', (
       manual: [{ transactionId: tx.id, personName: 'Lulu', direction: 'THEY_OWE_ME', amount: 35 }],
     });
     expect(result).toMatchObject({ sharesCreated: 1, skipped: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 2
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('organize: household scoping', () => {
+  it('a person (and alias) of another household is not a known person here: new person, nothing touched there', async () => {
+    const foreign = seedPerson({ householdId: OTHER, name: 'Bianca', aliases: ['bia'] });
+    const tx = expense({ notes: '*Dividir com Bia' });
+    const foreignTx = seedTransaction({ householdId: OTHER, type: 'EXPENSE', amount: 100, notes: '*Dividir com Bia' });
+
+    const p = await preview();
+
+    expect(p.proposals).toHaveLength(1);
+    expect(p.proposals[0]!.person).toEqual({ id: null, name: 'Bia' });
+    expect(p.proposals[0]!.defaultSelected).toBe(false);
+    expect(p.newPeople).toEqual([{ name: 'Bia', aliases: [] }]);
+
+    const before = JSON.stringify([rowsOf('person').filter((x) => x.householdId === OTHER), rowsOf('personAlias').filter((x) => x.householdId === OTHER)]);
+    const result = await apply({ people: [{ name: 'Bia' }], proposalIds: p.proposals.map((x) => x.id) });
+
+    expect(result).toMatchObject({ peopleCreated: 1, sharesCreated: 1 });
+    const mine = rowsOf('person').find((x) => x.householdId === HH)!;
+    expect(mine.name).toBe('Bia');
+    expect(rowsOf('transactionShare')).toEqual([expect.objectContaining({ householdId: HH, transactionId: tx.id, personId: mine.id })]);
+    expect(rowsOf('transactionShare').some((x) => x.personId === foreign.id || x.transactionId === foreignTx.id)).toBe(false);
+    expect(JSON.stringify([rowsOf('person').filter((x) => x.householdId === OTHER), rowsOf('personAlias').filter((x) => x.householdId === OTHER)])).toBe(before);
+  });
+
+  it('shares stamped with another household do not make a transaction look done or full', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const stranger = seedPerson({ householdId: OTHER, name: 'Estranha' });
+    const tx = expense({ amount: 100, notes: '*Dividir com Bia' });
+    seedShare({ householdId: OTHER, transactionId: tx.id, personId: bia.id, amount: 50 }); // same key, other household
+    seedShare({ householdId: OTHER, transactionId: tx.id, personId: stranger.id, amount: 90 }); // would exceed the amount
+
+    const p = await preview();
+
+    expect(p.alreadyDone).toBe(0);
+    expect(p.warnings).toEqual([]);
+    expect(p.proposals.map((x) => [x.transactionId, x.person.id, x.amount])).toEqual([[tx.id, bia.id, 50]]);
+  });
+
+  it('manual lines resolve a person name only among the people of this household', async () => {
+    seedPerson({ householdId: OTHER, name: 'Estranha', aliases: ['estr'] });
+    const tx = expense({ amount: 100 });
+    await expect(apply({ manual: [{ transactionId: tx.id, personName: 'estr', direction: 'THEY_OWE_ME', amount: 5 }] })).rejects.toEqual(error(400, /person not found/));
+  });
+});
+
+describe('organize: new people are a decision for the user', () => {
+  it('proposals for people already registered are selected, those that would create a person are not', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    expense({ notes: '*Dividir com Bia' });
+    expense({ notes: '*Dividir com Caio', date: '2026-10-02' });
+    income({ description: 'Bia', amount: 10 });
+    income({ description: 'Reembolso - Dora', amount: 20, date: '2026-10-03' });
+
+    const p = await preview();
+
+    expect(p.proposals.map((x) => [x.person.name, x.person.id === bia.id, x.defaultSelected])).toEqual([
+      ['Bia', true, true],
+      ['Caio', false, false],
+    ]);
+    expect(p.settlements.map((x) => [x.person.name, x.defaultSelected])).toEqual([
+      ['Bia', true],
+      ['Dora', false],
+    ]);
+  });
+
+  it('collective, compound and non-person phrases after the star go to review with a reason, never to a new person', async () => {
+    const cases = ['*Dividir com todo mundo', '*Dividir com a galera', '*Todos', '*Dividir com Ana e Bia', '*Dividir com Ana, Bia', '*Parcela 3/10', 'Pagar a conta de luz', '*Dividir com Maria da Silva Santos Lima'];
+    const txs = cases.map((notes, i) => expense({ notes, date: `2026-10-${String(i + 1).padStart(2, '0')}` }));
+
+    const p = await preview();
+
+    expect(p.proposals).toEqual([]);
+    expect(p.newPeople).toEqual([]);
+    expect(p.review.map((r) => r.transactionId)).toEqual(txs.map((t) => t.id));
+    expect(p.review.map((r) => r.reason)).toEqual([
+      expect.stringContaining('parece um grupo'),
+      expect.stringContaining('parece um grupo'),
+      expect.stringContaining('parece um grupo'),
+      expect.stringContaining('cita mais de uma pessoa'),
+      expect.stringContaining('cita mais de uma pessoa'),
+      expect.stringContaining('não parece o nome de uma pessoa'),
+      expect.stringContaining('não parece o nome de uma pessoa'),
+      expect.stringContaining('não parece o nome de uma pessoa'),
+    ]);
+    expect(p.review.every((r) => r.suggestedPersonId === null)).toBe(true);
+  });
+
+  it('a plain one- or two-word name is still a proposal', async () => {
+    expense({ notes: '*Dividir com Ana Paula' });
+    expense({ notes: 'Pagar a Caio', date: '2026-10-02' });
+    expect((await preview()).proposals.map((x) => x.person.name)).toEqual(['Ana Paula', 'Caio']);
+  });
+});
+
+describe('organize: order independence', () => {
+  it('an income named like a person a "Reembolso - X" introduces is a settlement whichever comes first', async () => {
+    const plainFirst = income({ description: 'Ana', amount: 10, date: '2026-10-01' });
+    const reimb = income({ description: 'Reembolso - Ana', amount: 20, date: '2026-10-02' });
+    const a = await preview();
+
+    resetStore();
+    const reimbFirst = income({ description: 'Reembolso - Ana', amount: 20, date: '2026-10-01' });
+    const plainAfter = income({ description: 'Ana', amount: 10, date: '2026-10-02' });
+    const b = await preview();
+
+    expect(a.settlements.map((x) => [x.transactionId, x.person.name, x.amount])).toEqual([[plainFirst.id, 'Ana', 10], [reimb.id, 'Ana', 20]]);
+    expect(b.settlements.map((x) => [x.transactionId, x.person.name, x.amount])).toEqual([[reimbFirst.id, 'Ana', 20], [plainAfter.id, 'Ana', 10]]);
+    expect(a.newPeople).toEqual([{ name: 'Ana', aliases: [] }]);
+    expect(b.newPeople).toEqual([{ name: 'Ana', aliases: [] }]);
+  });
+
+  it('a name introduced only by a linked income introduces nobody', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const linked = income({ description: 'Reembolso - Ana' });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 300, transactionId: linked.id });
+    income({ description: 'Ana', amount: 5 });
+    const p = await preview();
+    expect(p.settlements).toEqual([]);
+    expect(p.newPeople).toEqual([]);
+  });
+});
+
+describe('organize: keys and caps', () => {
+  it('apply rejects a person made only of combining marks, and keys that are too long, writing nothing', async () => {
+    expense({ notes: '*Dividir com Bia' });
+    const p = await preview();
+    const ids = p.proposals.map((x) => x.id);
+
+    await expect(apply({ people: [{ name: 'Bia' }, { name: '́' }], proposalIds: ids })).rejects.toEqual(error(400, /letter or digit/));
+    await expect(apply({ people: [{ name: 'Bia', aliases: ['각'.repeat(40)] }], proposalIds: ids })).rejects.toEqual(error(400, /too long once normalized/));
+    await expect(apply({ people: [{ name: '각'.repeat(40) }], proposalIds: ids })).rejects.toEqual(error(400, /too long once normalized/));
+    // a name merged into an existing person is checked too
+    const existing = seedPerson({ householdId: HH, name: 'Ana' });
+    await expect(apply({ people: [{ name: '́́', existingId: existing.id }] })).rejects.toEqual(error(400, /letter or digit/));
+
+    expect(rowsOf('person')).toHaveLength(1); // only the seeded Ana
+    expect(rowsOf('personAlias')).toHaveLength(1);
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+  });
+
+  it('apply skips an alias that normalizes to nothing, and stops at the household cap', async () => {
+    const ok = await apply({ people: [{ name: 'Bia', aliases: ['́', 'B'] }] });
+    expect(ok.peopleCreated).toBe(1);
+    expect(rowsOf('personAlias').map((x) => x.key)).toEqual(['bia', 'b']);
+
+    for (let i = 0; i < 499; i++) seedPerson({ householdId: HH, name: `Pessoa ${i}` });
+    await expect(apply({ people: [{ name: 'A mais' }] })).rejects.toEqual(error(400, /at most 500/));
+    // merging into someone who exists is not a new person
+    await expect(apply({ people: [{ name: 'bia', aliases: ['Bê'] }] })).resolves.toMatchObject({ peopleCreated: 0 });
+  });
+});
+
+describe('organize: free-text reading scales with the notes, not with notes x people', () => {
+  it('reads 2000 free notes against 200 people with 21 aliases each in well under a second', async () => {
+    for (let i = 0; i < 200; i++) {
+      seedPerson({ householdId: HH, name: `Pessoa${i}`, aliases: Array.from({ length: 20 }, (_, j) => `Apelido${i}x${j}`) });
+    }
+    for (let i = 0; i < 2000; i++) {
+      expense({ description: `Compra ${i}`, notes: `almoco com Pessoa${i % 200} e Apelido${(i * 7) % 200}x${i % 20} no sabado, dividido`, date: '2026-10-01' });
+    }
+
+    const started = performance.now();
+    const p = await preview();
+    const elapsed = performance.now() - started;
+
+    expect(p.review).toHaveLength(2000);
+    expect(p.review[0]!.reason).toMatch(/^Texto livre cita Pessoa0/);
+    expect(elapsed).toBeLessThan(1000);
   });
 });

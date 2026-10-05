@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { classifyNote, readFreeText, reimbursementName } from './organize.notes.js';
+import { buildFreeTextMatcher, classifyNote, readFreeText, reimbursementName } from './organize.notes.js';
 
 // Invented names only.
 
@@ -89,5 +89,56 @@ describe('reimbursementName', () => {
     expect(reimbursementName('Reembolso - ')).toBeNull();
     expect(reimbursementName('Lulu')).toBeNull();
     expect(reimbursementName('Pedido de reembolso - Ana')).toBeNull();
+  });
+});
+
+describe('classifyNote: what follows the star must look like one person', () => {
+  const reasonOf = (note: string) => {
+    const result = classifyNote(note);
+    return result.kind === 'free' ? result.reason : undefined;
+  };
+
+  it('sends collectives to review as free text, with the reason', () => {
+    for (const note of ['*Dividir com todo mundo', '*Dividir com todos', '*todas', '*Dividir com a galera', '*Dividir com a turma']) {
+      expect(classifyNote(note)).toMatchObject({ kind: 'free', reason: expect.stringContaining('parece um grupo') });
+    }
+  });
+
+  it('sends compound names to review', () => {
+    for (const note of ['*Dividir com Ana e Bia', '*Ana, Bia', '*Ana & Bia', '*Ana + Bia', '*Ana/Bia']) {
+      expect(reasonOf(note)).toMatch(/cita mais de uma pessoa/);
+    }
+  });
+
+  it('sends phrases that are not names to review: digits, bills and items, very long names', () => {
+    for (const note of ['*Parcela 3/10', '*Parcela 3 de 10', 'Pagar a conta de luz', 'Pagar a fatura do cartão', 'Pagar a Ana2', '*Dividir com Maria da Silva Santos Lima']) {
+      expect(reasonOf(note)).toMatch(/não parece o nome de uma pessoa/);
+    }
+  });
+
+  it('keeps ordinary names as hints, accents and two words included', () => {
+    for (const [note, person] of [['*Dividir com José', 'José'], ['*Ana Paula', 'Ana Paula'], ['Pagar a Maria da Silva', 'Maria da Silva'], ['*Eduardo', 'Eduardo']] as const) {
+      expect(classifyNote(note)).toMatchObject({ kind: 'hint', person });
+    }
+    // a name that merely contains the letter e is not a conjunction
+    expect(classifyNote('*Renata')).toMatchObject({ kind: 'hint', person: 'Renata' });
+  });
+});
+
+describe('buildFreeTextMatcher', () => {
+  it('reads many notes against the same keys, in order of appearance', () => {
+    const matcher = buildFreeTextMatcher(['ana', 'bia', 'ana maria']);
+    expect(matcher.read('Bia e Ana foram').mentionedKeys).toEqual(['bia', 'ana']);
+    expect(matcher.read('com Ana Maria hoje').mentionedKeys).toEqual(['ana', 'ana maria']);
+    expect(matcher.read('ninguem').mentionedKeys).toEqual([]);
+  });
+
+  it('matches names in any script, not only Latin letters', () => {
+    expect(buildFreeTextMatcher(['иван']).read('Обед с Иван в субботу').mentionedKeys).toEqual(['иван']);
+  });
+
+  it('ignores keys that normalize to no words and lists a key once however often it is mentioned', () => {
+    const matcher = buildFreeTextMatcher(['', '---', 'ana']);
+    expect(matcher.read('ana ana ana').mentionedKeys).toEqual(['ana']);
   });
 });
