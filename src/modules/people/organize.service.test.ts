@@ -999,3 +999,63 @@ describe('organize: free-text reading scales with the notes, not with notes x pe
     expect(elapsed).toBeLessThan(1000);
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Registered people are taken as written; suffix remarks
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('organize: registered people are not second-guessed by the heuristics', () => {
+  it('proposes a registered person whose name looks like a phrase or a pair, and still reviews the same text for a stranger', async () => {
+    const luz = seedPerson({ householdId: HH, name: 'Luz Marina' });
+    const pair = seedPerson({ householdId: HH, name: 'Ana e Bia' });
+    const a = expense({ notes: '*Dividir com Luz Marina' });
+    const b = expense({ notes: '*Dividir com Ana e Bia', date: '2026-10-02' });
+    const c = expense({ notes: '*Dividir com Ana e Carla', date: '2026-10-03' });
+    const d = expense({ notes: 'Pagar a conta de luz', date: '2026-10-04' });
+
+    const p = await preview();
+
+    expect(p.proposals.map((x) => [x.transactionId, x.person.id, x.defaultSelected])).toEqual([
+      [a.id, luz.id, true],
+      [b.id, pair.id, true],
+    ]);
+    // the unknown "Ana e Carla" and the bill are still reviewed
+    expect(p.review.map((r) => r.transactionId)).toEqual([c.id, d.id]);
+    expect(p.newPeople).toEqual([]);
+  });
+
+  it('a registered alias counts as well, and a name registered after the heuristic would have fired still applies', async () => {
+    const todos = seedPerson({ householdId: HH, name: 'Família', aliases: ['Todos'] });
+    expense({ notes: '*Todos' });
+    const p = await preview();
+    expect(p.proposals.map((x) => x.person.id)).toEqual([todos.id]);
+  });
+
+  it('takes the registered part before " - remark" or "(remark)", and keeps today\'s behaviour when nothing registered matches', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const andre = seedPerson({ householdId: HH, name: 'André' });
+    const a = expense({ notes: 'Pagar a Bia - mensalidade' });
+    const b = expense({ notes: '*Dividir com Andre (irmão)', date: '2026-10-02' });
+    const c = expense({ notes: '*Dividir com Caio - almoço', date: '2026-10-03' });
+
+    const p = await preview();
+
+    expect(p.proposals.map((x) => [x.transactionId, x.person.id, x.person.name, x.direction])).toEqual([
+      [a.id, bia.id, 'Bia', 'I_OWE_THEM'],
+      [b.id, andre.id, 'André', 'THEY_OWE_ME'],
+      [c.id, null, 'Caio - almoço', 'THEY_OWE_ME'],
+    ]);
+    expect(p.proposals[0]!.note).toBe('Pagar a Bia - mensalidade');
+    expect(p.proposals[2]!.defaultSelected).toBe(false);
+  });
+
+  it('a proposal ids by the registered name, so applying works', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const tx = expense({ amount: 80, notes: 'Pagar a Bia - mensalidade' });
+    const p = await preview();
+    const result = await apply({ proposalIds: p.proposals.map((x) => x.id) });
+    expect(result).toMatchObject({ sharesCreated: 1 });
+    expect(rowsOf('transactionShare')[0]).toMatchObject({ transactionId: tx.id, personId: bia.id, direction: 'I_OWE_THEM', amount: 80 });
+  });
+});
+

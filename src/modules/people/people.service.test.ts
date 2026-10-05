@@ -813,3 +813,71 @@ describe('ledger cursor', () => {
     }
   });
 });
+
+describe('race errors become 404/409, not 500', () => {
+  it('PUT shares answers 409 when the person is deleted after the lock (foreign key)', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    const real = fakePrisma.transactionShare.createMany.getMockImplementation()!;
+    fakePrisma.transactionShare.createMany.mockImplementationOnce(async (args) => {
+      rowsOf('person').splice(rowsOf('person').findIndex((x) => x.id === bia.id), 1); // deleted by somebody else
+      return real(args);
+    });
+
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] }),
+    ).rejects.toEqual(error(409, /changed meanwhile/));
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+  });
+
+  it('PUT shares answers 404 when the person is gone by the time the lock is taken', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    fakePrisma.$queryRaw.mockImplementationOnce(async () => {
+      rowsOf('person').splice(0, 1);
+      return [{ amount: { toString: () => '100' }, type: 'EXPENSE' }];
+    });
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] }),
+    ).rejects.toEqual(error(404));
+  });
+
+  it('deleting a person already deleted by somebody else is a 404, at the lock or at the write', async () => {
+    const a = seedPerson({ householdId: HH, name: 'Bia' });
+    fakePrisma.$queryRaw.mockImplementationOnce(async () => []);
+    await expect(deletePerson(HH, a.id)).rejects.toEqual(error(404));
+
+    const b = seedPerson({ householdId: HH, name: 'Caio' });
+    fakePrisma.person.delete.mockRejectedValueOnce(Object.assign(new Error('gone'), { code: 'P2025' }));
+    await expect(deletePerson(HH, b.id)).rejects.toEqual(error(404));
+  });
+
+  it('a settlement for a person deleted meanwhile is a 409 and removes the transaction it created', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    seedAccount({ id: 'acc-1', householdId: HH, balance: 100 });
+    const real = fakePrisma.settlement.create.getMockImplementation()!;
+    fakePrisma.settlement.create.mockImplementationOnce(async (args) => {
+      rowsOf('person').splice(0, 1);
+      return real(args);
+    });
+    await expect(
+      createSettlement(HH, bia.id, { householdId: HH, direction: 'RECEIVED', amount: 10, date: '2026-10-05', createTransaction: { accountId: 'acc-1' } }),
+    ).rejects.toEqual(error(409, /removed meanwhile/));
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(100);
+  });
+});
+
+describe('cleanPersonName', () => {
+  it('cuts by code points, never inside a surrogate pair', async () => {
+    const { cleanPersonName } = await import('./people.common.js');
+    const name = `a${'😀'.repeat(150)}`;
+    const cleaned = cleanPersonName(name);
+    expect(Array.from(cleaned)).toHaveLength(100);
+    expect(cleaned.endsWith('😀')).toBe(true);
+    expect(cleaned.includes('\uFFFD')).toBe(false);
+    // no lone surrogate survives
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cleaned)).toBe(false);
+    expect(cleanPersonName('**  Ana   Maria ')).toBe('Ana Maria');
+  });
+});

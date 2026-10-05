@@ -142,3 +142,31 @@ describe('buildFreeTextMatcher', () => {
     expect(matcher.read('ana ana ana').mentionedKeys).toEqual(['ana']);
   });
 });
+
+describe('classifyNote with registered people', () => {
+  const known = (...keys: string[]) => (key: string) => keys.includes(key);
+
+  it('takes a registered name as written, however it looks', () => {
+    expect(classifyNote('*Dividir com Luz Marina', known('luz marina'))).toMatchObject({ kind: 'hint', person: 'Luz Marina' });
+    expect(classifyNote('*Dividir com Ana e Bia', known('ana e bia'))).toMatchObject({ kind: 'hint', person: 'Ana e Bia' });
+    expect(classifyNote('*Todos', known('todos'))).toMatchObject({ kind: 'hint', person: 'Todos' });
+    // the same texts for strangers still go to review
+    expect(classifyNote('*Dividir com Ana e Bia', known('ana'))).toMatchObject({ kind: 'free', reason: expect.any(String) });
+    expect(classifyNote('*Dividir com Luz Marina')).toMatchObject({ kind: 'free', reason: expect.stringContaining('não parece') });
+  });
+
+  it('takes the registered part before a suffix remark', () => {
+    expect(classifyNote('Pagar a Bia - mensalidade', known('bia'))).toMatchObject({ kind: 'hint', person: 'Bia', segment: 'Pagar a Bia - mensalidade' });
+    expect(classifyNote('*Dividir com André (irmão)', known('andre'))).toMatchObject({ kind: 'hint', person: 'André' });
+    expect(classifyNote('*Dividir com André(irmão)', known('andre'))).toMatchObject({ kind: 'hint', person: 'André' });
+  });
+
+  it('keeps today\'s reading when the part before the remark is not registered', () => {
+    expect(classifyNote('*Dividir com Caio - almoço', known('bia'))).toMatchObject({ kind: 'hint', person: 'Caio - almoço' });
+    expect(classifyNote('*Dividir com Caio (irmão)', known())).toMatchObject({ kind: 'hint', person: 'Caio (irmão)' });
+  });
+
+  it('a registered person never turns a sharing word into a name', () => {
+    expect(classifyNote('*Dividir', known('dividir'))).toEqual({ kind: 'free', text: '*Dividir' });
+  });
+});

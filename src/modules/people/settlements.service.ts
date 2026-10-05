@@ -131,7 +131,7 @@ export async function createSettlement(
   }
 
   try {
-    const row = await conflictOnUnique(linkedMessage, () =>
+    const row = await conflictOnUnique(linkedMessage, 'The person was removed meanwhile; try again', () =>
       prisma.settlement.create({
         data: {
           householdId,

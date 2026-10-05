@@ -10,12 +10,25 @@ export function isUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002';
 }
 
-/** Runs a write, answering 409 when it loses a unique-key race instead of surfacing a 500. */
-export async function conflictOnUnique<T>(message: string, run: () => Promise<T>): Promise<T> {
+/** True for a foreign-key violation (P2003): the row a write points to was deleted meanwhile. */
+export function isForeignKeyViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2003';
+}
+
+/**
+ * Runs a write, answering 409 when it loses a race instead of surfacing a 500: `message` when a unique key is
+ * taken, `goneMessage` (default: the same) when a row it points to was deleted meanwhile (foreign key).
+ */
+export async function conflictOnUnique<T>(message: string, run: () => Promise<T>): Promise<T>;
+export async function conflictOnUnique<T>(message: string, goneMessage: string, run: () => Promise<T>): Promise<T>;
+export async function conflictOnUnique<T>(message: string, second: string | (() => Promise<T>), third?: () => Promise<T>): Promise<T> {
+  const goneMessage = typeof second === 'string' ? second : message;
+  const run = typeof second === 'string' ? third! : second;
   try {
     return await run();
   } catch (error) {
     if (isUniqueViolation(error)) throw new ConflictError(message);
+    if (isForeignKeyViolation(error)) throw new ConflictError(goneMessage);
     throw error;
   }
 }
@@ -35,7 +48,8 @@ export function labelKey(label: string): string {
  * spaces are not part of the name.
  */
 export function cleanPersonName(raw: string): string {
-  return raw.replace(/^[\s*]+/, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  // Cut by code points: a plain slice could split a surrogate pair (an emoji, a rare ideograph) in half
+  return Array.from(raw.replace(/^[\s*]+/, '').replace(/\s+/g, ' ').trim()).slice(0, 100).join('');
 }
 
 export interface KeyRow {

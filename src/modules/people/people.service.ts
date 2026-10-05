@@ -153,11 +153,22 @@ export type DeletePersonResult = { deleted: true } | { deleted: false; person: P
 
 /** Deletes a person with no history; one with shares or settlements is only deactivated (the data stays). */
 export async function deletePerson(householdId: string, personId: string): Promise<DeletePersonResult> {
+  try {
+    return await deletePersonLocked(householdId, personId);
+  } catch (error) {
+    // The person was deleted by somebody else between our lookup and our write
+    if ((error as { code?: unknown } | null)?.code === 'P2025') throw new NotFoundError('Person');
+    throw error;
+  }
+}
+
+async function deletePersonLocked(householdId: string, personId: string): Promise<DeletePersonResult> {
   return prisma.$transaction(async (tx) => {
     const person = await findPersonOrThrow(tx, householdId, personId);
     // Row lock: a share or settlement being inserted for this person holds a key-share lock until it commits, so
     // waiting for ours means the counts below see it (instead of the delete cascading it away)
-    await tx.$queryRaw`SELECT id FROM people WHERE id = ${personId}::uuid FOR UPDATE`;
+    const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM people WHERE id = ${personId}::uuid FOR UPDATE`;
+    if (locked.length === 0) throw new NotFoundError('Person');
     const [shares, settlements] = await Promise.all([
       tx.transactionShare.count({ where: { personId } }),
       tx.settlement.count({ where: { personId } }),

@@ -175,7 +175,7 @@ export async function computeOrganize(db: Db, options: OrganizeOptions): Promise
   const classes = new Map<string, NoteClass>();
   for (const tx of transactions) {
     if (tx.notes === null) continue;
-    const noteClass = classifyNote(tx.notes);
+    const noteClass = classifyNote(tx.notes, (key) => aliasIndex.has(key));
     classes.set(tx.id, noteClass);
     if (noteClass.kind !== 'hint' || tx.type !== 'EXPENSE') continue;
 

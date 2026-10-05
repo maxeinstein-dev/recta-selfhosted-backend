@@ -70,7 +70,16 @@ function fixTypos(segment: string): string {
   return segment.replace(/^(\*\s*)divivir\b/i, '$1Dividir');
 }
 
-export function classifyNote(note: string | null | undefined): NoteClass {
+/** Where a remark starts after the name: "Bia - mensalidade", "André (irmão)". */
+const SUFFIX_SPLIT = /\s+-\s+|\s*\(/;
+
+/**
+ * @param isKnown tells whether a normalized name/alias belongs to a registered person. A registered person is
+ *   taken as written (the heuristics below exist to keep strangers from becoming people, not to second-guess
+ *   people the user already registered, even "Luz Marina" or "Ana e Bia"), and so is the part before a
+ *   " - remark" or "(remark)" suffix when that part is registered.
+ */
+export function classifyNote(note: string | null | undefined, isKnown: (key: string) => boolean = () => false): NoteClass {
   const text = (note ?? '').trim();
   if (text === '') return { kind: 'none' };
 
@@ -79,12 +88,17 @@ export function classifyNote(note: string | null | undefined): NoteClass {
     const hint = parseShareHint(segment);
     if (!hint) continue;
     if (hint.kind === 'reimbursable') return { kind: 'reimbursable', segment: raw.trim() };
-    const person = cleanPersonName(hint.person);
+    let person = cleanPersonName(hint.person);
+    if (person !== '' && !isKnown(labelKey(person))) {
+      const head = cleanPersonName(person.split(SUFFIX_SPLIT)[0] ?? '');
+      if (head !== '' && head !== person && isKnown(labelKey(head))) person = head;
+    }
+    const registered = person !== '' && isKnown(labelKey(person));
     if (person === '' || NOT_A_NAME.test(labelKey(person))) {
       // "*Dividir" alone: it asks to split, but says with whom nowhere: a person has to be picked by hand.
       return { kind: 'free', text };
     }
-    const why = notAPerson(person);
+    const why = registered ? null : notAPerson(person);
     if (why) return { kind: 'free', text, reason: why };
     return { kind: 'hint', hint, person, segment: raw.trim() };
   }
