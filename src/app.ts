@@ -28,7 +28,7 @@ import { recurringTransactionRoutes } from './modules/recurring-transactions/ind
 import { feedbackRoutes } from './modules/feedback/index.js';
 import { notificationRoutes } from './modules/notifications/index.js';
 import { dashboardRoutes } from './modules/dashboard/index.js';
-import { peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
+import { organizeRoutes, peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
  * Build the Fastify application
@@ -312,6 +312,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cardOfxImportRoutes, { prefix: '/transactions' });
   await app.register(transactionSharesRoutes, { prefix: '/transactions' });
   await app.register(peopleRoutes, { prefix: '/people' });
+  await app.register(organizeRoutes, { prefix: '/people' });
   await app.register(settlementRoutes, { prefix: '/settlements' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
