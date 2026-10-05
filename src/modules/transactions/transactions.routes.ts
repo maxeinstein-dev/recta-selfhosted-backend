@@ -26,6 +26,7 @@ import {
 import { updateTransactionSplitSchema } from './transaction-splits.schema.js';
 import * as transactionsService from './transactions.service.js';
 import { assertUpdateKeepsShares } from '../people/shares.service.js';
+import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
 import * as transactionSplitsService from './transaction-splits.service.js';
 
 export async function transactionRoutes(app: FastifyInstance) {
@@ -497,15 +498,23 @@ export async function transactionRoutes(app: FastifyInstance) {
       // Shares of other people must keep fitting the transaction (route-level: internal flows are not blocked)
       await assertUpdateKeepsShares(existingTransaction.householdId, transactionId, existingTransaction, input);
 
+      // An occurrence of a recurrence that follows the last amount: when this is its most recent one, the
+      // recurrence takes the new amount in the same database transaction (and the response says so).
+      let recurringUpdated: { id: string; amount: number } | null = null;
       const transaction = await transactionsService.updateTransaction(
         transactionId,
         existingTransaction.householdId,
-        input
+        input,
+        {
+          inTransaction: async (tx) => {
+            recurringUpdated = await followLastAmountInTx(tx, existingTransaction, input);
+          },
+        }
       );
 
       return reply.send({
         success: true,
-        data: transaction,
+        data: recurringUpdated ? { ...transaction, recurringUpdated } : transaction,
       });
     }
   );

@@ -42,6 +42,12 @@ vi.mock('./transactions.service.js', () => ({
   payCreditCardInvoice: db.payCreditCardInvoice,
 }));
 vi.mock('../categories/categories.service.js', () => ({ createCategory: db.createCategory }));
+// Recurrence matching has its own tests (maxfin-import.recurring.test.ts); here no recurrence covers any month.
+vi.mock('./maxfin-recurring.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./maxfin-recurring.js')>()),
+  loadRecurringMatcher: async () => ({ take: () => undefined }),
+}));
+
 
 // ---------------------------------------------------------------------------
 // Fixtures

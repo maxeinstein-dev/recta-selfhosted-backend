@@ -4,6 +4,8 @@ import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
 import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
+import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
+import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
 import type {
   CreateRecurringTransactionInput,
   UpdateRecurringTransactionInput,
@@ -14,10 +16,16 @@ import type {
 /**
  * Calculate next run date based on frequency
  */
-function calculateNextRunDate(
+export function calculateNextRunDate(
   currentDate: Date,
-  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY'
+  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY',
+  /** Day of month the recurrence is anchored to (day of its startDate): a short month clamps, the next one returns to it. */
+  anchorDay?: number
 ): Date {
+  if (frequency === 'MONTHLY') {
+    const day = dayString(currentDate);
+    return localDate(addMonthsClamped(day, 1, Math.max(anchorDay ?? 0, Number(day.slice(8, 10)))));
+  }
   const next = new Date(currentDate);
 
   switch (frequency) {
@@ -30,15 +38,27 @@ function calculateNextRunDate(
     case 'BIWEEKLY':
       next.setDate(next.getDate() + 14);
       break;
-    case 'MONTHLY':
-      next.setMonth(next.getMonth() + 1);
-      break;
     case 'YEARLY':
       next.setFullYear(next.getFullYear() + 1);
       break;
   }
 
   return next;
+}
+
+/**
+ * Date a due occurrence is created with. A monthly recurrence runs on its scheduled day (nextRunAt) even when the cron
+ * is late, so a late run does not shift the day of every later month (Oct 5 executed on Oct 20 stays Oct 5, next Nov 5).
+ * Other frequencies keep dating the occurrence on the day it is processed.
+ */
+export function occurrenceDateFor(
+  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY',
+  nextRunAt: Date,
+  today: Date
+): Date {
+  if (frequency !== 'MONTHLY') return today;
+  const scheduled = localDate(dayString(nextRunAt));
+  return scheduled <= today ? scheduled : today;
 }
 
 /**
@@ -73,6 +93,7 @@ export async function createRecurringTransaction(
     endDate,
     nextRunAt,
     isActive,
+    followLastAmount,
   } = input;
 
   // Verify account belongs to household
@@ -103,6 +124,7 @@ export async function createRecurringTransaction(
       endDate,
       nextRunAt,
       isActive,
+      followLastAmount,
     },
     include: {
       account: {
@@ -173,6 +195,24 @@ export async function createRecurringTransaction(
 }
 
 /**
+ * Date (YYYY-MM-DD) of the most recent occurrence of each recurrence that still counts as "the current one" (not beyond
+ * today + 31 days, the rule of followLastAmountInTx). A client editing an occurrence knows only a page of transactions,
+ * so it compares the edited date with this: `date >= lastOccurrenceDate` means it is the latest one.
+ */
+async function lastOccurrenceDates(householdId: string, recurringIds: string[], now: Date = new Date()): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (recurringIds.length === 0) return map;
+  const limit = plusDays(now, FOLLOW_LOOKAHEAD_DAYS);
+  const rows = await prisma.transaction.groupBy({
+    by: ['recurringTransactionId'],
+    where: { householdId, recurringTransactionId: { in: recurringIds }, date: { lte: new Date(`${limit}T00:00:00.000Z`) } },
+    _max: { date: true },
+  });
+  for (const r of rows) if (r.recurringTransactionId && r._max.date) map.set(r.recurringTransactionId, dayString(r._max.date));
+  return map;
+}
+
+/**
  * Get recurring transaction by ID
  */
 export async function getRecurringTransaction(recurringId: string) {
@@ -217,10 +257,12 @@ export async function listRecurringTransactions(
     orderBy: [{ isActive: 'desc' }, { nextRunAt: 'asc' }],
   });
 
+  const last = await lastOccurrenceDates(householdId as string, recurring.map((r) => r.id));
   // Convert Prisma.Decimal to number for JSON serialization
   return recurring.map(r => ({
     ...r,
     amount: r.amount.toNumber(),
+    lastOccurrenceDate: last.get(r.id) ?? null,
   }));
 }
 
@@ -275,6 +317,7 @@ export async function updateRecurringTransaction(
       ...(input.endDate !== undefined && { endDate: input.endDate }),
       ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
       ...(input.isActive !== undefined && { isActive: input.isActive }),
+      ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
     },
     include: {
       account: {
@@ -395,6 +438,8 @@ export async function executeRecurringTransaction(
   const transactionDate = input.date || recurring.nextRunAt;
   const isPaid = input.paid ?? false; // Default: false (pendente)
 
+  const anchorDay = anchorDayOf(recurring.startDate);
+
   let isIncome: boolean;
   if (isCustomCategoryName(recurring.categoryName)) {
     const cat = await prisma.category.findFirst({
@@ -417,6 +462,27 @@ export async function executeRecurringTransaction(
 
   // Create the actual transaction and update next run date
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Idempotency guard: a monthly recurrence has at most one occurrence per month. When the month already holds a
+    // transaction of this recurrence (generated earlier, or taken over by an imported sheet row), nothing is created
+    // and the recurrence just moves on. The check runs under a per-recurrence lock, so two executions (cron, manual,
+    // sheet confirm) cannot both see an empty month.
+    if (recurring.frequency === 'MONTHLY') {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${recurring.id}`}))`;
+      const { start, end } = monthBoundsUtc(dayString(transactionDate));
+      const existing = await tx.transaction.findFirst({
+        where: { householdId, recurringTransactionId: recurring.id, date: { gte: start, lt: end } },
+        include: { account: { select: { id: true, name: true, type: true } } },
+      });
+      if (existing) {
+        const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency, anchorDay);
+        await tx.recurringTransaction.update({
+          where: { id: recurringId },
+          data: { lastRunDate: transactionDate, nextRunAt },
+        });
+        return { transaction: existing, nextRunAt, skipped: true as boolean };
+      }
+    }
+
     // Create transaction
     const transaction = await tx.transaction.create({
       data: {
@@ -455,7 +521,7 @@ export async function executeRecurringTransaction(
     }
 
     // Calculate and update next run date
-    const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency);
+    const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency, anchorDay);
 
     // Update lastRunDate and nextRunAt
     await tx.recurringTransaction.update({
@@ -469,6 +535,7 @@ export async function executeRecurringTransaction(
     return {
       transaction,
       nextRunAt,
+      skipped: false as boolean,
     };
   });
 
