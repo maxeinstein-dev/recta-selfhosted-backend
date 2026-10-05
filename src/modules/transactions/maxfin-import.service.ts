@@ -1,3 +1,4 @@
+import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { BadRequestError } from '../../shared/errors/app-error.js';
 import {
@@ -62,7 +63,15 @@ import type {
   MaxFinWorkbookPreviewResponse,
   MaxFinWorkbookSheet,
 } from './maxfin-import.types.js';
-import { createTransaction, deleteTransaction, payCreditCardInvoice } from './transactions.service.js';
+import { createTransaction, deleteTransaction, payCreditCardInvoice, updateTransaction } from './transactions.service.js';
+import { addMonthsClamped, localDate } from '../recurring-transactions/recurring-dates.js';
+import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
+import {
+  eligibleForRecurring,
+  loadRecurringMatcher,
+  recurringMatchDetail,
+  type RecurringMatch,
+} from './maxfin-recurring.js';
 
 // ---------------------------------------------------------------------------
 // Account resolution
@@ -175,7 +184,8 @@ function typeLabel(type: string, section: MaxFinSectionKey): string {
 /**
  * Classify a parsed row against what is already stored.
  * Order: same sourceRef (duplicate/changed) > generated future installments of the same plan
- * (replaces-future) > identical manual transaction without sourceRef (legacy-duplicate) > new.
+ * (replaces-future) > identical manual transaction without sourceRef (legacy-duplicate) > a recurrence that
+ * already covers the month (matches-recurring) > new.
  * A stored row is a duplicate only with the same type, amount and paid flag: amounts are absolute, so a sheet
  * value whose sign flipped (an expense turned refund) is a change of type.
  */
@@ -184,6 +194,7 @@ export function classifyRow(
   existing: ExistingBySourceRef | undefined,
   placeholders: FuturePlaceholder[],
   legacyMatchId: string | undefined,
+  recurringMatch?: RecurringMatch,
 ): { status: MaxFinRowStatus; statusDetail: string | null; existingTransactionId: string | null } {
   if (existing) {
     const sameType = existing.type === row.type;
@@ -211,6 +222,13 @@ export function classifyRow(
       status: 'legacy-duplicate',
       statusDetail: 'lançamento igual já existe (importado sem identificador de origem)',
       existingTransactionId: legacyMatchId,
+    };
+  }
+  if (recurringMatch) {
+    return {
+      status: 'matches-recurring',
+      statusDetail: recurringMatchDetail(recurringMatch),
+      existingTransactionId: recurringMatch.transactionId,
     };
   }
   return { status: 'new', statusDetail: null, existingTransactionId: null };
@@ -458,15 +476,29 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     }
   }
 
+  // Recurrences that already cover the month (the sheet takes them over); a match serves one row.
+  const recurringMatcher = key
+    ? await loadRecurringMatcher(householdId, accountIds, key)
+    : { take: (_accountId: string, _description: string): RecurringMatch | undefined => undefined };
+
   const rows: MaxFinPreviewRow[] = parsed.rows.map((r) => {
     const accountId = resolved[r.section].id;
     const paid = options.closedMonth ? true : r.paid;
     const planInstallment = r.section === 'credit' ? r.installment : null;
+    const existing = existingByRef.get(r.sourceRef);
+    const placeholders = planInstallment ? placeholdersCovering(planInstallment, placeholdersByPlan) : [];
+    const legacyMatchId = legacyByKey.get(legacyKey(accountId, toLocalDateString(r.date), r.amount, r.description, r.type));
+    // Only a row that would otherwise be new may take a recurrence's occurrence.
+    const recurringMatch =
+      !existing && placeholders.length === 0 && !legacyMatchId && eligibleForRecurring(r)
+        ? recurringMatcher.take(accountId, r.description)
+        : undefined;
     const cls = classifyRow(
       { amount: r.amount, paid, type: r.type, section: r.section },
-      existingByRef.get(r.sourceRef),
-      planInstallment ? placeholdersCovering(planInstallment, placeholdersByPlan) : [],
-      legacyByKey.get(legacyKey(accountId, toLocalDateString(r.date), r.amount, r.description, r.type)),
+      existing,
+      placeholders,
+      legacyMatchId,
+      recurringMatch,
     );
     const futureInstallments =
       planInstallment && options.generateFutureInstallments && !options.closedMonth && cls.status !== 'duplicate'
@@ -507,6 +539,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
       newCount: own.filter((r) => r.status === 'new' || r.status === 'replaces-future').length,
       duplicateCount: own.filter((r) => r.status === 'duplicate' || r.status === 'legacy-duplicate').length,
       changedCount: own.filter((r) => r.status === 'changed').length,
+      recurringCount: own.filter((r) => r.status === 'matches-recurring').length,
     };
   });
 
@@ -527,7 +560,9 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
   }
   if (month && resolved.credit.type === AccountType.CREDIT) {
     const creditRows = rows.filter(
-      (r) => r.section === 'credit' && (r.status === 'new' || r.status === 'changed' || r.status === 'replaces-future'),
+      (r) =>
+        r.section === 'credit' &&
+        (r.status === 'new' || r.status === 'changed' || r.status === 'replaces-future' || r.status === 'matches-recurring'),
     );
     // Purchases minus credits (refunds): the invoice pays the net.
     const amount = invoiceNetAmount(creditRows);
@@ -560,6 +595,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     duplicate: rows.filter((r) => r.status === 'duplicate').length,
     changed: rows.filter((r) => r.status === 'changed').length,
     legacyDuplicate: rows.filter((r) => r.status === 'legacy-duplicate').length,
+    matchesRecurring: rows.filter((r) => r.status === 'matches-recurring').length,
     skipped: parsed.skipped.length,
   };
 
@@ -922,10 +958,21 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   });
   const existingByRef = new Map(existingRows.map((t) => [t.sourceRef as string, t.id]));
 
+  // Recurrences that already cover the month, loaded only when a row could take one over.
+  const takesRecurrence = rows.some(eligibleForRecurring);
+  const recurringMatcher = takesRecurrence
+    ? await loadRecurringMatcher(
+        householdId,
+        Array.from(new Set(MAXFIN_SECTION_KEYS.map((k) => resolved[k].id))),
+        key,
+      )
+    : { take: (_accountId: string, _description: string): RecurringMatch | undefined => undefined };
+
   const ids: string[] = [];
   let imported = 0;
   let skipped = 0;
   let replaced = 0;
+  let assumedRecurring = 0;
   let consumedFutureInstallments = 0;
   const importedCreditRows: MaxFinConfirmRow[] = [];
   const importedFutureRows: MaxFinConfirmRow[] = [];
@@ -946,6 +993,42 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
       warnings.push(
         `"${row.description}" ignorada: já existem parcelas futuras geradas para este plano (marque "substituir" para trocá-las pela linha da planilha).`,
       );
+      continue;
+    }
+
+    // The sheet takes over the month's occurrence of a recurrence (same account and description).
+    const recurringMatch =
+      !existingId && placeholders.length === 0 && eligibleForRecurring(row)
+        ? recurringMatcher.take(resolved[row.section].id, row.description)
+        : undefined;
+    if (recurringMatch) {
+      if (!row.replace) {
+        skipped += 1;
+        warnings.push(
+          `"${row.description}" ignorada: uma recorrência já cobre este mês (marque "substituir" para a planilha assumir a conta).`,
+        );
+        continue;
+      }
+      const paid = options.closedMonth || row.section === 'credit' ? true : row.paid;
+      const date = parseLocalDateString(row.date);
+      try {
+        const takenId = await assumeRecurrence(recurringMatch, {
+          householdId,
+          row,
+          paid,
+          date,
+          accountId: resolved[row.section].id,
+          userId,
+          categories,
+        });
+        ids.push(takenId);
+        assumedRecurring += 1;
+        if (row.section === 'credit') importedCreditRows.push(row);
+      } catch (error) {
+        // A concurrent confirm stored the same sourceRef first: that row exists, skip ours.
+        if (!isUniqueViolation(error)) throw error;
+        skipped += 1;
+      }
       continue;
     }
 
@@ -1079,6 +1162,7 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
     imported,
     skipped,
     replaced,
+    assumedRecurring,
     consumedFutureInstallments,
     futureInstallments,
     createdCategories: categories.created,
@@ -1086,4 +1170,78 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
     ids,
     warnings,
   };
+}
+
+interface AssumeContext {
+  householdId: string;
+  row: MaxFinConfirmRow;
+  paid: boolean;
+  date: Date;
+  accountId: string;
+  userId?: string;
+  categories: CategoryResolver;
+}
+
+/**
+ * The sheet row takes over a recurrence's occurrence of the month. With a generated (pending) transaction, that
+ * transaction is updated in place through the transactions service (amount, date, paid and sourceRef; the link to
+ * the recurrence stays and balances follow the service). With only the recurrence, the row is created linked to it
+ * and the recurrence moves on to the month after, so the cron does not duplicate it. The recurrence follows the
+ * sheet's real value when it asks to follow the last amount. Returns the id of the transaction that carries the row.
+ */
+async function assumeRecurrence(match: RecurringMatch, ctx: AssumeContext): Promise<string> {
+  const { householdId, row, paid, date, userId, categories } = ctx;
+  if (match.kind === 'generated') {
+    await updateTransaction(
+      match.transactionId,
+      householdId,
+      {
+        amount: row.amount,
+        date,
+        paid,
+        sourceRef: row.sourceRef,
+        ...(row.notes ? { notes: row.notes.slice(0, 1000) } : {}),
+      },
+      {
+        inTransaction: async (tx) => {
+          await followLastAmountInTx(
+            tx,
+            { id: match.transactionId, householdId, recurringTransactionId: match.recurringId, date: localDate(match.day), amount: match.amount },
+            { amount: row.amount, date },
+          );
+        },
+      },
+    );
+    return match.transactionId;
+  }
+
+  const created = await createTransaction(
+    {
+      householdId,
+      accountId: ctx.accountId,
+      type: TransactionType.EXPENSE,
+      categoryName: categories.categoryNameFor(row.categoryKey, row.type),
+      amount: row.amount,
+      description: row.description.slice(0, 255),
+      date,
+      ...(row.notes ? { notes: row.notes.slice(0, 1000) } : {}),
+      paid,
+      isSplit: false,
+      sourceRef: row.sourceRef,
+      recurringTransactionId: match.recurringId,
+    },
+    userId,
+  );
+  // Move the recurrence on to the month after the sheet month (its next run was inside it).
+  const nextRunDay = addMonthsClamped(match.day, 1);
+  await prisma.recurringTransaction.update({
+    where: { id: match.recurringId },
+    data: {
+      lastRunDate: date,
+      nextRunAt: localDate(nextRunDay),
+      ...(match.followLastAmount ? { amount: new Prisma.Decimal(Math.round(row.amount * 100) / 100) } : {}),
+      ...(match.endDate && nextRunDay > match.endDate ? { isActive: false } : {}),
+    },
+  });
+  return created.id;
 }

@@ -48,7 +48,8 @@ export type MaxFinRowStatus =
   | 'duplicate' // same sourceRef already imported, same amount and paid flag
   | 'changed' // same sourceRef already imported with a different amount or paid flag
   | 'replaces-future' // generated future installments of the same plan (from an earlier import) are superseded by this row
-  | 'legacy-duplicate'; // no sourceRef match, but an identical (account, day, amount, description) exists
+  | 'legacy-duplicate' // no sourceRef match, but an identical (account, day, amount, description) exists
+  | 'matches-recurring'; // an expense a recurrence of the same account and description already covers this month: the sheet takes it over (needs replace: true)
 
 export interface MaxFinPreviewRow {
   sourceLine: number;
@@ -110,6 +111,8 @@ export interface MaxFinSectionPreview {
   newCount: number;
   duplicateCount: number;
   changedCount: number;
+  /** Rows with status matches-recurring. */
+  recurringCount: number;
 }
 
 export interface MaxFinInvoicePreview {
@@ -135,6 +138,7 @@ export interface MaxFinPreviewTotals {
   duplicate: number;
   changed: number;
   legacyDuplicate: number;
+  matchesRecurring: number;
   skipped: number;
 }
 
@@ -183,8 +187,9 @@ export interface MaxFinConfirmRow {
   notes: string | null;
   installment: MaxFinInstallment | null;
   /**
-   * Confirms replacing what this row supersedes: the stored row with the same sourceRef (status `changed`)
-   * and/or the generated future installments of the same plan it covers (status `replaces-future`).
+   * Confirms replacing what this row supersedes: the stored row with the same sourceRef (status `changed`),
+   * the generated future installments of the same plan it covers (status `replaces-future`) and/or taking over
+   * the month's occurrence of a recurrence (status `matches-recurring`).
    * Without it such rows are skipped. Never deletes anything else.
    */
   replace?: boolean;
@@ -203,6 +208,8 @@ export interface MaxFinConfirmResponse {
   /** Rows re-checked at write time and found already imported (or not replaceable). */
   skipped: number;
   replaced: number;
+  /** Rows that took over a recurrence's occurrence (status matches-recurring); not counted in `imported`. */
+  assumedRecurring: number;
   /** Generated future installments deleted because a sheet row of the same plan superseded them. */
   consumedFutureInstallments: number;
   futureInstallments: number;

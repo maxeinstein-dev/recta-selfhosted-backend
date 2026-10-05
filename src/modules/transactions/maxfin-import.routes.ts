@@ -175,7 +175,7 @@ export async function maxfinImportRoutes(app: FastifyInstance) {
   app.post('/import/maxfin/preview', {
     schema: {
       description:
-        'Preview a MaxFin monthly-sheet import (multipart/form-data: file field `file` (.csv, max 5MB) + text fields `accounts` (JSON {income,bills,credit,debit} account ids) and optional `options` (JSON)). Returns rows with status new/duplicate/changed/replaces-future/legacy-duplicate, section totals, category suggestions and the invoice payment that confirm would record (`invoice.alreadyPaid` tells when the payment of that month already exists). Requires EDITOR+ on the accounts household.',
+        'Preview a MaxFin monthly-sheet import (multipart/form-data: file field `file` (.csv, max 5MB) + text fields `accounts` (JSON {income,bills,credit,debit} account ids) and optional `options` (JSON)). Returns rows with status new/duplicate/changed/replaces-future/legacy-duplicate/matches-recurring (a recurrence already covers the month: confirm needs replace), section totals, category suggestions and the invoice payment that confirm would record (`invoice.alreadyPaid` tells when the payment of that month already exists). Requires EDITOR+ on the accounts household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       consumes: ['multipart/form-data'],
