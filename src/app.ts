@@ -28,6 +28,7 @@ import { recurringTransactionRoutes } from './modules/recurring-transactions/ind
 import { feedbackRoutes } from './modules/feedback/index.js';
 import { notificationRoutes } from './modules/notifications/index.js';
 import { dashboardRoutes } from './modules/dashboard/index.js';
+import { organizeRoutes, peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
  * Build the Fastify application
@@ -125,6 +126,7 @@ export async function buildApp(): Promise<FastifyInstance> {
         { name: 'Savings Goals', description: 'Savings goal endpoints' },
         { name: 'Recurring Transactions', description: 'Recurring transaction endpoints' },
         { name: 'Feedback', description: 'User feedback endpoints' },
+        { name: 'People', description: 'People, shared expenses, balances and settlements' },
       ],
     },
   });
@@ -308,6 +310,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(importRoutes, { prefix: '/transactions' });
   await app.register(maxfinImportRoutes, { prefix: '/transactions' });
   await app.register(cardOfxImportRoutes, { prefix: '/transactions' });
+  await app.register(transactionSharesRoutes, { prefix: '/transactions' });
+  await app.register(peopleRoutes, { prefix: '/people' });
+  await app.register(organizeRoutes, { prefix: '/people' });
+  await app.register(settlementRoutes, { prefix: '/settlements' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
   await app.register(recurringTransactionRoutes, { prefix: '/recurring-transactions' });
