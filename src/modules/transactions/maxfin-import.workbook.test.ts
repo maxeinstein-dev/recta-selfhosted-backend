@@ -23,6 +23,7 @@ const db = vi.hoisted(() => ({
   categoryFindMany: vi.fn(),
   transactionFindMany: vi.fn(),
   transactionFindFirst: vi.fn(),
+  externalRefFindMany: vi.fn(),
   createTransaction: vi.fn(),
   deleteTransaction: vi.fn(),
   payCreditCardInvoice: vi.fn(),
@@ -34,6 +35,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
     account: { findMany: db.accountFindMany },
     category: { findMany: db.categoryFindMany },
     transaction: { findMany: db.transactionFindMany, findFirst: db.transactionFindFirst },
+    transactionExternalRef: { findMany: db.externalRefFindMany },
   },
 }));
 vi.mock('./transactions.service.js', () => ({
@@ -175,6 +177,7 @@ beforeEach(() => {
   for (const mock of Object.values(db)) mock.mockReset();
   db.categoryFindMany.mockResolvedValue([]);
   db.transactionFindFirst.mockResolvedValue(null);
+  db.externalRefFindMany.mockResolvedValue([]);
   useStore([]);
 });
 

@@ -6,6 +6,7 @@ import {
   resetStore,
   seedAccount,
   seedRef,
+  seedShare,
   seedTransaction,
   store,
   type FakeTransaction,
@@ -216,6 +217,8 @@ describe('card OFX import: a month that has sheet rows', () => {
       installmentNumber: 5,
       totalInstallments: 6,
     });
+    // The sheet covers August too, so September purchases are not history the sheet never saw.
+    seedSheetRow(1, 'Compra de agosto', 10, { date: '2026-08-01', sourceRef: 'maxfin:2026-08:credit:1' });
     // September's invoice payment, recorded by the sheet import on the due day with the sheet total.
     recordedPayment = seedTransaction({
       householdId: HH,
@@ -308,7 +311,24 @@ describe('card OFX import: a month that has sheet rows', () => {
   it('warns about the leftovers on both sides, since new purchases come unselected in a sheet month', async () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
 
-    expect(preview.warnings).toEqual([expect.stringContaining('Sobram R$ 77,00 na planilha e R$ 40,00 no OFX')]);
+    expect(preview.warnings).toEqual([
+      expect.stringContaining('sobram linhas da planilha'),
+      expect.stringContaining('Sobram R$ 77,00 na planilha e R$ 40,00 no OFX'),
+    ]);
+  });
+
+  it('reports the statement closing: the OFX total against the card in the OFX period, explained', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+
+    const { closing } = preview;
+    expect(closing).toMatchObject({ periodStart: '2026-09-02', periodEnd: '2026-10-02', ofxTotal: preview.ofxTotal, explained: true });
+    const c = closing.components;
+    // delta = uncreated + heldMatches - sheetOnlyInPeriod - foreignInPeriod + residual, to the cent.
+    expect(Math.round(closing.delta * 100)).toBe(
+      Math.round((c.uncreated + c.heldMatches - c.sheetOnlyInPeriod - c.foreignInPeriod + c.residual) * 100),
+    );
+    // The new purchase (40,00) is held back and the sheet row without a bank line (77,00) stays in the card.
+    expect(c).toMatchObject({ uncreated: expect.any(Number), sheetOnlyInPeriod: 77 });
   });
 
   it('applies the selected groups, records every ref and adjusts the payment', async () => {
@@ -325,6 +345,7 @@ describe('card OFX import: a month that has sheet rows', () => {
 
     expect(result).toEqual({
       enriched: 4,
+      absorbedRows: 0,
       consumedFutures: 0,
       created: 1,
       futureInstallments: 0,
@@ -856,6 +877,22 @@ describe('card OFX import: a month without sheet rows', () => {
     expect(refsOf('fut-a4')).toEqual(consume.refs);
   });
 
+  it('counts a consumed future as skipped, and drops its refs, when the transaction service answers 409', async () => {
+    tx('fut-a4').amount = 49.99;
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const consume = preview.proposals.find((p) => p.target?.transactionId === 'fut-a4')!;
+    fakeServices.updateTransaction.mockRejectedValueOnce(Object.assign(new Error('changed'), { code: 'CONFLICT', statusCode: 409 }));
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: [consume.group], payment: null }),
+      account: card,
+    });
+
+    expect(result).toMatchObject({ consumedFutures: 0, skipped: 1 });
+    expect(refsOf('fut-a4')).toEqual([]);
+    expect(tx('fut-a4').amount).toBe(49.99);
+  });
+
   it('rewrites a consumed future in one database transaction when amount and paid flag already match', async () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
     const consume = preview.proposals.find((p) => p.target?.transactionId === 'fut-a4')!;
@@ -1168,6 +1205,258 @@ describe('card OFX confirm: validation before any write', () => {
 });
 
 // ---------------------------------------------------------------------------
+// January: the first sheet month (merges and history before the sheet)
+// ---------------------------------------------------------------------------
+
+function seedJanuaryRow(line: number, description: string, amount: number, extra: Partial<FakeTransaction> = {}): FakeTransaction {
+  return seedSheetRow(line, description, amount, { date: '2026-01-01', sourceRef: `maxfin:2026-01:credit:${line}`, ...extra });
+}
+
+const JANUARY_OPTIONS = { start: '20251203', end: '20260102' };
+const JANUARY: Trn[] = [
+  { fitid: 'jan-shop', date: '20251228', amount: '-91.30', memo: 'Zorbit*Loja Gama' },
+  { fitid: 'jan-dec1', date: '20251210', amount: '-40.00', memo: 'Padaria Dezembro' },
+  { fitid: 'jan-dec2', date: '20251215', amount: '-25.50', memo: 'Farmacia Dezembro' },
+  { fitid: 'jan-late', date: '20260101', amount: '-12.00', memo: 'Banca Janeiro' },
+  { fitid: 'jan-pay', date: '20260105', amount: '300.00', memo: 'Pagamento recebido' },
+];
+
+describe('card OFX import: merging sheet rows into one bank line', () => {
+  let card: ResolvedCardAccount;
+  let first: FakeTransaction;
+  let second: FakeTransaction;
+
+  beforeEach(() => {
+    card = seedCard();
+    first = seedJanuaryRow(1, 'Zorbyt - Item A', 36.86, { categoryName: 'SHOPPING', notes: 'nota original' });
+    second = seedJanuaryRow(2, 'Zorbyt - Item B grande', 54.44, { categoryName: 'SHOPPING' });
+  });
+
+  const MERGE_OFX: Trn[] = [{ fitid: 'mg-shop', date: '20260107', amount: '-91.30', memo: 'Zorbit*Loja Gama' }];
+  const mergeOptions = { start: '20251203', end: '20260102' };
+
+  function cardTotal(): number {
+    return store.transactions
+      .filter((t) => t.accountId === CARD && t.attachmentUrl === null)
+      .reduce((total, t) => total + Math.round(t.amount * 100), 0);
+  }
+
+  it('proposes the merge, selected, with the absorbed rows listed', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+
+    const merge = proposal(preview, 'enrich-merge');
+    expect(merge).toMatchObject({
+      defaultSelected: true,
+      ambiguous: false,
+      target: { transactionId: first.id, amount: 36.86 },
+      absorbed: [{ transactionId: second.id, amount: 54.44, description: 'Zorbyt - Item B grande' }],
+      result: { date: '2026-01-07', description: 'Zorbit*Loja Gama' },
+    });
+    expect(preview.sheetOnly).toEqual([]);
+  });
+
+  it('keeps the first row with the bank amount, absorbs the others, records every ref and keeps the total', async () => {
+    const before = cardTotal();
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 1, absorbedRows: 1, created: 0, skipped: 0 });
+    expect(store.transactions.find((t) => t.id === second.id)).toBeUndefined();
+    expect(tx(first.id)).toMatchObject({ amount: 91.3, date: '2026-01-07', description: 'Zorbit*Loja Gama', categoryName: 'SHOPPING', paid: true });
+    expect(tx(first.id).notes).toBe(
+      'nota original · Planilha (soma de 2 linhas): Zorbyt - Item A 36,86; Zorbyt - Item B grande 54,44',
+    );
+    expect(refsOf(first.id)).toEqual([preview.lines[0]!.ref, 'maxfin:2026-01:credit:2'].sort());
+    expect(cardTotal()).toBe(before);
+  });
+
+  it('shows the invoice reconciled when the same OFX comes again, and applies nothing twice', async () => {
+    const buffer = ofx(MERGE_OFX, mergeOptions);
+    const preview = await buildCardOfxPreview({ account: card, buffer });
+    await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    const again = await buildCardOfxPreview({ account: card, buffer });
+    expect(again.proposals).toEqual([]);
+    expect(again.lines.every((l) => l.status === 'reconciled')).toBe(true);
+
+    const replay = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+    expect(replay).toMatchObject({ enriched: 0, absorbedRows: 0, skipped: 1 });
+    expect(tx(first.id).amount).toBe(91.3);
+  });
+
+  it('writes nothing when another confirm records one of its refs first (all-or-nothing)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+    const other = seedJanuaryRow(9, 'Outra', 1);
+    const batch = fakePrisma.$transaction.getMockImplementation()!;
+    fakePrisma.$transaction.mockImplementationOnce(async (operations: Array<{ exec: () => Promise<unknown> }>) => {
+      seedRef({ householdId: HH, transactionId: other.id, ref: 'maxfin:2026-01:credit:2' });
+      return batch(operations);
+    });
+    const snapshot = JSON.stringify(store.transactions.filter((t) => t.id !== other.id));
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, absorbedRows: 0, skipped: 1 });
+    expect(JSON.stringify(store.transactions.filter((t) => t.id !== other.id))).toBe(snapshot);
+    expect(refsOf(first.id)).toEqual([]);
+  });
+
+  it('does not propose a merge when a row has a share or a settlement', async () => {
+    seedShare(second.id);
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+
+    expect(preview.proposals.filter((p) => p.kind === 'enrich-merge')).toEqual([]);
+    expect(preview.sheetOnly).toHaveLength(2);
+  });
+
+  it('does not propose a merge when a row is split, recurring or has an attachment', async () => {
+    second.attachmentUrl = 'invoice_pay:x:y';
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+    expect(preview.proposals.filter((p) => p.kind === 'enrich-merge')).toEqual([]);
+  });
+
+  it('unselects a merge across categories and says why', async () => {
+    second.categoryName = 'HOME';
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+
+    expect(proposal(preview, 'enrich-merge')).toMatchObject({ defaultSelected: false, reason: 'mixed-categories' });
+    expect(preview.warnings.some((w) => w.includes('mesclagem'))).toBe(true);
+  });
+
+  it('rolls everything back when a share appears on an absorbed row between the recompute and the write', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+    const batch = fakePrisma.$transaction.getMockImplementation()!;
+    fakePrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      seedShare(second.id);
+      return batch(fn);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, absorbedRows: 0, skipped: 1 });
+    expect(tx(second.id)).toBeDefined();
+    expect(tx(first.id).amount).toBe(36.86);
+    expect(refsOf(first.id)).toEqual([]);
+  });
+
+  it('rolls everything back when the absorbed row changed between the recompute and the write', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+    const selected = proposal(preview, 'enrich-merge').group;
+    const batch = fakePrisma.$transaction.getMockImplementation()!;
+    fakePrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      second.amount = 54.45; // edited by someone else after the recompute
+      return batch(fn);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [selected], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, absorbedRows: 0, skipped: 1 });
+    expect(tx(first.id)).toMatchObject({ amount: 36.86, description: 'Zorbyt - Item A' });
+    expect(refsOf(first.id)).toEqual([]);
+    expect(tx(second.id).amount).toBe(54.45);
+  });
+
+  it('skips the merge when a stored row changed after the preview (amount no longer adds up)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(MERGE_OFX, mergeOptions) });
+    const selected = proposal(preview, 'enrich-merge').group;
+    // The group id does not know the amounts: a row edited meanwhile makes the recompute stop proposing it...
+    second.amount = 50;
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [selected], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, absorbedRows: 0, skipped: 1 });
+    expect(tx(second.id).amount).toBe(50);
+    expect(tx(first.id).amount).toBe(36.86);
+  });
+});
+
+describe('card OFX import: history before the first sheet month', () => {
+  let card: ResolvedCardAccount;
+  // The sheet starts in January 2026: everything dated before 2026-01-01 is history, closing day or not.
+  const HISTORY: Trn[] = [
+    { fitid: 'h-nov', date: '20251120', amount: '-40.00', memo: 'Padaria Novembro' },
+    { fitid: 'h-dec', date: '20251215', amount: '-25.50', memo: 'Farmacia Dezembro' },
+    { fitid: 'h-late', date: '20260102', amount: '-9.00', memo: 'Banca Tardia' },
+    { fitid: 'h-jan', date: '20260101', amount: '-12.00', memo: 'Banca Janeiro' },
+    { fitid: 'h-pay', date: '20260105', amount: '300.00', memo: 'Pagamento recebido' },
+  ];
+  const OPTIONS = { start: '20251103', end: '20260102' };
+  const createFor = (preview: CardOfxPreviewResponse, memo: string) =>
+    preview.proposals.find((p) => p.kind === 'create' && preview.lines.find((l) => l.ref === p.refs[0])!.memo === memo);
+
+  beforeEach(() => {
+    card = seedCard();
+    seedJanuaryRow(1, 'Banca Janeiro', 12);
+  });
+
+  it('selects every purchase dated before the first sheet month, even while a sheet row is left over', async () => {
+    seedJanuaryRow(2, 'Sem par no OFX', 77);
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+
+    expect(createFor(preview, 'Padaria Novembro')).toMatchObject({ defaultSelected: true, reason: null });
+    expect(createFor(preview, 'Farmacia Dezembro')).toMatchObject({ defaultSelected: true, reason: null });
+  });
+
+  it('holds a leftover of the sheet month back, with the reason, only while sheet rows are left over', async () => {
+    seedJanuaryRow(2, 'Sem par no OFX', 77);
+
+    const held = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+
+    expect(createFor(held, 'Banca Tardia')).toMatchObject({ defaultSelected: false, reason: 'sheet-residue' });
+    expect(held.warnings.some((w) => w.includes('sobram linhas da planilha'))).toBe(true);
+  });
+
+  it('selects a leftover of the sheet month when every sheet row found its bank line', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+
+    expect(createFor(preview, 'Banca Tardia')).toMatchObject({ defaultSelected: true, reason: null });
+  });
+
+  it('does not propose paying the invoice before the sheet, which Recta has no purchases for', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+
+    expect(preview.payment).toMatchObject({ invoiceMonthKey: '2025-12', recorded: null, proposal: 'ok' });
+    expect(preview.warnings.some((w) => w.includes('anterior à planilha'))).toBe(true);
+  });
+
+  it('creates the history with its dates, paid and refs, records no payment, and shows it reconciled afterwards', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { payment: { apply: true, sourceAccountId: BANK } }),
+      account: card,
+      userId: 'user-1',
+    });
+
+    expect(result).toMatchObject({ created: 3, payment: null });
+    const created = store.transactions.filter((t) => t.sourceRef?.startsWith('ofx:'));
+    expect(created.map((t) => [t.description, t.date, t.paid, t.type]).sort()).toEqual([
+      ['Banca Tardia', '2026-01-02', true, 'EXPENSE'],
+      ['Farmacia Dezembro', '2025-12-15', true, 'EXPENSE'],
+      ['Padaria Novembro', '2025-11-20', true, 'EXPENSE'],
+    ]);
+    expect(store.transactions.filter((t) => t.attachmentUrl !== null)).toEqual([]);
+
+    const again = await buildCardOfxPreview({ account: card, buffer: ofx(HISTORY, OPTIONS) });
+    expect(again.proposals.filter((p) => p.kind === 'create')).toEqual([]);
+    expect(again.lines.find((l) => l.memo === 'Padaria Novembro')!.status).toBe('reconciled');
+  });
+
+  it('proposes the payment as usual for a month after the first sheet month', async () => {
+    seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 10, date: '2025-12-20', description: 'Antiga', sourceRef: 'x:1' });
+    const february = ofx([{ fitid: 'f-pay', date: '20260205', amount: '500.00', memo: 'Pagamento recebido' }], { start: '20260103', end: '20260202' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: february });
+
+    expect(preview.payment).toMatchObject({ invoiceMonthKey: '2026-01', proposal: 'create' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
 
@@ -1211,5 +1500,233 @@ describe('card OFX service helpers', () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
 
     expect(validateConfirmLines(confirmRequest(preview).lines)).toHaveLength(OCTOBER.length);
+  });
+});
+
+describe('card OFX import: closing period end', () => {
+  const OPTS = { start: '20260103', end: '20260202' };
+
+  it('leaves DTEND to the next statement when only a payment is dated on it', async () => {
+    const card = seedCard();
+    seedJanuaryRow(1, 'Banca Janeiro', 12);
+    const preview = await buildCardOfxPreview({
+      account: card,
+      buffer: ofx(
+        [
+          { fitid: 'e-1', date: '20260110', amount: '-12.00', memo: 'Banca Janeiro' },
+          { fitid: 'e-pay', date: '20260202', amount: '300.00', memo: 'Pagamento recebido' },
+        ],
+        OPTS,
+      ),
+    });
+
+    expect(preview.closing.endInclusive).toBe(false);
+  });
+
+  it('counts DTEND in the period when a purchase is dated on it', async () => {
+    const card = seedCard();
+    seedJanuaryRow(1, 'Banca Janeiro', 12);
+    const preview = await buildCardOfxPreview({
+      account: card,
+      buffer: ofx([{ fitid: 'e-1', date: '20260202', amount: '-12.00', memo: 'Banca Janeiro' }], OPTS),
+    });
+
+    expect(preview.closing.endInclusive).toBe(true);
+  });
+});
+
+describe('card OFX import: neighbour months and merchant groups', () => {
+  let card: ResolvedCardAccount;
+  const OPTS = { start: '20260203', end: '20260302' }; // due month 2026-03
+  const sheetMarch = (line: number, description: string, amount: number, extra: Partial<FakeTransaction> = {}) =>
+    seedSheetRow(line, description, amount, { date: '2026-03-01', sourceRef: `maxfin:2026-03:credit:${line}`, ...extra });
+  const sheetFebruary = (line: number, description: string, amount: number, extra: Partial<FakeTransaction> = {}) =>
+    seedSheetRow(line, description, amount, { date: '2026-02-01', sourceRef: `maxfin:2026-02:credit:${line}`, ...extra });
+
+  beforeEach(() => {
+    card = seedCard();
+    // February's statement was imported: one February sheet row is already tied to an OFX line.
+    const febAnchor = sheetFebruary(90, 'Ponto de fevereiro', 1);
+    seedRef({ householdId: HH, transactionId: febAnchor.id, ref: 'ofx:feb:11111111' });
+  });
+
+  const NEIGHBOUR: Trn[] = [
+    { fitid: 'a-1', date: '20260210', amount: '-10.00', memo: 'Banca Marco' },
+    { fitid: 'a-2', date: '20260205', amount: '-57.90', memo: 'Livraria Sol' },
+  ];
+
+  it('moves a purchase the sheet typed in the previous month: bank date and memo, sheet month kept, ref recorded', async () => {
+    sheetMarch(1, 'Banca Marco', 10);
+    const april = sheetFebruary(1, 'Livraria', 57.9, { notes: 'nota' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEIGHBOUR, OPTS) });
+
+    expect(proposal(preview, 'enrich-neighbour')).toMatchObject({ defaultSelected: true, target: { transactionId: april.id, sourceRef: 'maxfin:2026-02:credit:1' } });
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 2, skipped: 0 });
+    expect(tx(april.id)).toMatchObject({ date: '2026-02-05', description: 'Livraria Sol', sourceRef: 'maxfin:2026-02:credit:1', amount: 57.9 });
+    expect(tx(april.id).notes).toBe('nota · Planilha: Livraria');
+    expect(refsOf(april.id)).toHaveLength(1);
+    const again = await buildCardOfxPreview({ account: card, buffer: ofx(NEIGHBOUR, OPTS) });
+    expect(again.proposals).toEqual([]);
+  });
+
+  it('never touches a neighbour row that is already linked to an OFX line', async () => {
+    sheetMarch(1, 'Banca Marco', 10);
+    const april = sheetFebruary(1, 'Livraria', 57.9);
+    seedRef({ householdId: HH, transactionId: april.id, ref: 'ofx:other:11111111' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEIGHBOUR, OPTS) });
+
+    expect(preview.proposals.find((p) => p.kind === 'enrich-neighbour')).toBeUndefined();
+  });
+
+  it('writes nothing when another confirm linked the neighbour row between the recompute and the write', async () => {
+    sheetMarch(1, 'Banca Marco', 10);
+    const april = sheetFebruary(1, 'Livraria', 57.9);
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEIGHBOUR, OPTS) });
+    const batch = fakePrisma.$transaction.getMockImplementation()!;
+    fakePrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      seedRef({ householdId: HH, transactionId: april.id, ref: 'ofx:rival:22222222' });
+      return batch(fn);
+    });
+    const selected = proposal(preview, 'enrich-neighbour').group;
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [selected], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(tx(april.id)).toMatchObject({ date: '2026-02-01', description: 'Livraria' });
+    expect(refsOf(april.id)).toEqual(['ofx:rival:22222222']);
+  });
+
+  it('writes nothing when the neighbour row changed amount meanwhile', async () => {
+    sheetMarch(1, 'Banca Marco', 10);
+    const april = sheetFebruary(1, 'Livraria', 57.9);
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEIGHBOUR, OPTS) });
+    const batch = fakePrisma.$transaction.getMockImplementation()!;
+    fakePrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      april.amount = 58;
+      return batch(fn);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [proposal(preview, 'enrich-neighbour').group], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(refsOf(april.id)).toEqual([]);
+  });
+
+  it('applies a merchant group: the sheet row is kept at its total, with every bank line in the notes and refs', async () => {
+    const fillers: Trn[] = Array.from({ length: 16 }, (_, i) => ({ fitid: `f${i}`, date: '20260205', amount: '-33.33', memo: `Loja Fantasia ${i}` }));
+    const taxi: Trn[] = [
+      { fitid: 'g1', date: '20260206', amount: '-15.00', memo: 'Taxi' },
+      { fitid: 'g2', date: '20260207', amount: '-10.00', memo: 'Dl*Taxibras' },
+      { fitid: 'g3', date: '20260208', amount: '-15.00', memo: 'Pg *55 Corrida' },
+    ];
+    const group = sheetMarch(1, 'Taxi/55', 40);
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx([...fillers, ...taxi], OPTS) });
+    const proposed = proposal(preview, 'enrich-group');
+    expect(proposed).toMatchObject({ defaultSelected: true, reason: null, target: { transactionId: group.id } });
+    expect(proposed.refs).toHaveLength(3);
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result.skipped).toBe(0);
+    expect(tx(group.id)).toMatchObject({ amount: 40, description: 'Taxi/55', date: '2026-02-06' });
+    expect(tx(group.id).notes).toContain('Dl*Taxibras');
+    expect(refsOf(group.id)).toHaveLength(3);
+  });
+});
+
+describe('card OFX import: near amounts', () => {
+  let card: ResolvedCardAccount;
+  const OPTS = { start: '20260203', end: '20260302' }; // due month 2026-03
+  const NEAR: Trn[] = [
+    { fitid: 'z-1', date: '20260210', amount: '-10.00', memo: 'Banca Marco' },
+    { fitid: 'z-2', date: '20260215', amount: '-55.35', memo: 'Livraria Sol Central' },
+  ];
+  const marchRow = (line: number, description: string, amount: number, extra: Partial<FakeTransaction> = {}) =>
+    seedSheetRow(line, description, amount, { date: '2026-03-01', sourceRef: `maxfin:2026-03:credit:${line}`, ...extra });
+  let target: FakeTransaction;
+
+  beforeEach(() => {
+    card = seedCard();
+    marchRow(1, 'Banca Marco', 10);
+    target = marchRow(2, 'Livraria Sol', 55.37, { notes: 'nota' });
+  });
+
+  it('adopts the bank amount through the transaction service, noting the sheet amount, and records the ref', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+    expect(proposal(preview, 'enrich-near')).toMatchObject({ defaultSelected: true, reason: null, target: { transactionId: target.id, amount: 55.37 } });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 2, skipped: 0 });
+    expect(fakeServices.updateTransaction).toHaveBeenCalledWith(
+      target.id,
+      HH,
+      expect.objectContaining({ amount: 55.35, description: 'Livraria Sol Central' }),
+      { beforeWrite: expect.any(Function) },
+    );
+    expect(tx(target.id)).toMatchObject({ amount: 55.35, date: '2026-02-15', description: 'Livraria Sol Central', sourceRef: 'maxfin:2026-03:credit:2' });
+    expect(tx(target.id).notes).toBe('nota · Planilha: Livraria Sol 55,37');
+    expect(refsOf(target.id)).toHaveLength(1);
+    const again = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+    expect(again.proposals).toEqual([]);
+    expect(again.closing.explained).toBe(true);
+  });
+
+  it('writes nothing when another confirm linked the row first (the hook runs under the claim)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+    const impl = fakeServices.updateTransaction.getMockImplementation()!;
+    fakeServices.updateTransaction.mockImplementationOnce(async (...args: Parameters<typeof impl>) => {
+      seedRef({ householdId: HH, transactionId: target.id, ref: 'ofx:rival:33333333' });
+      return impl(...args);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [proposal(preview, 'enrich-near').group], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(tx(target.id)).toMatchObject({ amount: 55.37, description: 'Livraria Sol' });
+    expect(refsOf(target.id)).toEqual(['ofx:rival:33333333']);
+  });
+
+  it('writes nothing when the row changed amount meanwhile', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+    const impl = fakeServices.updateTransaction.getMockImplementation()!;
+    fakeServices.updateTransaction.mockImplementationOnce(async (...args: Parameters<typeof impl>) => {
+      target.amount = 55.4;
+      return impl(...args);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [proposal(preview, 'enrich-near').group], payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(tx(target.id).amount).toBe(55.4);
+    expect(refsOf(target.id)).toEqual([]);
+  });
+
+  it('keeps a weak near match unselected, with the reason, and still lists it', async () => {
+    target.description = 'Presente';
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+
+    expect(proposal(preview, 'enrich-near')).toMatchObject({ defaultSelected: false, reason: 'near-amount' });
+    expect(preview.warnings.some((w) => w.includes('valor próximo'))).toBe(true);
+  });
+
+  it('warns when a selected near-amount adoption falls in an invoice that already has a registered payment', async () => {
+    seedTransaction({ householdId: HH, accountId: BANK, type: 'EXPENSE', amount: 65.37, date: '2026-03-09', description: 'Pagamento', attachmentUrl: 'invoice_pay:card-1:2026-2' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+
+    expect(preview.warnings.some((w) => w.includes('já tem pagamento registrado'))).toBe(true);
+  });
+
+  it('does not warn about payments when there is none or nothing is adopted', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
+
+    expect(preview.warnings.some((w) => w.includes('já tem pagamento registrado'))).toBe(false);
   });
 });

@@ -52,13 +52,16 @@ export interface FakeCategory {
 }
 
 interface Store {
+  /** Rows that only exist to block merges: shares and settlements of a transaction. */
+  shares: Array<{ transactionId: string }>;
+  settlements: Array<{ transactionId: string }>;
   transactions: FakeTransaction[];
   refs: FakeExternalRef[];
   accounts: FakeAccount[];
   categories: FakeCategory[];
 }
 
-export const store: Store = { transactions: [], refs: [], accounts: [], categories: [] };
+export const store: Store = { shares: [], settlements: [], transactions: [], refs: [], accounts: [], categories: [] };
 let sequence = 0;
 
 function nextId(prefix: string): string {
@@ -67,6 +70,8 @@ function nextId(prefix: string): string {
 }
 
 export function resetStore(): void {
+  store.shares = [];
+  store.settlements = [];
   store.transactions = [];
   store.refs = [];
   store.accounts = [];
@@ -86,6 +91,8 @@ function localDay(date: Date): string {
 }
 
 function toDay(value: unknown): string {
+  // A date-only bound built with Date.UTC (exactly UTC midnight) is that UTC day; other Dates are local days.
+  if (value instanceof Date && value.getTime() % 86_400_000 === 0) return value.toISOString().slice(0, 10);
   if (value instanceof Date) return localDay(value);
   return String(value);
 }
@@ -208,6 +215,8 @@ function insertRefs(data: Array<Omit<FakeExternalRef, 'id'>>, skipDuplicates: bo
 
 function snapshot(): Store {
   return {
+    shares: store.shares.map((r) => ({ ...r })),
+    settlements: store.settlements.map((r) => ({ ...r })),
     transactions: store.transactions.map((t) => ({ ...t })),
     refs: store.refs.map((r) => ({ ...r })),
     accounts: store.accounts.map((a) => ({ ...a })),
@@ -223,6 +232,7 @@ function updateData(t: FakeTransaction, data: Record<string, unknown>): void {
 
 export const fakePrisma = {
   transaction: {
+    count: vi.fn(async (args: { where?: Where }) => store.transactions.filter((t) => matches(t as unknown as Record<string, unknown>, args.where)).length),
     findMany: vi.fn((args: { where?: Where; select?: Record<string, boolean>; orderBy?: unknown; take?: number }) =>
       lazy(() => {
         const rows = sortBy(store.transactions.filter((t) => matches(t as unknown as Record<string, unknown>, args.where)), args.orderBy);
@@ -237,6 +247,15 @@ export const fakePrisma = {
         return project(t);
       }),
     ),
+    deleteMany: vi.fn((args: { where: Where }) =>
+      lazy(() => {
+        const gone = store.transactions.filter((t) => matches(t as unknown as Record<string, unknown>, args.where));
+        const ids = new Set(gone.map((t) => t.id));
+        store.transactions = store.transactions.filter((t) => !ids.has(t.id));
+        store.refs = store.refs.filter((r) => !ids.has(r.transactionId));
+        return { count: gone.length };
+      }),
+    ),
     updateMany: vi.fn((args: { where: Where; data: Record<string, unknown> }) =>
       lazy(() => {
         const rows = store.transactions.filter((t) => matches(t as unknown as Record<string, unknown>, args.where));
@@ -249,6 +268,7 @@ export const fakePrisma = {
     findMany: vi.fn((args: { where?: Where; select?: Record<string, boolean> }) =>
       lazy(() => store.refs.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
     ),
+    count: vi.fn(async (args: { where?: Where }) => store.refs.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).length),
     createMany: vi.fn((args: { data: Array<Omit<FakeExternalRef, 'id'>>; skipDuplicates?: boolean }) =>
       lazy(() => insertRefs(args.data, args.skipDuplicates ?? false)),
     ),
@@ -274,9 +294,24 @@ export const fakePrisma = {
       lazy(() => store.categories.filter((c) => matches(c as unknown as Record<string, unknown>, args.where)).map((c) => ({ ...c }))),
     ),
   },
-  $transaction: vi.fn(async (operations: Array<{ exec: () => Promise<unknown> }>) => {
+  $queryRaw: vi.fn(async () => []),
+  transactionShare: {
+    count: vi.fn(async (args: { where?: Where }) => store.shares.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).length),
+    findMany: vi.fn((args: { where?: Where }) =>
+      lazy(() => store.shares.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
+    ),
+  },
+  settlement: {
+    count: vi.fn(async (args: { where?: Where }) => store.settlements.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).length),
+    findMany: vi.fn((args: { where?: Where }) =>
+      lazy(() => store.settlements.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
+    ),
+  },
+  $transaction: vi.fn(async (operations: any) => {
     const saved = snapshot();
     try {
+      // Interactive form: the callback gets the same fake client; any throw rolls everything back.
+      if (typeof operations === 'function') return await operations(fakePrisma);
       const results: unknown[] = [];
       for (const operation of operations) results.push(await operation.exec());
       return results;
@@ -324,15 +359,23 @@ export const fakeServices = {
     });
     return { ...row };
   }),
-  deleteTransaction: vi.fn(async (id: string, householdId: string) => {
+  deleteTransaction: vi.fn(async (id: string, householdId: string, options?: { guard?: (tx: unknown) => Promise<void> }) => {
+    await options?.guard?.(fakePrisma);
     const before = store.transactions.length;
     store.transactions = store.transactions.filter((t) => !(t.id === id && t.householdId === householdId));
     if (store.transactions.length === before) throw prismaError('NOT_FOUND', 'Transaction not found');
     store.refs = store.refs.filter((r) => r.transactionId !== id);
   }),
-  updateTransaction: vi.fn(async (id: string, householdId: string, input: Record<string, unknown>) => {
+  updateTransaction: vi.fn(async (id: string, householdId: string, input: Record<string, unknown>, options?: { beforeWrite?: (tx: unknown) => Promise<void> }) => {
     const t = store.transactions.find((row) => row.id === id && row.householdId === householdId);
     if (!t) throw prismaError('NOT_FOUND', 'Transaction not found');
+    const saved = snapshot();
+    try {
+      await options?.beforeWrite?.(fakePrisma);
+    } catch (error) {
+      Object.assign(store, saved);
+      throw error;
+    }
     updateData(t, input);
     return { ...t };
   }),
@@ -388,6 +431,14 @@ export function seedAccount(account: Partial<FakeAccount> & Pick<FakeAccount, 'i
 
 export function seedTransaction(data: Partial<FakeTransaction> & { householdId: string }): FakeTransaction {
   return insertTransaction(data);
+}
+
+export function seedSettlement(transactionId: string): void {
+  store.settlements.push({ transactionId });
+}
+
+export function seedShare(transactionId: string): void {
+  store.shares.push({ transactionId });
 }
 
 export function seedRef(data: Omit<FakeExternalRef, 'id'>): void {

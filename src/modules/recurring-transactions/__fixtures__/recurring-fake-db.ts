@@ -70,7 +70,7 @@ function matches(row: Row, where: Where | undefined): boolean {
   return true;
 }
 
-const decimal = (n: number) => ({ toNumber: () => n, toString: () => n.toFixed(2) });
+const decimal = (n: number) => ({ toNumber: () => n, toString: () => n.toFixed(2), equals: (other: { toNumber(): number }) => other.toNumber() === n });
 
 function project(row: Row, select?: Record<string, boolean>): Record<string, unknown> {
   const full: Record<string, unknown> = { ...row };
@@ -181,6 +181,14 @@ export const fakePrisma = {
   recurringTransaction: table('recurringTransaction'),
   account: table('account'),
   category: table('category'),
+  /** External refs (card statement import) do not exist in these scenarios: nothing is linked. */
+  transactionExternalRef: {
+    findMany: vi.fn(async () => []),
+    count: vi.fn(async () => 0),
+    createMany: vi.fn(async () => ({ count: 0 })),
+  },
+  /** Row locks (SELECT ... FOR UPDATE) have nothing to lock in memory. */
+  $queryRaw: vi.fn(async () => []),
   /** The advisory lock apply takes (no real locking; tests look at the calls). */
   $executeRaw: vi.fn(async (strings: TemplateStringsArray, ..._values: unknown[]) => {
     if (!strings.join('?').includes('pg_advisory_xact_lock')) throw new Error(`Unexpected raw query: ${strings.join('?')}`);
