@@ -9,6 +9,7 @@ import {
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
@@ -1862,7 +1863,7 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
  * Invoice window of a card month (month = 1..12) as UTC date-only bounds, to compare with @db.Date columns (stored as
  * UTC midnight). With a closing day the invoice runs from the closing day of the previous month to the day before the
  * closing day of this one, both ends inclusive (7 Jan to 6 Feb for closing day 7 and month 2024-02); without one it is
- * the calendar month. Local-time bounds made Prisma truncate both ends to the UTC day in time zones behind UTC, which
+ * the calendar month (callers pass the effective closing day: the explicit one or due day - 7). Local-time bounds made Prisma truncate both ends to the UTC day in time zones behind UTC, which
  * counted the closing day in two invoices.
  */
 export function creditCardInvoiceWindow(year: number, month: number, closingDay: number | null | undefined) {
@@ -1907,7 +1908,7 @@ export async function calculateCreditCardInvoice(
   // Parse month (YYYY-MM) to start and end dates
   const [year, monthNum] = month.split('-').map(Number);
   
-  const window = creditCardInvoiceWindow(year, monthNum, account.closingDay);
+  const window = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(account));
   const invoiceStart = window.start;
   const invoiceEnd = window.end;
   const previousPeriodStart = window.previousStart;
@@ -2159,7 +2160,7 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
     // 3. Calculate invoice (inline calculation to avoid nested transactions)
     const [invoiceYear, invoiceMonthNum] = month.split('-').map(Number);
     
-    const invoiceWindow = creditCardInvoiceWindow(invoiceYear, invoiceMonthNum, creditCard.closingDay);
+    const invoiceWindow = creditCardInvoiceWindow(invoiceYear, invoiceMonthNum, effectiveClosingDay(creditCard));
     const invoiceMonthStart = invoiceWindow.start;
     const invoiceMonthEnd = invoiceWindow.end;
 
@@ -2448,7 +2449,7 @@ export async function undoCreditCardPayment(
     // monthIndex is 0-indexed (0-11), convert to 1-indexed for Date constructor
     const monthNum = monthIndex + 1;
     
-    const undoWindow = creditCardInvoiceWindow(year, monthNum, creditCard.closingDay);
+    const undoWindow = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(creditCard));
     const monthStart = undoWindow.start;
     const monthEnd = undoWindow.end;
 

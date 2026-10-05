@@ -6,6 +6,7 @@
  * as Date are read as local days, like the service writes them.
  */
 import { vi } from 'vitest';
+import { effectiveClosingDay } from '../../accounts/closing-day.js';
 
 export interface FakeTransaction {
   id: string;
@@ -330,7 +331,7 @@ function isoDay(year: number, monthIndex: number, day: number): string {
 function invoicePeriod(cardId: string, month: string): { start: string; end: string } {
   const year = Number(month.slice(0, 4));
   const index = Number(month.slice(5, 7)) - 1;
-  const closingDay = store.accounts.find((a) => a.id === cardId)?.closingDay ?? null;
+  const closingDay = effectiveClosingDay(store.accounts.find((a) => a.id === cardId));
   if (closingDay) return { start: isoDay(year, index - 1, closingDay), end: isoDay(year, index, closingDay - 1) };
   return { start: isoDay(year, index, 1), end: isoDay(year, index + 1, 0) };
 }

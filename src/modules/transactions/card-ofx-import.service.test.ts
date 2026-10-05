@@ -1082,6 +1082,17 @@ describe('card OFX preview: month, warnings and errors', () => {
     ]);
   });
 
+  it('does not warn about the closing day when it is derived from the due day', async () => {
+    seedAccount({ id: CARD, householdId: HH, name: 'Cartao Teste', type: 'CREDIT', dueDay: 9, closingDay: null });
+    const card = await resolveCardAccount(CARD);
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER.slice(0, 1)) });
+
+    expect(card.closingDay).toBe(2);
+    expect(preview.monthKey).toBe('2026-10');
+    expect(preview.warnings).toEqual([]);
+  });
+
   it('warns when the ledger balance and the lines disagree beyond the bank rounding', async () => {
     const card = seedCard();
 
@@ -1140,6 +1151,16 @@ describe('resolveCardAccount', () => {
       dueDay: 9,
       closingDay: 2,
     });
+  });
+
+  it.each([
+    [9, 2],
+    [3, 26],
+    [null, null],
+  ])('with due day %s and no closing day the resolved closing day is %s', async (dueDay, closingDay) => {
+    seedCard({ dueDay, closingDay: null });
+
+    await expect(resolveCardAccount(CARD)).resolves.toMatchObject({ dueDay, closingDay });
   });
 });
 
