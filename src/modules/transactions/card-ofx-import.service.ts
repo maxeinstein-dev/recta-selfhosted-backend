@@ -393,6 +393,13 @@ export function paymentProposal(line: Pick<CardOfxStatementLine, 'amount' | 'dat
   return 'ok';
 }
 
+/** Several recorded payments from different accounts become one payment from one account when adjusted. */
+export function collapseWarning(recorded: RecordedPayment[], invoiceMonthKey: string): string | null {
+  const accounts = new Set(recorded.map((p) => p.accountId));
+  if (accounts.size < 2) return null;
+  return `A fatura de ${invoiceMonthKey} tem pagamentos registrados de ${accounts.size} contas diferentes: o ajuste os troca por um só, pago de uma única conta.`;
+}
+
 function paymentDto(
   result: ReconcileResult,
   recorded: RecordedPayment[],
@@ -685,6 +692,8 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       `O pagamento registrado da fatura de ${monthKey(addMonths(month, -1))} saiu de uma conta que não está mais disponível: escolha a conta de origem para o ajuste.`,
     );
   }
+  const collapse = result.payment && collapseWarning(context.recordedPayments, monthKey(addMonths(month, -1)));
+  if (collapse && paymentProposal(result.payment!.line, context.recordedPayments) === 'adjust') warnings.push(collapse);
   if (context.recordedPayments.length > 1 && result.payment) {
     const sum = context.recordedPayments.reduce((total, p) => total + toCents(p.amount), 0) / 100;
     warnings.push(
@@ -860,6 +869,12 @@ function isAlreadyTakenOrGone(error: unknown): boolean {
   return isUniqueViolation(error) || code === 'P2003' || code === 'P2025';
 }
 
+/** The transaction service's NotFoundError (404) or Prisma's P2025: the row to update is gone. */
+function isNotFound(error: unknown): boolean {
+  const { code, statusCode } = (error ?? {}) as { code?: unknown; statusCode?: unknown };
+  return code === 'NOT_FOUND' || code === 'P2025' || statusCode === 404;
+}
+
 /** Record the refs and rewrite the target in one database transaction; false when that lost a race (nothing written). */
 async function claimAndUpdate(
   householdId: string,
@@ -916,6 +931,8 @@ async function applyConsumeFuture(householdId: string, proposal: ReconcilePropos
     await updateTransaction(target.id, householdId, { ...data, amount, paid: true });
   } catch (error) {
     await prisma.transactionExternalRef.deleteMany({ where: { householdId, transactionId: target.id, ref: { in: proposal.refs } } });
+    // The row was deleted after the claim: nothing to consume, like a lost race in claimAndUpdate.
+    if (isNotFound(error)) return false;
     throw error;
   }
   return true;
@@ -980,6 +997,30 @@ async function createLines(ctx: CreateContext, refs: string[]): Promise<number> 
   return created;
 }
 
+/**
+ * Record the refs of lines that matched a transaction the generic importer stored. A repeated ref is skipped, and
+ * when one of those transactions was deleted meanwhile (its foreign key fails the whole statement) the others are
+ * recorded one by one: this runs after the groups were applied and must not fail the confirm.
+ */
+async function recordLegacyRefs(householdId: string, items: Array<{ transactionId: string; ref: string }>): Promise<void> {
+  if (items.length === 0) return;
+  try {
+    await prisma.transactionExternalRef.createMany({
+      data: items.map((item) => ({ householdId, ...item })),
+      skipDuplicates: true,
+    });
+  } catch (error) {
+    if (!isAlreadyTakenOrGone(error)) throw error;
+    for (const item of items) {
+      try {
+        await prisma.transactionExternalRef.create({ data: { householdId, ...item } });
+      } catch (itemError) {
+        if (!isAlreadyTakenOrGone(itemError)) throw itemError;
+      }
+    }
+  }
+}
+
 /** Future installments of a new purchase, one per following month, like the monthly sheet's (`<ref>:f<i>`). */
 async function createFutureInstallments(ctx: CreateContext, proposal: ReconcileProposal): Promise<number> {
   if (proposal.futureNumbers.length === 0 || !proposal.futureBaseRef) return 0;
@@ -1033,24 +1074,30 @@ async function paidPurchasesUpTo(householdId: string, cardId: string, invoiceMon
   return rows.map((r) => r.id);
 }
 
+/** Mark paid again the purchases an undo marked unpaid (and that were paid before it). */
+async function restorePaidFlags(householdId: string, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await prisma.transaction.updateMany({ where: { id: { in: ids }, householdId, paid: false }, data: { paid: true } });
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function applyPayment(
   plan: PaymentPlan,
   householdId: string,
   card: ResolvedCardAccount,
   invoiceMonth: MaxFinMonth,
+  warnings: string[],
 ): Promise<CardOfxConfirmResponse['payment']> {
   if (plan.kind === 'none') return null;
+  const month = monthKey(invoiceMonth);
+  const payWith = (input: { sourceAccountId: string; amount: number; description: string; paymentDate: Date }) =>
+    payCreditCardInvoice({ householdId, accountId: card.id, month, ...input });
   const paymentDate = parseLocalDateString(plan.line.date);
   const pay = (sourceAccountId: string, description: string) =>
-    payCreditCardInvoice({
-      householdId,
-      accountId: card.id,
-      sourceAccountId,
-      month: monthKey(invoiceMonth),
-      amount: plan.line.amount,
-      description,
-      paymentDate,
-    });
+    payWith({ sourceAccountId, amount: plan.line.amount, description, paymentDate });
 
   if (plan.kind === 'create') {
     const result = await pay(plan.sourceAccountId, paymentDescription(invoiceMonth));
@@ -1061,15 +1108,40 @@ async function applyPayment(
   // only marks paid the purchases of the invoice period: restore the flags of the ones that were paid before.
   const latestDate = plan.recorded.reduce((latest, p) => (p.date > latest ? p.date : latest), plan.recorded[0]!.date);
   const paidBefore = await paidPurchasesUpTo(householdId, card.id, invoiceMonth, latestDate);
-  for (const recorded of plan.recorded) {
-    await undoCreditCardPayment({ accountId: card.id, transactionId: recorded.id }, householdId);
+  const undone: RecordedPayment[] = [];
+  let result: Awaited<ReturnType<typeof pay>>;
+  try {
+    for (const recorded of plan.recorded) {
+      await undoCreditCardPayment({ accountId: card.id, transactionId: recorded.id }, householdId);
+      undone.push(recorded);
+    }
+    result = await pay(plan.sourceAccountId, plan.description);
+  } catch (error) {
+    // All or nothing: put back the payments already undone, with their own amount, date and account.
+    try {
+      for (const recorded of undone) {
+        await payWith({
+          sourceAccountId: recorded.accountId ?? plan.sourceAccountId,
+          amount: recorded.amount,
+          description: recorded.description || paymentDescription(invoiceMonth),
+          paymentDate: parseLocalDateString(storedDateString(recorded.date)),
+        });
+      }
+      await restorePaidFlags(householdId, paidBefore);
+    } catch (restoreError) {
+      throw new Error(
+        `${errorText(error)}; and the recorded payment of the ${month} invoice could not be put back (${errorText(restoreError)}): check it`,
+        { cause: error },
+      );
+    }
+    throw error;
   }
-  const result = await pay(plan.sourceAccountId, plan.description);
-  if (paidBefore.length > 0) {
-    await prisma.transaction.updateMany({
-      where: { id: { in: paidBefore }, householdId, paid: false },
-      data: { paid: true },
-    });
+  try {
+    await restorePaidFlags(householdId, paidBefore);
+  } catch (flagError) {
+    warnings.push(
+      `Pagamento da fatura de ${month} ajustado, mas não foi possível marcar como pagas as compras que já estavam (${errorText(flagError)}).`,
+    );
   }
   return { action: 'adjusted', transactionId: result.paymentTransaction.id, amount: plan.line.amount, date: plan.line.date };
 }
@@ -1100,6 +1172,10 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
 
   const warnings: string[] = [];
   const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth);
+  if (paymentPlan.kind === 'adjust') {
+    const collapse = collapseWarning(paymentPlan.recorded, monthKey(invoiceMonth));
+    if (collapse) warnings.push(collapse);
+  }
 
   const importedLines = toApply
     .filter((p) => p.kind === 'create' || p.kind === 'reversal')
@@ -1133,13 +1209,12 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
         else skipped += 1;
         break;
       case 'create': {
-        const count = await createLines(createContext, proposal.refs);
-        if (count === 0) {
-          skipped += 1;
-          break;
-        }
-        created += count;
+        // The future installments go first: once the line exists its group is gone, so a failure after it would
+        // lose them for good, while a failure before it leaves the group to be retried (stored numbers are skipped).
         futureInstallments += await createFutureInstallments(createContext, proposal);
+        const count = await createLines(createContext, proposal.refs);
+        if (count === 0) skipped += 1;
+        else created += count;
         break;
       }
       case 'reversal': {
@@ -1155,14 +1230,12 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   const legacy = result.lines
     .map((state, i) => ({ state, line: lines[i]! }))
     .filter(({ state }) => state.reconciledBy === 'legacy' && state.transactionId);
-  if (legacy.length > 0) {
-    await prisma.transactionExternalRef.createMany({
-      data: legacy.map(({ state, line }) => ({ householdId, transactionId: state.transactionId!, ref: line.ref })),
-      skipDuplicates: true,
-    });
-  }
+  await recordLegacyRefs(
+    householdId,
+    legacy.map(({ state, line }) => ({ transactionId: state.transactionId!, ref: line.ref })),
+  );
 
-  const payment = await applyPayment(paymentPlan, householdId, account, invoiceMonth);
+  const payment = await applyPayment(paymentPlan, householdId, account, invoiceMonth, warnings);
 
   return {
     enriched,

@@ -514,6 +514,137 @@ describe('card OFX import: a month that has sheet rows', () => {
     expect(refsOf(row.id)).toEqual(exact.refs);
   });
 
+  const PAYMENT_ID = 'invoice_pay:card-1:2026-8';
+  const P2002 = () => Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
+
+  it('puts the recorded payment back, with its flags, when paying again fails after the undo', async () => {
+    seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 20, date: '2026-08-20', description: 'Compra antiga', paid: true });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    fakeServices.payCreditCardInvoice.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(confirmCardOfxImport({ request: confirmRequest(preview), account: card })).rejects.toThrow('db down');
+
+    const payments = store.transactions.filter((t) => t.attachmentUrl === PAYMENT_ID);
+    expect(payments.map((t) => [t.amount, t.date, t.accountId, t.description])).toEqual([
+      [1499, '2026-09-09', BANK, recordedPayment.description],
+    ]);
+    expect(store.transactions.filter((t) => t.accountId === CARD && !t.paid)).toEqual([]);
+  });
+
+  it('puts back the payments already undone when a later undo fails (several recorded payments)', async () => {
+    seedAccount({ id: 'savings-1', householdId: HH, type: 'SAVINGS' });
+    seedTransaction({ householdId: HH, accountId: 'savings-1', type: 'EXPENSE', amount: 500, date: '2026-09-05', description: 'Parte', attachmentUrl: PAYMENT_ID });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    const real = fakeServices.undoCreditCardPayment.getMockImplementation()!;
+    fakeServices.undoCreditCardPayment.mockImplementationOnce(real).mockRejectedValueOnce(new Error('undo failed'));
+
+    await expect(confirmCardOfxImport({ request: confirmRequest(preview), account: card })).rejects.toThrow('undo failed');
+
+    const payments = store.transactions
+      .filter((t) => t.attachmentUrl === PAYMENT_ID)
+      .map((t) => [t.amount, t.date, t.accountId])
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+    expect(payments).toEqual([
+      [500, '2026-09-05', 'savings-1'],
+      [1499, '2026-09-09', BANK],
+    ]);
+  });
+
+  it('says so when the recorded payment itself cannot be put back', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    fakeServices.payCreditCardInvoice.mockRejectedValueOnce(new Error('db down')).mockRejectedValueOnce(new Error('still down'));
+
+    await expect(confirmCardOfxImport({ request: confirmRequest(preview), account: card })).rejects.toThrow(
+      /db down.*could not be put back \(still down\)/,
+    );
+  });
+
+  it('warns, in the preview and the confirm, when an adjust joins payments of different accounts', async () => {
+    seedAccount({ id: 'savings-1', householdId: HH, type: 'SAVINGS' });
+    seedTransaction({ householdId: HH, accountId: 'savings-1', type: 'EXPENSE', amount: 500, date: '2026-09-05', description: 'Parte', attachmentUrl: PAYMENT_ID });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview), account: card });
+
+    expect(preview.warnings).toContainEqual(expect.stringContaining('2 contas diferentes'));
+    expect(result.warnings).toContainEqual(expect.stringContaining('2 contas diferentes'));
+    expect(store.transactions.filter((t) => t.attachmentUrl === PAYMENT_ID)).toHaveLength(1);
+  });
+
+  it('does not warn about accounts when the recorded payments share one', async () => {
+    seedTransaction({ householdId: HH, accountId: BANK, type: 'EXPENSE', amount: 500, date: '2026-09-05', description: 'Parte', attachmentUrl: PAYMENT_ID });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+
+    expect(preview.warnings.some((w) => w.includes('contas diferentes'))).toBe(false);
+  });
+
+  it('skips a new purchase whose sourceRef another confirm created first (P2002 on the transaction)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    fakeServices.createTransaction.mockRejectedValueOnce(P2002());
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: [proposal(preview, 'create').group], payment: null }),
+      account: card,
+    });
+
+    expect(result).toMatchObject({ created: 0, skipped: 1 });
+    expect(store.transactions.some((t) => t.description === 'Livraria Nova' && t.date === '2026-09-25')).toBe(false);
+    expect(store.refs).toEqual([]);
+  });
+
+  it('removes the transaction it just created when its ref was reconciled elsewhere meanwhile (P2002 on the ref)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    fakePrisma.transactionExternalRef.create.mockImplementationOnce(() => {
+      throw P2002();
+    });
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: [proposal(preview, 'create').group], payment: null }),
+      account: card,
+    });
+
+    expect(result).toMatchObject({ created: 0, skipped: 1 });
+    expect(fakeServices.deleteTransaction).toHaveBeenCalledTimes(1);
+    expect(store.transactions.some((t) => t.description === 'Livraria Nova' && t.date === '2026-09-25')).toBe(false);
+    expect(store.refs).toEqual([]);
+  });
+
+  it('records the refs of legacy lines even when another confirm recorded one meanwhile (skipDuplicates)', async () => {
+    const legacy = seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 40, date: '2026-09-25', description: 'Livraria Nova' });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    const line = preview.lines.find((l) => l.memo === 'Livraria Nova')!;
+    const real = fakePrisma.transactionExternalRef.createMany.getMockImplementation()!;
+    fakePrisma.transactionExternalRef.createMany.mockImplementationOnce((args) => {
+      seedRef({ householdId: HH, transactionId: legacy.id, ref: line.ref }); // the other confirm got there first
+      return real(args);
+    });
+
+    await expect(
+      confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [], payment: null }), account: card }),
+    ).resolves.toMatchObject({ skipped: 0 });
+
+    expect(refsOf(legacy.id)).toEqual([line.ref]);
+  });
+
+  it('records the other legacy refs when one legacy transaction was deleted meanwhile', async () => {
+    const kept = seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 40, date: '2026-09-25', description: 'Livraria Nova' });
+    const gone = seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 149.9, date: '2026-09-08', description: 'Loja Mu' });
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(OCTOBER) });
+    const real = fakePrisma.transactionExternalRef.createMany.getMockImplementation()!;
+    fakePrisma.transactionExternalRef.createMany.mockImplementationOnce((args) => {
+      store.transactions = store.transactions.filter((t) => t.id !== gone.id);
+      return real(args);
+    });
+
+    await expect(
+      confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [], payment: null }), account: card }),
+    ).resolves.toBeDefined();
+
+    expect(refsOf(kept.id)).toHaveLength(1);
+    expect(store.refs).toHaveLength(1);
+  });
+
   it('records the refs of lines the generic importer already stored', async () => {
     const legacy = seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', amount: 40, date: '2026-09-25', description: 'Livraria Nova' });
 
@@ -689,7 +820,8 @@ describe('card OFX import: a month without sheet rows', () => {
     const newLine = preview.lines.find((l) => l.memo === 'Loja Nova - Parcela 1/3')!;
     const plan = store.transactions
       .filter((t) => t.installmentId === 'ofx:fit-new')
-      .map((t) => [t.installmentNumber, t.date, t.description, t.sourceRef, t.amount]);
+      .map((t) => [t.installmentNumber, t.date, t.description, t.sourceRef, t.amount] as const)
+      .sort((a, b) => a[0]! - b[0]!);
     expect(plan).toEqual([
       [1, '2026-11-05', 'Loja Nova - Parcela 1/3', newLine.ref, 70],
       [2, '2026-12-01', 'Loja Nova - Parcela 2/3', `${newLine.ref}:f1`, 70],
@@ -733,6 +865,69 @@ describe('card OFX import: a month without sheet rows', () => {
     expect(fakeServices.updateTransaction).not.toHaveBeenCalled();
     expect(fakePrisma.$transaction).toHaveBeenCalledTimes(1);
     expect(tx('fut-a4')).toMatchObject({ amount: 50, date: '2026-11-03' });
+  });
+
+  it('skips the group, and drops its refs, when the future was deleted after the claim', async () => {
+    tx('fut-a4').paid = false;
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const consume = preview.proposals.find((p) => p.target?.transactionId === 'fut-a4')!;
+    fakeServices.updateTransaction.mockRejectedValueOnce(Object.assign(new Error('Transaction not found'), { statusCode: 404, code: 'NOT_FOUND' }));
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: [consume.group], payment: null }),
+      account: card,
+    });
+
+    expect(result).toMatchObject({ consumedFutures: 0, skipped: 1 });
+    expect(store.refs).toEqual([]);
+  });
+
+  const storedPlan = () =>
+    store.transactions
+      .filter((t) => t.installmentId === 'ofx:fit-new')
+      .map((t) => t.installmentNumber)
+      .sort();
+
+  it('regenerates the missing future installments when a failure stops the creation halfway', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const create = preview.proposals.find((p) => p.kind === 'create' && p.futureInstallments === 2)!;
+    const real = fakeServices.createTransaction.getMockImplementation()!;
+    fakeServices.createTransaction.mockImplementationOnce(real).mockRejectedValueOnce(new Error('db blip')); // future 2, then future 3 fails
+
+    await expect(
+      confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [create.group], payment: null }), account: card }),
+    ).rejects.toThrow('db blip');
+    expect(storedPlan()).toEqual([2]); // the line is not there, so its group still exists
+
+    const retry = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const again = retry.proposals.find((p) => p.kind === 'create' && p.refs.includes(create.refs[0]!))!;
+    expect(again.futureInstallments).toBe(1);
+    const result = await confirmCardOfxImport({ request: confirmRequest(retry, { selectedGroups: [again.group], payment: null }), account: card });
+
+    expect(result).toMatchObject({ created: 1, futureInstallments: 1 });
+    expect(storedPlan()).toEqual([1, 2, 3]);
+  });
+
+  it('does not duplicate the future installments when only the line failed', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const create = preview.proposals.find((p) => p.kind === 'create' && p.futureInstallments === 2)!;
+    const real = fakeServices.createTransaction.getMockImplementation()!;
+    fakeServices.createTransaction
+      .mockImplementationOnce(real)
+      .mockImplementationOnce(real)
+      .mockRejectedValueOnce(new Error('db blip')); // both futures stored, the line fails
+
+    await expect(
+      confirmCardOfxImport({ request: confirmRequest(preview, { selectedGroups: [create.group], payment: null }), account: card }),
+    ).rejects.toThrow('db blip');
+    expect(storedPlan()).toEqual([2, 3]);
+
+    const retry = await buildCardOfxPreview({ account: card, buffer: NOV_OFX() });
+    const again = retry.proposals.find((p) => p.kind === 'create' && p.refs.includes(create.refs[0]!))!;
+    expect(again.futureInstallments).toBe(0);
+    await confirmCardOfxImport({ request: confirmRequest(retry, { selectedGroups: [again.group], payment: null }), account: card });
+
+    expect(storedPlan()).toEqual([1, 2, 3]);
   });
 
   it('marks a consumed future paid through the transaction service when it was unpaid', async () => {
