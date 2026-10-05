@@ -6,7 +6,7 @@ import { errorHandler } from '../../shared/errors/error-handler.js';
 import { requireEditor } from '../../shared/middleware/authorization.middleware.js';
 import { transactionRoutes } from '../transactions/transactions.routes.js';
 import * as transactionsService from '../transactions/transactions.service.js';
-import { resetStore, seedPerson, seedShare, seedTransaction } from './__fixtures__/people-fake-db.js';
+import { resetStore, seedPerson, seedSettlement, seedShare, seedTransaction } from './__fixtures__/people-fake-db.js';
 import { assertUpdateKeepsShares } from './shares.service.js';
 
 vi.mock('../../shared/db/prisma.js', async () => ({
@@ -58,7 +58,6 @@ describe('assertUpdateKeepsShares', () => {
     setup();
     await expect(assertUpdateKeepsShares(HH, TX, { type: 'EXPENSE' }, { amount: 70 })).resolves.toBeUndefined();
     await expect(assertUpdateKeepsShares(HH, TX, { type: 'EXPENSE' }, { amount: 500 })).resolves.toBeUndefined();
-    await expect(assertUpdateKeepsShares(HH, TX, { type: 'EXPENSE' }, { amount: -70 })).resolves.toBeUndefined();
   });
 
   it('refuses an amount below the shares they owe me, naming the sum', async () => {
@@ -168,5 +167,52 @@ describe('the internal service path is not guarded', () => {
       const source = readFileSync(new URL(`../transactions/${file}`, import.meta.url), 'utf8');
       expect(source).not.toContain('assertUpdateKeepsShares');
     }
+  });
+});
+
+describe('assertUpdateKeepsShares: round 2', () => {
+  it('compares the signed amount: a negative amount is below any share', async () => {
+    setup();
+    await expect(assertUpdateKeepsShares(HH, TX, { type: 'EXPENSE' }, { amount: -70 })).rejects.toEqual(error(/-70\.00.*Reduce the shares first/));
+    await expect(assertUpdateKeepsShares(HH, TX, { type: 'EXPENSE' }, { amount: -1000 })).rejects.toEqual(error(/lower than the shares/));
+    // without shares a negative amount is the transaction service's business
+    const bare = seedTransaction({ householdId: HH, amount: 10 });
+    await expect(assertUpdateKeepsShares(HH, bare.id, { type: 'EXPENSE' }, { amount: -5 })).resolves.toBeUndefined();
+  });
+
+  it('keeps the type a linked settlement needs: RECEIVED an income, PAID an expense', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 50 });
+    const expense = seedTransaction({ householdId: HH, type: 'EXPENSE', amount: 50 });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 50, direction: 'RECEIVED', transactionId: income.id });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 50, direction: 'PAID', transactionId: expense.id });
+
+    await expect(assertUpdateKeepsShares(HH, income.id, { type: 'INCOME' }, { type: 'EXPENSE' })).rejects.toEqual(error(/linked to a settlement you received.*stay an income.*Delete the settlement/));
+    await expect(assertUpdateKeepsShares(HH, expense.id, { type: 'EXPENSE' }, { type: 'INCOME' })).rejects.toEqual(error(/settlement you paid.*stay an expense/));
+    // a "change" to the same type, or an amount-only change, is fine
+    await expect(assertUpdateKeepsShares(HH, income.id, { type: 'INCOME' }, { type: 'INCOME', amount: 1 })).resolves.toBeUndefined();
+    await expect(assertUpdateKeepsShares(HH, expense.id, { type: 'EXPENSE' }, { amount: 1 })).resolves.toBeUndefined();
+  });
+
+  it('a settlement of another household does not hold the type', async () => {
+    const bia = seedPerson({ householdId: 'hh-2', name: 'Bia' });
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 50 });
+    seedSettlement({ householdId: 'hh-2', personId: bia.id, amount: 50, transactionId: income.id });
+    await expect(assertUpdateKeepsShares(HH, income.id, { type: 'INCOME' }, { type: 'EXPENSE' })).resolves.toBeUndefined();
+  });
+
+  it('PATCH refuses the type change of a settled transaction before updating', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    const income = seedTransaction({ id: TX, householdId: HH, type: 'INCOME', amount: 50 });
+    seedSettlement({ householdId: HH, personId: bia.id, amount: 50, transactionId: income.id });
+    vi.mocked(requireEditor).mockResolvedValue({} as never);
+    mockedGet.mockResolvedValue({ id: TX, householdId: HH, type: 'INCOME', amount: 50 } as never);
+    const app = Fastify({ logger: false });
+    app.setErrorHandler(errorHandler);
+    await app.register(transactionRoutes, { prefix: '/transactions' });
+    const res = await app.inject({ method: 'PATCH', url: `/transactions/${TX}`, payload: { type: 'EXPENSE' }, headers: { authorization: 'Bearer t' } });
+    await app.close();
+    expect(res.statusCode).toBe(400);
+    expect(mockedUpdate).not.toHaveBeenCalled();
   });
 });

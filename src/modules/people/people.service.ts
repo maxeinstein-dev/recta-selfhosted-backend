@@ -1,8 +1,8 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../shared/errors/app-error.js';
 import { storedDateString } from '../transactions/maxfin-import.helpers.js';
-import { buildLedger, computeBalance, type BalanceCents } from './balance.js';
-import { buildKeyRows, conflictOnUnique, labelKey, type Db } from './people.common.js';
+import { buildLedger, compareLedgerRows, computeBalance, type BalanceCents } from './balance.js';
+import { MAX_PEOPLE_PER_HOUSEHOLD, buildKeyRows, conflictOnUnique, labelKey, type Db } from './people.common.js';
 import type { LedgerEntryDto, LedgerPage, PersonBalanceDto, PersonDto } from './people.types.js';
 import { fromCents, storedToCents } from './money.js';
 
@@ -98,6 +98,9 @@ export async function createPerson(input: { householdId: string; name: string; a
   return conflictOnUnique(NAME_CONFLICT, () =>
     prisma.$transaction(async (tx) => {
       await assertKeysFree(tx, householdId, rows.map((r) => r.key));
+      if ((await tx.person.count({ where: { householdId } })) >= MAX_PEOPLE_PER_HOUSEHOLD) {
+        throw new BadRequestError(`A household can have at most ${MAX_PEOPLE_PER_HOUSEHOLD} people`);
+      }
       const person = await tx.person.create({ data: { householdId, name: rows[0]!.label } });
       await tx.personAlias.createMany({
         data: rows.map((r) => ({ householdId, personId: person.id, label: r.label, key: r.key, isName: r.isName })),
@@ -122,7 +125,9 @@ export async function updatePerson(
       if (input.name !== undefined || input.aliases !== undefined) {
         name = input.name ?? person.name;
         const aliases = input.aliases ?? current.filter((a) => !a.isName).map((a) => a.label);
-        const rows = buildKeyRows(name, aliases);
+        // A rename keeps answering to the old name (notes and sheets still say it); buildKeyRows drops it when it
+        // is only a change of case or accents
+        const rows = buildKeyRows(name, name === person.name ? aliases : [...aliases, person.name]);
         name = rows[0]!.label;
         await assertKeysFree(tx, householdId, rows.map((r) => r.key), personId);
         await tx.personAlias.deleteMany({ where: { personId } });
@@ -150,6 +155,9 @@ export type DeletePersonResult = { deleted: true } | { deleted: false; person: P
 export async function deletePerson(householdId: string, personId: string): Promise<DeletePersonResult> {
   return prisma.$transaction(async (tx) => {
     const person = await findPersonOrThrow(tx, householdId, personId);
+    // Row lock: a share or settlement being inserted for this person holds a key-share lock until it commits, so
+    // waiting for ours means the counts below see it (instead of the delete cascading it away)
+    await tx.$queryRaw`SELECT id FROM people WHERE id = ${personId}::uuid FOR UPDATE`;
     const [shares, settlements] = await Promise.all([
       tx.transactionShare.count({ where: { personId } }),
       tx.settlement.count({ where: { personId } }),
@@ -214,14 +222,21 @@ export async function listBalances(householdId: string): Promise<PersonBalanceDt
 
 const SETTLEMENT_LABEL = { RECEIVED: 'Acerto recebido', PAID: 'Acerto pago' } as const;
 
-function ledgerCursor(row: { kind: string; id: string }): string {
-  return `${row.kind}:${row.id}`;
+/** A cursor is the sort key of the last row returned (day|creation ms|id), so it still works if that row is deleted. */
+function ledgerCursor(row: { date: string; createdAt: number; id: string }): string {
+  return `${row.date}|${row.createdAt}|${row.id}`;
+}
+
+function parseLedgerCursor(cursor: string): { date: string; createdAt: number; id: string } {
+  const match = /^(\d{4}-\d{2}-\d{2})\|(\d{1,16})\|(.+)$/.exec(cursor);
+  if (!match) throw new BadRequestError('Invalid cursor');
+  return { date: match[1]!, createdAt: Number(match[2]), id: match[3]! };
 }
 
 /**
  * Timeline of a person: shares and settlements with the running balance, computed over the whole history in
  * chronological order (day, creation, id) and then paged. Newest first by default; `order: 'asc'` flips the list,
- * not the balances. The cursor is the key of the last row returned.
+ * not the balances. The cursor is the sort key of the last row returned: the next page is what comes after that position.
  */
 export async function getLedger(
   householdId: string,
@@ -283,9 +298,10 @@ export async function getLedger(
   const ordered = query.order === 'asc' ? chronological : [...chronological].reverse();
   let start = 0;
   if (query.cursor !== undefined) {
-    const at = ordered.findIndex((row) => ledgerCursor(row) === query.cursor);
-    if (at < 0) throw new BadRequestError('Invalid cursor');
-    start = at + 1;
+    const position = parseLedgerCursor(query.cursor);
+    const after = query.order === 'asc' ? (row: typeof position) => compareLedgerRows(row, position) > 0 : (row: typeof position) => compareLedgerRows(row, position) < 0;
+    const next = ordered.findIndex(after);
+    start = next < 0 ? ordered.length : next;
   }
   const page = ordered.slice(start, start + query.limit);
   const hasMore = start + query.limit < ordered.length;

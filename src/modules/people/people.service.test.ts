@@ -104,12 +104,13 @@ describe('people: create, list, update, delete', () => {
     const person = await createPerson({ householdId: HH, name: 'Bia', aliases: ['Biazinha'] });
 
     const renamed = await updatePerson(HH, person.id, { name: 'Beatriz' });
-    expect(renamed).toMatchObject({ name: 'Beatriz', aliases: ['Biazinha'] });
+    // the old name keeps answering
+    expect(renamed).toMatchObject({ name: 'Beatriz', aliases: ['Biazinha', 'Bia'] });
 
     const replaced = await updatePerson(HH, person.id, { aliases: ['Bê'] });
     expect(replaced).toMatchObject({ name: 'Beatriz', aliases: ['Bê'] });
 
-    // the old keys are free again
+    // the replaced aliases are free again
     await expect(createPerson({ householdId: HH, name: 'Biazinha' })).resolves.toMatchObject({ name: 'Biazinha' });
     await expect(createPerson({ householdId: HH, name: 'Bê' })).rejects.toEqual(error(409));
   });
@@ -543,6 +544,12 @@ describe('balances', () => {
   });
 });
 
+function cursorOf(entry: { date: string; id: string }): string {
+  // The cursor is the sort key of a row: day, creation time (the fake projects its sequence onto a fixed epoch) and id
+  const row = rowsOf('transactionShare').concat(rowsOf('settlement')).find((r) => r.id === entry.id)!;
+  return `${entry.date}|${1_700_000_000_000 + (row.createdAt as number)}|${entry.id}`;
+}
+
 describe('ledger', () => {
   async function history() {
     const bia = await createPerson({ householdId: HH, name: 'Bia' });
@@ -618,7 +625,7 @@ describe('ledger', () => {
     const desc = await getLedger(HH, bia.id, { limit: 50, order: 'desc' });
     const asc = await getLedger(HH, bia.id, { limit: 50, order: 'asc' });
     expect(asc.data.map((e) => e.id)).toEqual([...desc.data].reverse().map((e) => e.id));
-    const second = await getLedger(HH, bia.id, { limit: 2, order: 'asc', cursor: `${asc.data[1]!.kind}:${asc.data[1]!.id}` });
+    const second = await getLedger(HH, bia.id, { limit: 2, order: 'asc', cursor: cursorOf(asc.data[1]!) });
     expect(second.data.map((e) => e.balanceAfter)).toEqual(asc.data.slice(2, 4).map((e) => e.balanceAfter));
     // the last chronological balance is the person's balance
     const balance = (await listBalances(HH))[0]!.balance;
@@ -627,7 +634,182 @@ describe('ledger', () => {
 
   it('rejects a cursor that is not in the ledger, and a person of another household', async () => {
     const { bia } = await history();
-    await expect(getLedger(HH, bia.id, { limit: 5, order: 'desc', cursor: 'share:nope' })).rejects.toEqual(error(400, /cursor/));
+    await expect(getLedger(HH, bia.id, { limit: 5, order: 'desc', cursor: 'nope' })).rejects.toEqual(error(400, /cursor/));
     await expect(getLedger(OTHER, bia.id, { limit: 5, order: 'desc' })).rejects.toEqual(error(404));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 2: keys, caps, scoping, races, rename, cursor
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('names and keys', () => {
+  const COMBINING = '́';
+
+  it('rejects a name made only of combining marks (400, nothing written) on create and update', async () => {
+    await expect(createPerson({ householdId: HH, name: COMBINING })).rejects.toEqual(error(400, /letter or digit/));
+    await expect(createPerson({ householdId: HH, name: `${COMBINING}${COMBINING}`, aliases: ['Ok'] })).rejects.toEqual(error(400));
+    expect(rowsOf('person')).toHaveLength(0);
+    expect(rowsOf('personAlias')).toHaveLength(0);
+
+    const person = await createPerson({ householdId: HH, name: 'Bia' });
+    await expect(updatePerson(HH, person.id, { name: COMBINING })).rejects.toEqual(error(400, /letter or digit/));
+    expect((await listPeople(HH))[0]).toMatchObject({ name: 'Bia' });
+  });
+
+  it('skips an alias that normalizes to nothing instead of failing', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia', aliases: [COMBINING, 'Bi'] });
+    expect(person.aliases).toEqual(['Bi']);
+  });
+
+  it('rejects a name or alias whose normalized key exceeds the column (Hangul triples in NFD), without writing', async () => {
+    const long = '각'.repeat(40); // 40 characters, 120 once decomposed
+    await expect(createPerson({ householdId: HH, name: long })).rejects.toEqual(error(400, /too long once normalized/));
+    await expect(createPerson({ householdId: HH, name: 'Bia', aliases: [long] })).rejects.toEqual(error(400, /too long once normalized/));
+    expect(rowsOf('person')).toHaveLength(0);
+
+    const person = await createPerson({ householdId: HH, name: 'Bia' });
+    await expect(updatePerson(HH, person.id, { aliases: [long] })).rejects.toEqual(error(400));
+    expect((await listPeople(HH))[0]!.aliases).toEqual([]);
+    // 33 syllables = 99 characters of key still fit
+    await expect(createPerson({ householdId: HH, name: '각'.repeat(33) })).resolves.toMatchObject({ isActive: true });
+  });
+
+  it('caps the people of a household', async () => {
+    for (let i = 0; i < 500; i++) seedPerson({ householdId: HH, name: `Pessoa ${i}` });
+    await expect(createPerson({ householdId: HH, name: 'A mais' })).rejects.toEqual(error(400, /at most 500/));
+    await expect(createPerson({ householdId: OTHER, name: 'A mais' })).resolves.toMatchObject({ name: 'A mais' });
+  });
+
+  it('a rename keeps the old name as an alias, unless only the case or accents change', async () => {
+    const person = await createPerson({ householdId: HH, name: 'Bia', aliases: ['Biazinha'] });
+    const renamed = await updatePerson(HH, person.id, { name: 'Beatriz', aliases: ['Bê'] });
+    expect(renamed.aliases).toEqual(['Bê', 'Bia']);
+    // the old name still resolves, and it cannot be taken by somebody else
+    await expect(createPerson({ householdId: HH, name: 'bia' })).rejects.toEqual(error(409));
+
+    const same = await updatePerson(HH, person.id, { name: 'BEATRIZ' });
+    expect(same.aliases).toEqual(['Bê', 'Bia']);
+    expect(same.name).toBe('BEATRIZ');
+  });
+});
+
+describe('race guards', () => {
+  it('PUT shares locks the transaction row and splits the amount as it is under the lock', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    const rows = rowsOf('transaction');
+    // An update lands after the early checks and before the lock is taken
+    fakePrisma.$queryRaw.mockImplementationOnce(async () => {
+      rows.find((t) => t.id === tx.id)!.amount = 50;
+      return [{ amount: { toString: () => '50' }, type: 'EXPENSE' }];
+    });
+
+    await expect(
+      putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'exact', entries: [{ personId: bia.id, amount: 80 }] }),
+    ).rejects.toEqual(error(400, /more than the transaction amount/));
+    expect(rowsOf('transactionShare')).toHaveLength(0);
+
+    const sql = fakePrisma.$queryRaw.mock.calls[0]![0] as unknown as string[];
+    expect(sql.join('?')).toMatch(/FROM transactions WHERE id = \?::uuid FOR UPDATE/);
+    // taken inside the database transaction, before the shares are written
+    const orders = fakePrisma.$transaction.mock.invocationCallOrder;
+    expect(orders[orders.length - 1]!).toBeLessThan(fakePrisma.$queryRaw.mock.invocationCallOrder[0]!);
+  });
+
+  it('PUT shares answers with the amount it split, not the one it first read', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    fakePrisma.$queryRaw.mockImplementationOnce(async () => {
+      rowsOf('transaction').find((t) => t.id === tx.id)!.amount = 200;
+      return [{ amount: { toString: () => '200' }, type: 'EXPENSE' }];
+    });
+    const result = await putTransactionShares(HH, tx.id, { direction: 'THEY_OWE_ME', strategy: 'equal', entries: [{ personId: bia.id }] });
+    expect(result.shares[0]!.amount).toBe(100);
+    expect(result.transactionAmount).toBe(200);
+  });
+
+  it('deleting a person locks the row first, so a share committed meanwhile deactivates instead of cascading away', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    // the share lands while the delete waits for the lock
+    fakePrisma.$queryRaw.mockImplementationOnce(async () => {
+      seedShare({ householdId: HH, transactionId: tx.id, personId: bia.id, amount: 10 });
+      return [{ id: bia.id }];
+    });
+
+    const result = await deletePerson(HH, bia.id);
+
+    expect(result).toMatchObject({ deleted: false });
+    expect(rowsOf('person')).toHaveLength(1);
+    expect(rowsOf('transactionShare')).toHaveLength(1);
+    expect((fakePrisma.$queryRaw.mock.calls[0]![0] as unknown as string[]).join('?')).toMatch(/FROM people WHERE id = \?::uuid FOR UPDATE/);
+  });
+});
+
+describe('household scoping of every read (inconsistent rows of another household are ignored)', () => {
+  // The foreign key does not tie a row to its household, so each query filters by it; these rows would only
+  // exist through a bug, and must still never count here.
+  it('balances ignore shares and settlements stamped with another household', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const tx = seedTransaction({ householdId: HH, amount: 100 });
+    seedShare({ householdId: HH, transactionId: tx.id, personId: bia.id, amount: 10 });
+    seedShare({ householdId: OTHER, transactionId: tx.id, personId: bia.id, amount: 70, direction: 'I_OWE_THEM' });
+    seedSettlement({ householdId: OTHER, personId: bia.id, amount: 5 });
+
+    expect((await listBalances(HH))[0]).toMatchObject({ owedToMe: 10, iOwe: 0, received: 0, balance: 10, openShares: 1 });
+  });
+
+  it('the ledger ignores shares and settlements of another household, and transactions of another household', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const mine = seedTransaction({ householdId: HH, amount: 100, description: 'Minha' });
+    const foreign = seedTransaction({ householdId: OTHER, amount: 100, description: 'De fora' });
+    seedShare({ householdId: HH, transactionId: mine.id, personId: bia.id, amount: 10 });
+    seedShare({ householdId: HH, transactionId: foreign.id, personId: bia.id, amount: 30 }); // transaction of another household
+    seedShare({ householdId: OTHER, transactionId: mine.id, personId: bia.id, amount: 40 }); // stamped with another household
+    seedSettlement({ householdId: OTHER, personId: bia.id, amount: 5 });
+
+    const page = await getLedger(HH, bia.id, { limit: 50, order: 'asc' });
+
+    expect(page.data.map((e) => [e.description, e.amount])).toEqual([['Minha', 10]]);
+    expect(page.pagination.total).toBe(1);
+  });
+});
+
+describe('ledger cursor', () => {
+  it('continues from the position when the row it names was deleted', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    const days = ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'];
+    const shares = days.map((date) => seedShare({ householdId: HH, transactionId: seedTransaction({ householdId: HH, amount: 100, date }).id, personId: bia.id, amount: 10 }));
+    const first = await getLedger(HH, bia.id, { limit: 2, order: 'asc' });
+    expect(first.data.map((e) => e.date)).toEqual(['2026-10-01', '2026-10-02']);
+
+    // the last row of the first page is removed before the next page is asked for
+    const doomed = shares[1]!;
+    await fakePrisma.transaction.delete({ where: { id: doomed.transactionId as string } });
+    const second = await getLedger(HH, bia.id, { limit: 2, order: 'asc', cursor: first.pagination.nextCursor! });
+
+    expect(second.data.map((e) => e.date)).toEqual(['2026-10-03', '2026-10-04']);
+    expect(second.pagination.hasMore).toBe(false);
+  });
+
+  it('works the same newest first, and a cursor past the end gives an empty page', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    for (const date of ['2026-10-01', '2026-10-02', '2026-10-03']) {
+      seedShare({ householdId: HH, transactionId: seedTransaction({ householdId: HH, amount: 100, date }).id, personId: bia.id, amount: 10 });
+    }
+    const first = await getLedger(HH, bia.id, { limit: 2, order: 'desc' });
+    const second = await getLedger(HH, bia.id, { limit: 2, order: 'desc', cursor: first.pagination.nextCursor! });
+    expect(second.data.map((e) => e.date)).toEqual(['2026-10-01']);
+    const past = await getLedger(HH, bia.id, { limit: 2, order: 'desc', cursor: `2000-01-01|1|zzz` });
+    expect(past.data).toEqual([]);
+    expect(past.pagination).toEqual({ nextCursor: null, hasMore: false, total: 3 });
+  });
+
+  it('rejects a cursor that is not a position', async () => {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    for (const cursor of ['share:abc', '2026-10-01|x|y', '|1|2', '']) {
+      await expect(getLedger(HH, bia.id, { limit: 5, order: 'asc', cursor })).rejects.toEqual(error(400, /cursor/));
+    }
   });
 });

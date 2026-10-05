@@ -112,11 +112,23 @@ export async function putTransactionShares(
   transactionId: string,
   input: PutSharesInput,
 ): Promise<TransactionSharesResponse> {
-  const transaction = await loadTransaction(prisma, householdId, transactionId);
-  const result = await resolveSplit(prisma, householdId, transaction, input);
+  // Early answers (404, inactive person, bad split) without opening a transaction
+  const first = await loadTransaction(prisma, householdId, transactionId);
+  await resolveSplit(prisma, householdId, first, input);
 
-  await conflictOnUnique('The shares of this transaction changed meanwhile; try again', () =>
+  const transaction = await conflictOnUnique('The shares of this transaction changed meanwhile; try again', () =>
     prisma.$transaction(async (tx) => {
+      // Row lock, then compute against the amount as it is now: a concurrent amount update either finished before
+      // (and its new amount is what we split) or waits for this commit (its guard runs after our shares exist).
+      const locked = await tx.$queryRaw<Array<{ amount: { toString(): string }; type: string }>>`SELECT amount, type::text AS type FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
+      const row = locked[0];
+      if (!row) throw new NotFoundError('Transaction');
+      if (row.type !== 'INCOME' && row.type !== 'EXPENSE') {
+        throw new BadRequestError('Only income and expense transactions can be shared');
+      }
+      const current: TransactionFacts = { id: transactionId, type: row.type, amountCents: storedToCents(Number(row.amount.toString())) };
+      const result = await resolveSplit(tx, householdId, current, input);
+
       await tx.transactionShare.deleteMany({ where: { transactionId, direction: input.direction } });
       if (result.parts.length > 0) {
         await tx.transactionShare.createMany({
@@ -131,6 +143,7 @@ export async function putTransactionShares(
           })),
         });
       }
+      return current;
     }),
   );
   return buildResponse(prisma, householdId, transaction);
@@ -143,8 +156,13 @@ function formatReais(cents: number): string {
 /**
  * Guard for the user-facing transaction update (called by the route, never by transactions.service, so internal flows
  * such as the card OFX import or installment generation are not affected). A transaction that has shares cannot
- * get an amount below the sum of the shares of either direction, nor turn from an expense into an income.
- * @throws BadRequestError telling to reduce or remove the shares first.
+ * get an amount below the sum of the shares of either direction (the SIGNED amount is compared: a negative amount
+ * is below any share), nor turn from an expense into an income; one linked to a settlement keeps the type the
+ * settlement needs (RECEIVED an income, PAID an expense).
+ *
+ * The check and the update are two steps: a share written in between (PUT shares) locks the row and recomputes
+ * against the current amount, but an update that already passed this guard can still land after it.
+ * @throws BadRequestError telling to reduce or remove the shares, or to unlink the settlement, first.
  */
 export async function assertUpdateKeepsShares(
   householdId: string,
@@ -156,6 +174,21 @@ export async function assertUpdateKeepsShares(
   const typeChanges = change.type !== undefined && change.type !== current.type;
   if (!amountChanges && !typeChanges) return;
 
+  if (typeChanges) {
+    const settlement = await prisma.settlement.findFirst({
+      where: { householdId, transactionId },
+      select: { direction: true },
+    });
+    if (settlement) {
+      const needed = settlement.direction === 'RECEIVED' ? 'INCOME' : 'EXPENSE';
+      if (change.type !== needed) {
+        throw new BadRequestError(
+          `This transaction is linked to a settlement you ${settlement.direction === 'RECEIVED' ? 'received' : 'paid'}, so it must stay an ${needed.toLowerCase()}. Delete the settlement first.`,
+        );
+      }
+    }
+  }
+
   const shares = await prisma.transactionShare.findMany({
     where: { householdId, transactionId },
     select: { direction: true, amount: true },
@@ -166,7 +199,7 @@ export async function assertUpdateKeepsShares(
     throw new BadRequestError('This transaction has shares, so it cannot become an income. Remove the shares first.');
   }
   if (amountChanges) {
-    const newCents = Math.round(Math.abs(change.amount!) * 100);
+    const newCents = Math.round(change.amount! * 100);
     for (const direction of ['THEY_OWE_ME', 'I_OWE_THEM'] as const) {
       const sum = shares.filter((s) => s.direction === direction).reduce((total, s) => total + storedToCents(s.amount), 0);
       if (sum > newCents) {

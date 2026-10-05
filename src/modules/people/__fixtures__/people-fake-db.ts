@@ -242,6 +242,20 @@ export const fakePrisma = {
   settlement: table('settlement'),
   account: table('account'),
   category: table('category'),
+  /** The two row-lock reads the module makes (`SELECT ... FOR UPDATE`); no real locking, tests hook the call. */
+  $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql = strings.join('?');
+    if (!sql.includes('FOR UPDATE')) throw new Error(`Unexpected raw query: ${sql}`);
+    if (sql.includes('FROM transactions')) {
+      const row = store.transaction!.find((t) => t.id === values[0]);
+      return row ? [{ amount: { toString: () => String(row.amount) }, type: row.type }] : [];
+    }
+    if (sql.includes('FROM people')) {
+      const row = store.person!.find((t) => t.id === values[0]);
+      return row ? [{ id: row.id }] : [];
+    }
+    throw new Error(`Unexpected raw query: ${sql}`);
+  }),
   $transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
     const saved = snapshot();
     try {

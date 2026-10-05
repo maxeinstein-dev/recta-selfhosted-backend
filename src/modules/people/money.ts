@@ -11,7 +11,10 @@ export function toCents(value: number, label = 'Amount'): number {
   if (!Number.isFinite(value)) throw new BadRequestError(`${label} must be a number`);
   const scaled = value * 100;
   const cents = Math.round(scaled);
-  if (Math.abs(scaled - cents) > 1e-6) {
+  // The product carries float noise that grows with the magnitude (123456789.57 * 100 is off by ~1e-5): allow a few
+  // ulps, far below the half cent a real sub-cent value is off by.
+  const tolerance = Math.max(1e-6, Math.abs(scaled) * Number.EPSILON * 8);
+  if (Math.abs(scaled - cents) > tolerance) {
     throw new BadRequestError(`${label} must have at most 2 decimal places`);
   }
   return cents;

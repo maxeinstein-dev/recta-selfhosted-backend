@@ -1,5 +1,5 @@
 import { Prisma } from '../../generated/prisma/client.js';
-import { ConflictError } from '../../shared/errors/app-error.js';
+import { BadRequestError, ConflictError } from '../../shared/errors/app-error.js';
 import { normalizeLabel } from '../transactions/maxfin-import.helpers.js';
 
 /** The Prisma client or an interactive-transaction client: every helper works inside or outside a transaction. */
@@ -44,19 +44,42 @@ export interface KeyRow {
   isName: boolean;
 }
 
+/** `person_aliases.key` is VARCHAR(100); normalization can lengthen a label (NFD of Hangul triples it). */
+export const MAX_KEY_LENGTH = 100;
+/** A household's people: the free-text matcher and the alias scans are sized for this. */
+export const MAX_PEOPLE_PER_HOUSEHOLD = 500;
+
+/**
+ * The lookup key of a label, validated for storage: a name must keep at least one character once normalized
+ * (a name of combining marks only would be an empty key) and no key may exceed the column.
+ * @returns the key, or '' for an alias that normalizes to nothing (to be skipped).
+ * @throws BadRequestError
+ */
+export function assertKeyUsable(label: string, isName: boolean): string {
+  const key = labelKey(label.trim());
+  if (key === '') {
+    if (isName) throw new BadRequestError('The name must contain at least one letter or digit');
+    return '';
+  }
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new BadRequestError(`"${label.trim().slice(0, 40)}" is too long once normalized (limit ${MAX_KEY_LENGTH} characters)`);
+  }
+  return key;
+}
+
 /**
  * The lookup rows of a person: the name first, then the aliases, one per distinct key (an alias that repeats the
  * name or an earlier alias is dropped, not an error).
+ * @throws BadRequestError when the name has no usable key or a key is too long.
  */
 export function buildKeyRows(name: string, aliases: readonly string[]): KeyRow[] {
   const rows: KeyRow[] = [];
   const seen = new Set<string>();
   const add = (label: string, isName: boolean) => {
-    const trimmed = label.trim();
-    const key = labelKey(trimmed);
+    const key = assertKeyUsable(label, isName);
     if (key === '' || seen.has(key)) return;
     seen.add(key);
-    rows.push({ label: trimmed, key, isName });
+    rows.push({ label: label.trim(), key, isName });
   };
   add(name, true);
   for (const alias of aliases) add(alias, false);
