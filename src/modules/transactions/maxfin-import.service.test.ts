@@ -53,6 +53,12 @@ vi.mock('./transactions.service.js', () => ({
   payCreditCardInvoice: db.payCreditCardInvoice,
 }));
 vi.mock('../categories/categories.service.js', () => ({ createCategory: db.createCategory }));
+// Recurrence matching has its own tests (maxfin-import.recurring.test.ts); here no recurrence covers any month.
+vi.mock('./maxfin-recurring.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./maxfin-recurring.js')>()),
+  loadRecurringMatcher: async () => ({ take: () => undefined }),
+}));
+
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1595,7 +1601,7 @@ describe('buildMaxFinPreview on the sample sheet with nothing stored', () => {
     expect(preview.rows).toHaveLength(18);
     expect(preview.rows.every((row) => row.status === 'new')).toBe(true);
     expect(preview.rows.every((row) => row.statusDetail === null && row.existingTransactionId === null)).toBe(true);
-    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 4 });
+    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, matchesRecurring: 0, skipped: 4 });
     expect(preview.skipped).toHaveLength(4);
   });
 
@@ -1826,7 +1832,7 @@ describe('buildMaxFinPreview: rows that are already stored', () => {
 
     const preview = await previewSample();
 
-    expect(preview.totals).toEqual({ rows: 18, new: 14, duplicate: 2, changed: 2, legacyDuplicate: 0, skipped: 4 });
+    expect(preview.totals).toEqual({ rows: 18, new: 14, duplicate: 2, changed: 2, legacyDuplicate: 0, matchesRecurring: 0, skipped: 4 });
     expect(preview.sections.map((s) => [s.key, s.newCount, s.duplicateCount, s.changedCount])).toEqual([
       ['income', 1, 0, 1],
       ['bills', 2, 1, 0],
@@ -1970,7 +1976,7 @@ describe('buildMaxFinPreview: generated future installments', () => {
     const row = rowOf(preview, REF.lojaA);
     expect(row).toMatchObject({ status: 'replaces-future', existingTransactionId: 'ph-3' });
     expect(row.statusDetail).toMatch(/\b3\b/);
-    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, skipped: 4 });
+    expect(preview.totals).toEqual({ rows: 18, new: 18, duplicate: 0, changed: 0, legacyDuplicate: 0, matchesRecurring: 0, skipped: 4 });
     expect(preview.sections.find((s) => s.key === 'credit')).toMatchObject({ newCount: 11, duplicateCount: 0 });
     expect(preview.invoice).toMatchObject({ amount: 1916.5 });
   });

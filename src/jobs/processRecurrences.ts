@@ -25,37 +25,8 @@ import '../shared/config/env.js';
 
 import { prisma } from '../shared/db/prisma.js';
 import { AccountType } from '../shared/enums/index.js';
-import { executeRecurringTransaction } from '../modules/recurring-transactions/recurring-transactions.service.js';
-
-/**
- * Calculate next run date based on frequency
- */
-function calculateNextRunDate(
-  currentDate: Date,
-  frequency: 'DAILY' | 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY' | 'YEARLY'
-): Date {
-  const next = new Date(currentDate);
-
-  switch (frequency) {
-    case 'DAILY':
-      next.setDate(next.getDate() + 1);
-      break;
-    case 'WEEKLY':
-      next.setDate(next.getDate() + 7);
-      break;
-    case 'BIWEEKLY':
-      next.setDate(next.getDate() + 14);
-      break;
-    case 'MONTHLY':
-      next.setMonth(next.getMonth() + 1);
-      break;
-    case 'YEARLY':
-      next.setFullYear(next.getFullYear() + 1);
-      break;
-  }
-
-  return next;
-}
+import { anchorDayOf } from '../modules/recurring-transactions/recurring-dates.js';
+import { calculateNextRunDate, executeRecurringTransaction, occurrenceDateFor } from '../modules/recurring-transactions/recurring-transactions.service.js';
 
 /**
  * Process all due recurring transactions
@@ -97,12 +68,13 @@ async function processDueRecurringTransactions() {
 
     for (const recurring of dueRecurring) {
       try {
+        const occurrenceDate = occurrenceDateFor(recurring.frequency, recurring.nextRunAt, today);
         // REGRA DE NEGÓCIO: Idempotência - verificar se transação já existe
         const existingTransaction = await prisma.transaction.findFirst({
           where: {
             householdId: recurring.householdId,
             recurringTransactionId: recurring.id,
-            date: today,
+            date: occurrenceDate,
           },
         });
 
@@ -114,14 +86,14 @@ async function processDueRecurringTransactions() {
           skippedCount++;
           
           // Still update nextRunAt and lastRunDate to prevent reprocessing
-          const nextRunAt = calculateNextRunDate(today, recurring.frequency);
+          const nextRunAt = calculateNextRunDate(occurrenceDate, recurring.frequency, anchorDayOf(recurring.startDate));
           const shouldDeactivate = recurring.endDate && nextRunAt > new Date(recurring.endDate);
           
           await prisma.recurringTransaction.update({
             where: { id: recurring.id },
             data: { 
               nextRunAt,
-              lastRunDate: today,
+              lastRunDate: occurrenceDate,
               ...(shouldDeactivate && { isActive: false }),
             },
           });
@@ -149,7 +121,7 @@ async function processDueRecurringTransactions() {
 
         // Execute recurring transaction (creates transaction, updates balance if paid, and updates nextRunAt/lastRunDate)
         const result = await executeRecurringTransaction(recurring.id, recurring.householdId, {
-          date: today,
+          date: occurrenceDate,
           paid: shouldCreateAsPaid,
         });
 
@@ -163,6 +135,13 @@ async function processDueRecurringTransactions() {
             where: { id: recurring.id },
             data: { isActive: false },
           });
+        }
+
+        if (result.skipped) {
+          // The month already holds an occurrence of this recurrence (idempotency guard): nothing was created.
+          skippedCount++;
+          console.log(`[CronJob] ⏭️  Skipping recurring ${recurring.id} - the month already has its occurrence`);
+          continue;
         }
 
         processedCount++;

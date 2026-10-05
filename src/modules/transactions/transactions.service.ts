@@ -54,7 +54,11 @@ function calculateBalanceChange(amount: number, isIncome: boolean, accountType: 
  * @param input Transaction input data
  * @param userId Optional user ID - if provided, allows using personal accounts in shared household
  */
-export async function createTransaction(input: CreateTransactionInput, userId?: string) {
+export async function createTransaction(
+  input: CreateTransactionInput,
+  userId?: string,
+  hooks?: { inTransaction?: (tx: Prisma.TransactionClient, created: { id: string }) => Promise<void> }
+) {
   // householdId must be provided (resolved in routes via ensurePersonalHousehold)
   if (!input.householdId) {
     throw new BadRequestError('householdId is required');
@@ -448,6 +452,9 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
       }
     }
 
+    // Caller's writes that must commit (or roll back) together with the transaction
+    if (hooks?.inTransaction) await hooks.inTransaction(tx, transaction);
+
     return transaction;
   });
 
@@ -719,10 +726,19 @@ export async function listTransactions(query: ListTransactionsQuery) {
 /**
  * Update transaction
  */
+/** Server-side extras of an update (not part of the HTTP schema): the importer re-points the source of a row. */
+export type InternalUpdateTransactionInput = UpdateTransactionInput & { sourceRef?: string | null };
+
+/** Hooks of updateTransaction. `inTransaction` runs inside the same database transaction as the update. */
+export interface UpdateTransactionHooks {
+  inTransaction?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput
+  input: InternalUpdateTransactionInput,
+  hooks?: UpdateTransactionHooks
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
@@ -867,6 +883,7 @@ export async function updateTransaction(
         ...(input.installmentNumber !== undefined && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments !== undefined && { totalInstallments: input.totalInstallments }),
         ...(input.attachmentUrl !== undefined && { attachmentUrl: input.attachmentUrl }),
+        ...(input.sourceRef !== undefined && { sourceRef: input.sourceRef }),
       },
       include: {
         account: {
@@ -874,6 +891,8 @@ export async function updateTransaction(
         },
       },
     });
+
+    if (hooks?.inTransaction) await hooks.inTransaction(tx);
 
     // Recalculate credit card limit if transaction is on a credit card
     if (transaction.account?.type === AccountType.CREDIT) {
