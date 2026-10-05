@@ -2,10 +2,15 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildGroupId,
+  countSubsetSums,
+  MAX_GROUP_ID_LENGTH,
+  MAX_GROUP_REFS,
   parseGroupId,
   reconcileCardOfx,
   subsetSumMatches,
+  SUM_COUNT_BUDGET,
   SUM_MAX_CANDIDATES,
+  toCents,
   wordsOf,
   type ReconcileInput,
   type ReconcileProposal,
@@ -441,6 +446,50 @@ describe('reconcileCardOfx: sums', () => {
     expect(twoAggregates.sheetOnly.map((r) => r.description)).toEqual(['Total do mes']);
   });
 
+  it('is ambiguous when another subset exists outside the search window (16 eligible lines)', () => {
+    // The best 15 candidates hold only 2 + 3; the 16th (1) makes 1 + 4 another way to reach 5, 13 times over.
+    const amounts = [2, 3, ...Array<number>(13).fill(4), 1];
+    const lines = amounts.map((amount, i) => line(`u${i}`, 'Loja', -amount));
+
+    const [sum] = proposalsOf(run({ lines, sheetRows: [sheetRow('Zzz', 5)] }), 'enrich-sum');
+
+    expect(sum).toMatchObject({ ambiguous: true, defaultSelected: false });
+    expect(sum!.refs).toEqual(refsOf([lines[0]!, lines[1]!]));
+  });
+
+  it('is ambiguous for a real-shaped pool: the words pick one subset and two more lines hide a second', () => {
+    const own = [line('a1', 'Pastelaria Sigma', -38), line('a2', 'Pastelaria Sigma', -9)];
+    const fillers = Array.from({ length: 13 }, (_, i) => line(`o${i}`, `Loja ${i}`, -46)); // eligible, combine with nothing
+    const hidden = [line('h1', 'Banca Eta', -17), line('h2', 'Banca Teta', -30)]; // 17 + 30 = 47 too
+
+    const [sum] = proposalsOf(run({ lines: [...own, ...fillers, ...hidden], sheetRows: [sheetRow('Pastelaria', 47)] }), 'enrich-sum');
+
+    expect(sum).toMatchObject({ ambiguous: true, defaultSelected: false });
+    expect(sum!.refs).toEqual(refsOf(own));
+  });
+
+  it('stays selected when a pool larger than the window holds no other subset', () => {
+    const own = [line('a1', 'Pastelaria Sigma', -38), line('a2', 'Pastelaria Sigma', -9)];
+    const fillers = Array.from({ length: 14 }, (_, i) => line(`o${i}`, `Loja ${i}`, -46));
+
+    const [sum] = proposalsOf(run({ lines: [...own, ...fillers], sheetRows: [sheetRow('Pastelaria', 47)] }), 'enrich-sum');
+
+    expect(sum).toMatchObject({ ambiguous: false, defaultSelected: true });
+    expect(sum!.refs).toEqual(refsOf(own));
+  });
+
+  it('counts a pool larger than the window as ambiguous once the counting budget is spent', () => {
+    // 5,000.00 against 102 lines: 102 * 500,000 cells is over SUM_COUNT_BUDGET, so the count is not attempted.
+    expect(102 * 500_000).toBeGreaterThan(SUM_COUNT_BUDGET);
+    const own = [line('a1', 'Reforma Sigma', -3000), line('a2', 'Reforma Sigma', -2000)];
+    const fillers = Array.from({ length: 100 }, (_, i) => line(`o${i}`, `Loja ${i}`, -4999.99));
+
+    const [sum] = proposalsOf(run({ lines: [...own, ...fillers], sheetRows: [sheetRow('Reforma', 5000)] }), 'enrich-sum');
+
+    expect(sum).toMatchObject({ ambiguous: true, defaultSelected: false });
+    expect(sum!.refs).toEqual(refsOf(own));
+  });
+
   it('only sums purchases, never credits or payments', () => {
     const lines = [line('c1', 'Loja Chi', -20), line('c2', 'Estorno de "Loja Psi" (Loja Psi)', 10), line('c3', 'Loja Omega', -10)];
     const row = sheetRow('Total', 40);
@@ -479,6 +528,19 @@ describe('reconcileCardOfx: stored future installments', () => {
       }),
     ]);
     expect(proposalsOf(result, 'create')).toEqual([]);
+  });
+
+  it('lets one stored future be consumed once: a second line of the same N/M and amount is new', () => {
+    const first = line('fa', 'Loja Alfa - Parcela 4/10', -50);
+    const second = line('fb', 'Loja Alfa - Parcela 4/10', -50, '2026-11-04'); // another purchase, same shape
+    const future = futureOf('fut-4', 4, 10, 50);
+
+    const result = run({ lines: [first, second], futures: [future] });
+
+    expect(proposalsOf(result, 'consume-future')).toHaveLength(1);
+    expect(proposalsOf(result, 'consume-future')[0]!.target?.id).toBe('fut-4');
+    expect(proposalsOf(result, 'create')).toHaveLength(1);
+    expect(new Set(result.proposals.flatMap((p) => p.refs)).size).toBe(2);
   });
 
   it('accepts one cent of difference and no more', () => {
@@ -660,6 +722,34 @@ describe('reconcileCardOfx: payments', () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
+describe('countSubsetSums', () => {
+  it('counts the subsets of two values or more that reach the target, capped', () => {
+    expect(countSubsetSums([2, 3], 5)).toBe(1);
+    expect(countSubsetSums([2, 3, 1, 4], 5)).toBe(2); // 2+3 and 1+4
+    expect(countSubsetSums([1, 1, 1, 1, 1, 1], 3, 2)).toBe(2); // 20 subsets, capped at 2
+    expect(countSubsetSums([1, 1, 1, 1, 1, 1], 3, 100)).toBe(20);
+  });
+
+  it('ignores a value equal to the target (a subset of one) and values above it', () => {
+    expect(countSubsetSums([5, 2, 3], 5)).toBe(1);
+    expect(countSubsetSums([5, 7], 5)).toBe(0);
+    expect(countSubsetSums([], 5)).toBe(0);
+  });
+
+  it('agrees with subsetSumMatches on random inputs', () => {
+    let seed = 99;
+    const next = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let i = 0; i < 200; i++) {
+      const values = Array.from({ length: 2 + next(12) }, () => 1 + next(9));
+      const target = 3 + next(14);
+      expect(countSubsetSums(values, target, 1_000_000), values.join(',')).toBe(subsetSumMatches(values, target).count);
+    }
+  });
+});
+
 describe('subsetSumMatches', () => {
   it('counts every subset of two values or more and returns the one that keeps the earliest values', () => {
     expect(subsetSumMatches([10, 20, 15, 15], 30)).toEqual({ count: 2, best: [0, 1] });
@@ -674,6 +764,38 @@ describe('subsetSumMatches', () => {
 
   it('refuses more than SUM_MAX_CANDIDATES values', () => {
     expect(() => subsetSumMatches(Array.from({ length: SUM_MAX_CANDIDATES + 1 }, () => 1), 2)).toThrow();
+  });
+});
+
+describe('group id size', () => {
+  const LONG_FITID = 'x'.repeat(64);
+
+  it('splits a purchase with more lines than a group may list, keeping every id under the cap', () => {
+    const lines = Array.from({ length: 1000 }, (_, i) => line(LONG_FITID, `Loja Fatiada ${i}`, -(1 + i / 100), '2026-09-15'));
+
+    const proposals = proposalsOf(run({ lines }), 'create');
+
+    expect(proposals.map((p) => p.refs.length)).toEqual([150, 150, 150, 150, 150, 150, 100]);
+    expect(proposals.every((p) => p.defaultSelected)).toBe(true);
+    expect(Math.max(...proposals.map((p) => p.group.length))).toBeLessThanOrEqual(MAX_GROUP_ID_LENGTH);
+    expect(new Set(proposals.flatMap((p) => p.refs)).size).toBe(1000);
+    for (const p of proposals) expect(parseGroupId(p.group)?.refs).toEqual(p.refs);
+  });
+
+  it('keeps the longest possible group id under the cap', () => {
+    const refs = Array.from({ length: MAX_GROUP_REFS }, (_, i) => `ofx:${LONG_FITID}:${String(i).padStart(8, '0')}`);
+
+    expect(buildGroupId('enrich-plan', refs, '00000000-0000-4000-8000-000000000000').length).toBeLessThan(MAX_GROUP_ID_LENGTH);
+  });
+
+  it('leaves a FITID with more lines than a group may list to the create proposals, never to a plan', () => {
+    const lines = Array.from({ length: MAX_GROUP_REFS + 1 }, (_, i) => line('big', 'Loja Grande', -1, `2026-09-${String(1 + (i % 28)).padStart(2, '0')}`, 1 + Math.floor(i / 28)));
+    const row = sheetRow('Loja Grande', MAX_GROUP_REFS + 1);
+
+    const result = run({ lines, sheetRows: [row] });
+
+    expect(proposalsOf(result, 'enrich-plan')).toEqual([]);
+    expect(proposalsOf(result, 'create').every((p) => p.group.length <= MAX_GROUP_ID_LENGTH)).toBe(true);
   });
 });
 
@@ -696,6 +818,114 @@ describe('group ids', () => {
 describe('wordsOf', () => {
   it('drops accents, case, short words, numbers and installment noise', () => {
     expect(wordsOf('Açaí da Praça - NuPay - Parcela 3/10')).toEqual(new Set(['acai', 'praca']));
+  });
+});
+
+describe('properties (seeded fuzz)', () => {
+  const NAMES = ['Padaria', 'Mercado Livre', 'Posto Shell', 'Farmacia', 'Uber', 'Pastelaria', 'Combustivel', 'Loja X'];
+
+  function generator(seed: number) {
+    let state = seed;
+    const random = () => (state = (state * 1664525 + 1013904223) % 4294967296) / 4294967296;
+    return { random, int: (n: number) => Math.floor(random() * n) };
+  }
+
+  it('never double-uses a line or a row, matches a cent only with equal N/M, and never selects an ambiguous sum', () => {
+    const { random, int } = generator(12345);
+    let selectedSums = 0;
+    for (let iteration = 0; iteration < 250; iteration++) {
+      const count = 5 + int(26);
+      const lines: CardOfxStatementLine[] = [];
+      for (let i = 0; i < count; i++) {
+        const r = random();
+        const amount = (1 + int(6)) * (random() < 0.2 ? 1.01 : 1);
+        const kind = r < 0.8 ? 'purchase' : r < 0.9 ? 'refund' : 'discount';
+        const installment = kind === 'purchase' && random() < 0.4 ? { number: 1 + int(4), total: 4 + int(3) } : null;
+        const name = NAMES[int(NAMES.length)]!;
+        const memo = kind === 'discount' ? 'Desconto Antecipação' : installment ? `${name} - Parcela ${installment.number}/${installment.total}` : name;
+        const date = `2026-09-${String(1 + int(28)).padStart(2, '0')}`;
+        const signed = Math.round((kind === 'purchase' ? -amount : amount) * 100) / 100;
+        const fitid = `f${int(Math.max(2, count / 2))}`;
+        lines.push({
+          ref: cardOfxRef(fitid, memo, signed, date, 1 + i),
+          fitid,
+          date,
+          amount: Math.abs(signed),
+          type: kind === 'purchase' ? 'EXPENSE' : 'INCOME',
+          kind,
+          memo,
+          merchant: name,
+          installment,
+        });
+      }
+      const rows: StoredCardRow[] = Array.from({ length: int(count) }, (_, i) => {
+        const installment = random() < 0.4 ? { number: 1 + int(4), total: 4 + int(3), prepaid: random() < 0.3 ? 1 + int(2) : 0 } : null;
+        const name = NAMES[int(NAMES.length)]!;
+        return storedRow({
+          id: `s${i}`,
+          description: installment ? `${name} ${installment.number}/${installment.total}${installment.prepaid ? ` +${installment.prepaid}` : ''}` : name,
+          amount: Math.round((1 + int(12)) * (random() < 0.15 ? 1.01 : 1) * 100) / 100,
+          type: random() < 0.9 ? 'EXPENSE' : 'INCOME',
+          installmentNumber: installment?.number ?? null,
+          totalInstallments: installment?.total ?? null,
+        });
+      });
+      const futures = Array.from({ length: int(4) }, (_, i) => {
+        const total = 4 + int(3);
+        return storedRow({
+          id: `fu${i}`,
+          description: `Loja X ${1 + int(4)}/${total}`,
+          amount: 1 + int(6),
+          date: '2026-11-01',
+          installmentId: `p${i}`,
+          installmentNumber: 1 + int(4),
+          totalInstallments: total,
+        });
+      });
+
+      const result = run({ lines, sheetRows: rows, futures });
+
+      const refs = result.proposals.flatMap((p) => p.refs);
+      const targets = result.proposals.flatMap((p) => (p.target ? [p.target.id] : []));
+      expect(new Set(refs).size, `iteration ${iteration}: a line is in two proposals`).toBe(refs.length);
+      expect(new Set(targets).size, `iteration ${iteration}: a row is in two proposals`).toBe(targets.length);
+      lines.forEach((l, i) => {
+        if (result.lines[i]!.status === 'proposed') expect(refs, `iteration ${iteration}: orphan line`).toContain(l.ref);
+      });
+      for (const [index, p] of result.proposals.entries()) {
+        if (p.kind === 'enrich-sum' && p.ambiguous) expect(p.defaultSelected, `iteration ${iteration}: ambiguous but selected`).toBe(false);
+        if (p.kind === 'enrich-exact') {
+          const target = p.target!;
+          const bank = lines.find((l) => l.ref === p.refs[0])!;
+          const difference = Math.abs(toCents(target.amount) - toCents(bank.amount));
+          expect(difference, `iteration ${iteration}: exact over a cent`).toBeLessThanOrEqual(1);
+          if (difference === 1) {
+            const same = bank.installment && target.installmentNumber === bank.installment.number && target.totalInstallments === bank.installment.total;
+            expect(same, `iteration ${iteration}: a cent without equal N/M`).toBeTruthy();
+          }
+          expect(target.type).toBe(bank.type);
+        }
+        if (p.kind === 'enrich-sum' && p.defaultSelected) {
+          // A selected sum is the only subset of two or more among all the purchases still free at that point.
+          selectedSums += 1;
+          const rowCents = toCents(p.target!.amount);
+          const earlier = new Set(result.proposals.slice(0, index).flatMap((q) => q.refs));
+          const pool = lines.filter((l) => l.kind === 'purchase' && toCents(l.amount) <= rowCents && !earlier.has(l.ref));
+          if (pool.length <= 16) {
+            const cents = pool.map((l) => toCents(l.amount));
+            let subsets = 0;
+            for (let mask = 1; mask < 1 << cents.length; mask++) {
+              if ((mask & (mask - 1)) === 0) continue;
+              let total = 0;
+              for (let bit = 0; bit < cents.length; bit++) if ((mask >> bit) & 1) total += cents[bit]!;
+              if (total === rowCents) subsets += 1;
+            }
+            expect(subsets, `iteration ${iteration}: a selected sum with ${subsets} subsets`).toBe(1);
+          }
+        }
+      }
+    }
+    expect(selectedSums).toBeGreaterThan(0); // the property is not vacuous
   });
 });
 

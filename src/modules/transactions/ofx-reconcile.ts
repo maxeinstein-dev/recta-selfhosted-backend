@@ -13,8 +13,8 @@
  *  3. exact, one to one: same type and amount, or one cent apart when both carry the same N/M (installment
  *     rounding; the sheet keeps its amount); ties go by equal N/M, then exact amount, then words in common;
  *  4. sum: a sheet expense equal to a subset of the remaining purchases (searched among at most 15 of them, those
- *     sharing words with the row first, then in file order; smaller rows first); more than one subset makes the
- *     proposal ambiguous (unselected);
+ *     sharing words with the row first, then in file order; smaller rows first); more than one subset anywhere in
+ *     the pool of remaining purchases makes the proposal ambiguous (unselected);
  *  5. stored future installment (sheet or earlier OFX), same N/M, amount within 1 cent: the real line consumes it;
  *     a prepayment's lines N+1..N+K consume the futures with those numbers (its discount is left to step 7);
  *  6. reversal: a purchase and a refund of the same amount and a similar merchant (unselected);
@@ -125,6 +125,18 @@ export const INSTALLMENT_ROUNDING_CENTS = 1;
 export const FUTURE_TOLERANCE_CENTS = 1;
 /** Candidate purchases searched per sheet row in the sum step (2^15 subsets at most). */
 export const SUM_MAX_CANDIDATES = 15;
+/**
+ * Work the whole reconciliation may spend counting the subsets of the full pool of purchases (one unit = one cell of
+ * the knapsack table). Past it, a sum whose pool is larger than the search window is reported ambiguous.
+ */
+export const SUM_COUNT_BUDGET = 40_000_000;
+/**
+ * Lines one proposal may cover. A group id lists its refs, so this bounds its length: 150 refs of at most 77
+ * characters (`ofx:` + a 64-character FITID + `:` + 8 hex) stay under MAX_GROUP_ID_LENGTH.
+ */
+export const MAX_GROUP_REFS = 150;
+/** Longest group id the confirm endpoint accepts. */
+export const MAX_GROUP_ID_LENGTH = 16_000;
 const MAX_NOTES_APPEND = 1000;
 
 const STOP_WORDS = new Set(['parcela', 'nupay']);
@@ -196,6 +208,26 @@ export function subsetSumMatches(values: readonly number[], target: number): { c
   const best: number[] = [];
   for (let bit = 0; bit < k; bit++) if ((bestMask >> bit) & 1) best.push(bit);
   return { count, best };
+}
+
+/**
+ * How many subsets of two values or more of `values` add up to `target`, counted up to `cap` (a 0/1 knapsack over
+ * the cents). Values equal to the target are only ever a subset of one, so they are left out; values above it never
+ * fit. The table costs about values.length * target cells.
+ */
+export function countSubsetSums(values: readonly number[], target: number, cap = 2): number {
+  const ways = new Uint8Array(target + 1);
+  ways[0] = 1;
+  let reach = 0;
+  for (const value of values) {
+    if (value >= target || value <= 0) continue;
+    reach = Math.min(target, reach + value);
+    for (let sum = reach; sum >= value; sum--) {
+      const total = ways[sum]! + ways[sum - value]!;
+      ways[sum] = total > cap ? cap : total;
+    }
+  }
+  return ways[target]!;
 }
 
 /** "1.234,56" with a sign: what a card line did to the invoice (purchases negative, credits positive). */
@@ -404,6 +436,7 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       const numbers = new Set(parts.map((s) => s.line.installment!.number));
       if (parts.length !== prepaid + 1 || numbers.size !== prepaid + 1) continue;
       const discounts = free.filter((s) => s.line.kind === 'discount');
+      if (parts.length + discounts.length > MAX_GROUP_REFS) continue;
       const net = parts.reduce((t, s) => t + s.cents, 0) - discounts.reduce((t, s) => t + s.cents, 0);
       if (Math.abs(net - row.cents) > PLAN_TOLERANCE_CENTS) continue;
       const score = sharedWordCount(row.words, unionWords(parts));
@@ -420,7 +453,7 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     let best: { states: LineState[]; score: number } | null = null;
     for (const group of fitGroups.values()) {
       const free = freeOf(group);
-      if (free.length < 2) continue;
+      if (free.length < 2 || free.length > MAX_GROUP_REFS) continue;
       const net = free.reduce((t, s) => t + (s.line.type === 'EXPENSE' ? s.cents : -s.cents), 0);
       if (net <= 0 || Math.abs(net - row.cents) > PLAN_TOLERANCE_CENTS) continue;
       const score = sharedWordCount(row.words, unionWords(free));
@@ -478,25 +511,39 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
 
   // 4. Sums: a sheet expense equal to a subset of the remaining purchases. Smaller rows go first: few lines can
   // make a small total, while a large one could absorb the lines of a small aggregate.
+  // The subset is searched among the best SUM_MAX_CANDIDATES lines, but it is only unique when no other subset of
+  // the whole pool of remaining purchases makes the same total: that is counted exactly while the budget lasts, and
+  // otherwise a pool larger than the window counts as ambiguous.
+  let countBudget = SUM_COUNT_BUDGET;
   const bySmallestAmount = [...sheet].sort((a, b) => a.cents - b.cents || a.index - b.index);
   for (const row of bySmallestAmount) {
     if (row.used || row.row.type !== 'EXPENSE') continue;
-    const candidates = lines
+    const pool = lines
       .filter((s) => s.status === 'free' && s.line.kind === 'purchase' && s.cents <= row.cents)
       .map((s) => ({ state: s, shared: sharedWordCount(row.words, s.words) }))
       .sort((a, b) => b.shared - a.shared || a.state.index - b.state.index)
-      .slice(0, SUM_MAX_CANDIDATES)
       .map((c) => c.state);
+    const candidates = pool.slice(0, SUM_MAX_CANDIDATES);
     if (candidates.length < 2 || candidates.reduce((t, s) => t + s.cents, 0) < row.cents) continue;
     const { count, best } = subsetSumMatches(
       candidates.map((s) => s.cents),
       row.cents,
     );
     if (!best) continue;
+    let ambiguous = count > 1;
+    if (!ambiguous && pool.length > candidates.length) {
+      const cost = pool.length * row.cents;
+      if (cost <= countBudget) {
+        countBudget -= cost;
+        ambiguous = countSubsetSums(pool.map((s) => s.cents), row.cents) > 1;
+      } else {
+        ambiguous = true;
+      }
+    }
     const states = best.map((i) => candidates[i]!);
     propose('enrich-sum', states, row, {
-      ambiguous: count > 1,
-      defaultSelected: count === 1,
+      ambiguous,
+      defaultSelected: !ambiguous,
       result: aggregateResult(states, row),
     });
   }
@@ -588,11 +635,15 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
   }
   for (const [fitid, group] of leftovers) {
     const plan = monthHasSheet ? null : futurePlan(fitid, group, lines, input.planNumbers);
-    propose('create', group.sort(byFileOrder), null, {
-      defaultSelected: !monthHasSheet,
-      futureNumbers: plan?.numbers ?? [],
-      futureBaseRef: plan?.baseRef ?? null,
-    });
+    group.sort(byFileOrder);
+    // A purchase with more lines than a group id can list (never seen in a real invoice) comes in several groups.
+    for (let start = 0; start < group.length; start += MAX_GROUP_REFS) {
+      propose('create', group.slice(start, start + MAX_GROUP_REFS), null, {
+        defaultSelected: !monthHasSheet,
+        futureNumbers: plan?.numbers ?? [],
+        futureBaseRef: plan?.baseRef ?? null,
+      });
+    }
   }
   const unpairedAdvances: ReconcileLine[] = [];
   for (const state of lines) {

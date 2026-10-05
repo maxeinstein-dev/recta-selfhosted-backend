@@ -13,6 +13,8 @@ import {
   resolveCardAccount,
 } from './card-ofx-import.service.js';
 import { categoryTargetSchema, maxfinMonthSchema, parseJsonField } from './maxfin-import.routes.js';
+import { MAX_GROUP_ID_LENGTH } from './ofx-reconcile.js';
+import { MAX_CARD_OFX_AMOUNT, MAX_CARD_OFX_FITID_LENGTH } from './parsers/ofx-card.parser.js';
 
 // Error shape mirrors the other import routes and the central error handler.
 const errorResponseSchema = {
@@ -46,9 +48,9 @@ export const cardOfxOptionsSchema = z.object({
 
 const cardOfxLineSchema = z.object({
   ref: z.string().min(1).max(120),
-  fitid: z.string().min(1).max(255),
+  fitid: z.string().min(1).max(MAX_CARD_OFX_FITID_LENGTH),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
-  amount: z.number().positive().max(1_000_000_000),
+  amount: z.number().positive().max(MAX_CARD_OFX_AMOUNT),
   type: typeSchema,
   kind: z.enum(['purchase', 'refund', 'discount', 'payment']),
   memo: z.string().min(1).max(255),
@@ -62,8 +64,8 @@ export const cardOfxConfirmBodySchema = z.object({
   accountId: z.string().uuid(),
   monthKey: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'monthKey must be YYYY-MM'),
   lines: z.array(cardOfxLineSchema).min(1).max(MAX_CARD_OFX_LINES),
-  // A group id is kind|sorted refs|target: one plan of up to 99 installments plus its discount fits.
-  selectedGroups: z.array(z.string().min(1).max(16_000)).max(MAX_CARD_OFX_LINES),
+  // A group id is kind|sorted refs|target and a proposal covers at most MAX_GROUP_REFS lines.
+  selectedGroups: z.array(z.string().min(1).max(MAX_GROUP_ID_LENGTH)).max(MAX_CARD_OFX_LINES),
   categoryMap: z
     .array(z.object({ key: z.string().max(255), type: typeSchema, target: categoryTargetSchema }))
     .max(MAX_CARD_OFX_LINES),
