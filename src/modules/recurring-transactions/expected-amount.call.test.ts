@@ -4,7 +4,8 @@ import { resetStore, seedAccount, seedRecurrence } from './__fixtures__/recurrin
 // The occurrence amount comes from expectedAmountFor, and it is asked for the month the occurrence COUNTS for
 // (its reference month), not the month of its date. Invented data only.
 const spy = vi.hoisted(() => ({ calls: [] as unknown[][] }));
-vi.mock('./expected-amount.js', () => ({
+vi.mock('./expected-amount.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./expected-amount.js')>()),
   expectedAmountFor: (...args: unknown[]) => {
     spy.calls.push(args);
     return (args[0] as { amount: number }).amount;

@@ -94,7 +94,7 @@ export async function loadRecurringMatcher(
 
   const recurrences = await prisma.recurringTransaction.findMany({
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
-    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true },
+    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, forecastStrategy: true, amount: true, competenceOffsetMonths: true },
   });
   // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
   // followLastAmountInTx): a sheet of a far future month must not consume it.
@@ -145,7 +145,8 @@ export async function loadRecurringMatcher(
         transactionId: null,
         recurringId: r.id,
         day: nextRun,
-        followLastAmount: r.followLastAmount,
+        // Only the LAST strategy takes over the sheet's value
+        followLastAmount: r.followLastAmount && (r.forecastStrategy ?? 'LAST') === 'LAST',
         endDate,
         anchorDay: anchorDayOf(r.startDate),
         amount: r.amount.toNumber(),

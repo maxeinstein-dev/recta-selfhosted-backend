@@ -20,7 +20,8 @@ const SPECS: Record<string, { unique: string[][]; defaults: () => Record<string,
   },
   recurringTransaction: {
     unique: [],
-    defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY', competenceOffsetMonths: null }),
+    defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY', competenceOffsetMonths: null,
+      forecastStrategy: 'LAST', forecastWindow: null, dailyRate: null, safetyBusinessDays: 0, nonWorkingDays: [], optionalHolidays: [] }),
   },
   account: { unique: [], defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING', name: 'Conta' }) },
   category: { unique: [], defaults: () => ({}) },
@@ -42,7 +43,7 @@ function prismaError(code: string, message: string): Error {
 
 function toStored(field: string, value: unknown): unknown {
   if (value instanceof Date) return dayString(value);
-  if (field === 'amount' && value !== null && typeof value === 'object') return Number(String(value));
+  if ((field === 'amount' || field === 'dailyRate') && value !== null && typeof value === 'object') return Number(String(value));
   return value;
 }
 
@@ -75,6 +76,7 @@ const decimal = (n: number) => ({ toNumber: () => n, toString: () => n.toFixed(2
 function project(row: Row, select?: Record<string, boolean>): Record<string, unknown> {
   const full: Record<string, unknown> = { ...row };
   if (typeof row.amount === 'number') full.amount = decimal(row.amount);
+  if (typeof row.dailyRate === 'number') full.dailyRate = decimal(row.dailyRate);
   for (const f of ['date', 'startDate', 'nextRunAt', 'endDate', 'lastRunDate']) {
     if (typeof row[f] === 'string') full[f] = new Date(`${row[f]}T00:00:00.000Z`);
   }
@@ -122,8 +124,8 @@ function sortRows(rows: Row[], orderBy: unknown): Row[] {
 function table(name: string) {
   const rows = () => store[name]!;
   return {
-    findMany: vi.fn(async (args: { where?: Where; select?: Record<string, boolean>; orderBy?: unknown; include?: Record<string, unknown> } = {}) =>
-      sortRows(rows().filter((r) => matches(r, args.where)), args.orderBy).map((r) => withInclude(project(r, args.select), r, args.include))),
+    findMany: vi.fn(async (args: { where?: Where; select?: Record<string, boolean>; orderBy?: unknown; include?: Record<string, unknown>; take?: number } = {}) =>
+      sortRows(rows().filter((r) => matches(r, args.where)), args.orderBy).slice(0, args.take).map((r) => withInclude(project(r, args.select), r, args.include))),
     findFirst: vi.fn(async (args: { where?: Where; select?: Record<string, boolean>; orderBy?: unknown; include?: Record<string, unknown> } = {}) => {
       const found = sortRows(rows().filter((r) => matches(r, args.where)), args.orderBy)[0];
       return found ? withInclude(project(found, args.select), found, args.include) : null;
@@ -323,6 +325,12 @@ export interface SeedRecurrence {
   followLastAmount?: boolean;
   endDate?: string | null;
   competenceOffsetMonths?: number | null;
+  forecastStrategy?: 'LAST' | 'FIXED' | 'CONSERVATIVE' | 'PER_BUSINESS_DAY';
+  forecastWindow?: number | null;
+  dailyRate?: number | null;
+  safetyBusinessDays?: number;
+  nonWorkingDays?: string[];
+  optionalHolidays?: string[];
 }
 
 export function seedRecurrence(data: SeedRecurrence): Row {
