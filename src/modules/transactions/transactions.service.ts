@@ -1881,6 +1881,60 @@ export function creditCardInvoiceWindow(year: number, month: number, closingDay:
   };
 }
 
+/** Today as a UTC date-only value, comparable with @db.Date columns (stored as UTC midnight). */
+export function utcToday(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+/** Ordinal (year * 12 + zero-based month) of an invoice month, used to order payments by the invoice they pay. */
+export function invoiceOrdinal(year: number, monthNum: number): number {
+  return year * 12 + (monthNum - 1);
+}
+
+/**
+ * Invoice ordinal of a payment tagged `invoice_pay:<cardId>:<YYYY>-<zero-based month>`; null when the transaction is
+ * not a payment of this card or its tag cannot be read.
+ */
+export function parseInvoicePaymentOrdinal(attachmentUrl: string | null | undefined, accountId: string): number | null {
+  const prefix = `invoice_pay:${accountId}:`;
+  if (!attachmentUrl?.startsWith(prefix)) return null;
+  const match = /^(\d{4})-(\d{1,2})$/.exec(attachmentUrl.slice(prefix.length));
+  if (!match) return null;
+  return Number(match[1]) * 12 + Number(match[2]);
+}
+
+/**
+ * Payments of a card split by the invoice they pay (their tag), not by the window their date falls in: a payment is
+ * dated on or after the closing day of its own invoice, so the date window never contains it. Payments dated after
+ * `today` (scheduled / imported for an upcoming due date) are not paid yet and are left out.
+ */
+export async function loadInvoicePayments(
+  client: Pick<Prisma.TransactionClient, 'transaction'>,
+  householdId: string,
+  accountId: string,
+  invoice: { year: number; monthNum: number },
+  today: Date
+) {
+  const rows = await client.transaction.findMany({
+    where: {
+      householdId,
+      attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
+      date: { lte: today },
+    },
+  });
+  const current = invoiceOrdinal(invoice.year, invoice.monthNum);
+  const previous: typeof rows = [];
+  const currentRows: typeof rows = [];
+  for (const row of rows) {
+    const ordinal = parseInvoicePaymentOrdinal(row.attachmentUrl, accountId);
+    if (ordinal === null) continue;
+    if (ordinal < current) previous.push(row);
+    else if (ordinal === current) currentRows.push(row);
+  }
+  const sum = (list: typeof rows) => list.reduce((total, t) => total + t.amount.toNumber(), 0);
+  return { previousTotal: sum(previous), currentTotal: sum(currentRows), currentRows };
+}
+
 /**
  * Calculate credit card invoice for a specific month.
  * `currentExpenses` is the card's net purchases in the invoice window, the figure comparable with the bank statement
@@ -1890,7 +1944,8 @@ export async function calculateCreditCardInvoice(
   accountId: string,
   month: string,
   householdId: string,
-  pagination?: { limit?: number; cursor?: string }
+  pagination?: { limit?: number; cursor?: string },
+  options?: { today?: Date }
 ) {
   // Verify account is a credit card
   const account = await prisma.account.findFirst({
@@ -1937,19 +1992,9 @@ export async function calculateCreditCardInvoice(
     }
   }, 0);
 
-  // Get all payment transactions before the invoice period
-  const previousPayments = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
-      date: { lt: invoiceStart },
-    },
-  });
-
-  const previousPaymentsTotal = previousPayments.reduce(
-    (sum, t) => sum + t.amount.toNumber(),
-    0
-  );
+  // Payments by the invoice they pay (tag), already paid as of today
+  const payments = await loadInvoicePayments(prisma, householdId, accountId, { year, monthNum }, options?.today ?? utcToday());
+  const previousPaymentsTotal = payments.previousTotal;
 
   // Calculate previous balance based on transactions
   // Previous balance = all net expenses (expenses - income) before this month - all payments before this month
@@ -2027,18 +2072,8 @@ export async function calculateCreditCardInvoice(
   const monthKey = `${year}-${monthNum - 1}`;
   const technicalIdentifier = `invoice_pay:${accountId}:${monthKey}`;
   
-  const currentPayments = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      attachmentUrl: technicalIdentifier,
-      date: { gte: invoiceStart, lte: invoiceEnd },
-    },
-  });
-
-  const currentPaymentsTotal = currentPayments.reduce(
-    (sum, t) => sum + t.amount.toNumber(),
-    0
-  );
+  const currentPayments = payments.currentRows;
+  const currentPaymentsTotal = payments.currentTotal;
 
   // Total invoice = previous balance + current net expenses (expenses - income) - current payments
   const invoiceTotal = previousBalance + currentNetExpenses - currentPaymentsTotal;
@@ -2187,18 +2222,14 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
       }
     }, 0);
 
-    const invoicePreviousPayments = await tx.transaction.findMany({
-      where: {
-        householdId: householdId!,
-        attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
-        date: { lt: invoiceMonthStart },
-      },
-    });
-
-    const invoicePreviousPaymentsTotal = invoicePreviousPayments.reduce(
-      (sum, t) => sum + t.amount.toNumber(),
-      0
+    const invoicePayments = await loadInvoicePayments(
+      tx,
+      householdId!,
+      accountId,
+      { year: invoiceYear, monthNum: invoiceMonthNum },
+      utcToday()
     );
+    const invoicePreviousPaymentsTotal = invoicePayments.previousTotal;
 
     // Calculate previous balance based on transactions
     // Previous balance = all expenses before this month - all payments before this month
@@ -2271,17 +2302,7 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
     }, 0);
 
     // Pagamentos já realizados nesta fatura (parcial ou total) — devem ser descontados do total
-    const invoiceCurrentPayments = await tx.transaction.findMany({
-      where: {
-        householdId: householdId!,
-        attachmentUrl: technicalIdentifier,
-        date: { gte: invoiceMonthStart, lte: invoiceMonthEnd },
-      },
-    });
-    const invoiceCurrentPaymentsTotal = invoiceCurrentPayments.reduce(
-      (sum, t) => sum + t.amount.toNumber(),
-      0
-    );
+    const invoiceCurrentPaymentsTotal = invoicePayments.currentTotal;
 
     // Total restante = saldo anterior + despesas líquidas do período (expenses - income) - pagamentos já feitos neste período
     const invoiceRemaining = Math.max(
@@ -2488,7 +2509,8 @@ export async function undoCreditCardPayment(
         householdId,
         date: {
           gte: monthStart,
-          lte: paymentTransaction.date,
+          // Never past the invoice's own window: the payment is dated on/after the closing day
+          lte: paymentTransaction.date < monthEnd ? paymentTransaction.date : monthEnd,
         },
         paid: true,
         attachmentUrl: { equals: null }, // Only purchases, not payments
