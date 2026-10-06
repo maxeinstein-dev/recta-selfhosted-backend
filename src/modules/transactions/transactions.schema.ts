@@ -158,6 +158,9 @@ export const listTransactionsQuerySchema = paginationSchema
     type: z.nativeEnum(TransactionType).optional(), // Now supports TRANSFER and ALLOCATION
     startDate: localDateSchema.optional(),
     endDate: localDateSchema.optional(),
+    // Inclusive range of planning months ('YYYY-MM'): rows whose reference month (else the month of the date) is in it
+    monthFrom: competenceMonthSchema.optional(),
+    monthTo: competenceMonthSchema.optional(),
     search: z.string().max(100).optional(),
     // paid=false lists the pending ones (forecasts waiting to be confirmed); paid=true the settled ones
     paid: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),

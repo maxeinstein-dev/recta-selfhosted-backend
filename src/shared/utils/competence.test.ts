@@ -4,6 +4,7 @@ import {
   addMonths,
   competenceWithinRange,
   effectiveMonth,
+  effectiveMonthRangeWhere,
   effectiveMonthWhere,
   monthDistance,
   monthOfDate,
@@ -104,5 +105,27 @@ describe('month arithmetic and the +-24 months rule', () => {
     expect(competenceWithinRange('2024-10', date)).toBe(true);
     expect(competenceWithinRange('2028-11', date)).toBe(false);
     expect(competenceWithinRange('2024-09', date)).toBe(false);
+  });
+});
+
+describe('effectiveMonthRangeWhere (monthFrom / monthTo)', () => {
+  it('selects rows whose effective month is inside the range, by reference month or by date', () => {
+    expect(idsIn(effectiveMonthRangeWhere('2026-10', '2026-11'))).toEqual([
+      'no-comp-in', 'no-comp-first', 'no-comp-last', 'no-comp-next', 'voucher', 'leaves-oct', 'same-month', 'back-dated',
+    ]);
+  });
+  it('a range of one month is the month filter', () => {
+    expect(idsIn(effectiveMonthRangeWhere('2026-10', '2026-10'))).toEqual(idsIn(effectiveMonthWhere('2026-10')));
+  });
+  it('a row dated in the range that refers outside it is out; one dated outside that refers inside is in', () => {
+    const ids = idsIn(effectiveMonthRangeWhere('2026-09', '2026-10'));
+    expect(ids).toContain('voucher');
+    expect(ids).not.toContain('leaves-oct');
+    expect(ids).not.toContain('no-comp-next');
+  });
+  it('monthOrRangeWhere takes monthFrom/monthTo (one of them alone is a single month) and month wins', () => {
+    expect(idsIn(monthOrRangeWhere({ monthFrom: '2026-10', monthTo: '2026-10' }))).toEqual(idsIn(effectiveMonthWhere('2026-10')));
+    expect(monthOrRangeWhere({ monthFrom: '2026-10' })).toEqual(monthOrRangeWhere({ monthFrom: '2026-10', monthTo: '2026-10' }));
+    expect(monthOrRangeWhere({ month: '2026-10', monthFrom: '2025-01', monthTo: '2027-01' })).toEqual(monthOrRangeWhere({ month: '2026-10' }));
   });
 });

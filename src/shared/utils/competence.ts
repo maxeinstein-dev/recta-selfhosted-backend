@@ -56,11 +56,27 @@ export function effectiveMonthWhere(month: string): { OR: Array<Record<string, u
 }
 
 /**
+ * `where` for "the transaction counts in a month between `from` and `to`" (both 'YYYY-MM', inclusive): the effective
+ * month is in the range. One month (from = to) is `effectiveMonthWhere`.
+ */
+export function effectiveMonthRangeWhere(from: string, to: string): { OR: Array<Record<string, unknown>> } {
+  const { start } = parseMonthFilter(from);
+  const { end } = parseMonthFilter(to);
+  return {
+    OR: [
+      { competenceMonth: { gte: from, lte: to } },
+      { competenceMonth: null, date: { gte: start, lte: end } },
+    ],
+  };
+}
+
+/**
  * `where` fragment of the "month or custom range" filters of the transaction endpoints: a month means the planning
  * month (effective month); an explicit startDate/endDate range stays a plain date range (cash view).
  */
-export function monthOrRangeWhere(f: { month?: string; startDate?: Date; endDate?: Date }): Record<string, unknown> {
+export function monthOrRangeWhere(f: { month?: string; monthFrom?: string; monthTo?: string; startDate?: Date; endDate?: Date }): Record<string, unknown> {
   if (f.month) return { AND: [effectiveMonthWhere(f.month)] };
+  if (f.monthFrom || f.monthTo) return { AND: [effectiveMonthRangeWhere(f.monthFrom ?? f.monthTo!, f.monthTo ?? f.monthFrom!)] };
   if (f.startDate || f.endDate) {
     const date: { gte?: Date; lte?: Date } = {};
     if (f.startDate) date.gte = f.startDate;

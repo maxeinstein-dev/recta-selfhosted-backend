@@ -648,6 +648,8 @@ export async function listTransactions(query: ListTransactionsQuery) {
     categoryName,
     type,
     month,
+    monthFrom,
+    monthTo,
     startDate,
     endDate,
     search,
@@ -657,7 +659,7 @@ export async function listTransactions(query: ListTransactionsQuery) {
   } = query;
 
   // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
-  const periodWhere = monthOrRangeWhere({ month, startDate, endDate });
+  const periodWhere = monthOrRangeWhere({ month, monthFrom, monthTo, startDate, endDate });
 
   // Build where clause
   const where: Prisma.TransactionWhereInput = {
