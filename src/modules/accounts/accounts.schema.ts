@@ -95,7 +95,7 @@ function localToday(): Date {
  */
 export const adjustBalanceSchema = z.object({
   newBalance: z.preprocess(
-    (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v) : v),
+    (v) => (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v) ? Number(v) : v),
     z
       .number({ invalid_type_error: 'newBalance must be a number' })
       .finite()
