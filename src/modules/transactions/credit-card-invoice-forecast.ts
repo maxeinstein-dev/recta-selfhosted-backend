@@ -158,7 +158,12 @@ export function buildForecast(
 
 type Client = Pick<Prisma.TransactionClient, 'recurringTransaction' | 'transaction'> & Partial<Pick<Prisma.TransactionClient, 'category'>>;
 
-/** Loads the card's active recurrences and the occurrences already generated, then builds the forecast. */
+/**
+ * Loads the card's active recurrences and the occurrences already generated, then builds the forecast.
+ * `today` is a UTC date-only 'YYYY-MM-DD' (the recurrence cron uses the server's local date, so late in the evening the
+ * two can differ by a day). Only the invoice asked for is forecast: the debt of a future invoice does not include the
+ * forecast of the invoices before it.
+ */
 export async function loadInvoiceForecast(
   client: Client,
   params: { householdId: string; accountId: string; dates: InvoiceDates; today: string; statementTotalCents: number },

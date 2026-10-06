@@ -111,6 +111,39 @@ describe('invoiceDates', () => {
   });
 });
 
+describe('invoiceDates on short months and equal closing/due days', () => {
+  const dates = (m: number, closing: number, due: number | null) => invoiceDates(creditCardInvoiceWindow(2026, m, closing), due);
+
+  it('closing 30 on February closes on Feb 28 (never Mar 2) and the windows stay continuous', () => {
+    expect(dates(2, 30, 9)).toMatchObject({ windowStart: '2026-01-30', windowEnd: '2026-02-27', closingDate: '2026-02-28', dueDate: '2026-03-09' });
+    expect(dates(3, 30, 9)).toMatchObject({ windowStart: '2026-02-28', windowEnd: '2026-03-29', closingDate: '2026-03-30' });
+  });
+
+  it('closing 31 on February and April closes on the last day of the month', () => {
+    expect(dates(2, 31, 9)).toMatchObject({ closingDate: '2026-02-28', windowStart: '2026-01-31', windowEnd: '2026-02-27' });
+    expect(dates(4, 31, 9)).toMatchObject({ closingDate: '2026-04-30', windowStart: '2026-03-31', windowEnd: '2026-04-29' });
+    expect(dates(5, 31, 9)).toMatchObject({ closingDate: '2026-05-31', windowStart: '2026-04-30', windowEnd: '2026-05-30' });
+  });
+
+  it('a leap February keeps day 29', () => {
+    expect(invoiceDates(creditCardInvoiceWindow(2028, 2, 30), 9).closingDate).toBe('2028-02-29');
+  });
+
+  it('every window starts the day the previous one closed (no gap, no overlap) for closing 28..31', () => {
+    for (const closing of [28, 29, 30, 31]) {
+      for (let m = 2; m <= 12; m += 1) {
+        const prev = invoiceDates(creditCardInvoiceWindow(2026, m - 1, closing), 9);
+        const cur = invoiceDates(creditCardInvoiceWindow(2026, m, closing), 9);
+        expect(cur.windowStart, `closing ${closing} month ${m}`).toBe(prev.closingDate);
+      }
+    }
+  });
+
+  it('closing day equal to the due day: the due date is the NEXT month (due is strictly after closing)', () => {
+    expect(dates(11, 9, 9)).toMatchObject({ closingDate: '2026-11-09', dueDate: '2026-12-09' });
+  });
+});
+
 describe('invoiceState', () => {
   it('is open until the closing date, then closed or paid', () => {
     expect(invoiceState('2026-11-02', '2026-11-01', false)).toBe('open');
@@ -310,6 +343,23 @@ describe('calculateCreditCardInvoice forecast', () => {
     seedNovember();
     expect((await invoice('2026-11', day('2026-11-01'))).state).toBe('open');
     expect((await invoice('2026-11', day('2026-11-02'))).state).toBe('closed');
+  });
+
+  it('a paid invoice owes 0 and a one-cent residue is neither debt nor outstanding of the next invoice', async () => {
+    store.tx = [
+      purchase('2026-07-10', 100),
+      purchase('2026-08-20', 50),
+      { ...purchase('2026-08-05', 99.99), attachmentUrl: `invoice_pay:${CARD.id}:2026-7` },
+    ];
+    const aug = await invoice('2026-08');
+    expect(aug.statementTotal).toBe(100);
+    expect(aug.isPaid).toBe(true);
+    expect(aug.state).toBe('paid');
+    expect(aug.debtTotal).toBe(0);
+    const sep = await invoice('2026-09');
+    expect(sep.outstandingFromPrevious).toBe(0);
+    expect(sep.statementTotal).toBe(50);
+    expect(sep.debtTotal).toBe(50);
   });
 
   it('keeps every legacy field of the response', async () => {
