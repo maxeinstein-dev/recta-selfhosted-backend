@@ -996,6 +996,8 @@ export async function buildCategoryResolver(householdId: string, entries: MaxFin
     } else if (target.kind === 'create') {
       const name = target.name.trim().slice(0, 100);
       if (!name) throw new BadRequestError(`Empty name for new category (key "${entry.key}")`);
+      // NOTE (behaviour): when a legacy custom category already has the same name as a system one, the system category wins
+      // for a `create` target (the custom one is only reached by choosing it explicitly, target kind `custom`).
       // A name equal to a system category of the type (ignoring case/accents) maps to that system category: creating a
       // custom one would be refused (409) halfway through the map, after other categories were already created.
       const system = (getCategoriesByType(entry.type as CategoryType) as CategoryName[]).find(

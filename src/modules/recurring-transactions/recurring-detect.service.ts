@@ -14,6 +14,7 @@ import {
 } from './detect.js';
 import { addMonthsClamped, daysInMonth, dayString, localDate, startDayFor } from './recurring-dates.js';
 import type { DetectApplyInput, DetectRecurringInput } from './recurring-transactions.schema.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 
 /** The slice of the Prisma client the detection reads from (the client itself, or a transaction's). */
 type DetectClient = Pick<Prisma.TransactionClient, 'account' | 'transaction' | 'recurringTransaction'>;
@@ -181,6 +182,7 @@ export async function applyDetectedRecurrences(
         const dayOfMonth = item.dayOfMonth ?? candidate.dayOfMonth;
         const amount = Math.round((item.amount ?? candidate.amount) * 100) / 100;
         const firstRun = firstRunDay(candidate, dayOfMonth);
+        await lockCustomCategory(tx, householdId, candidate.categoryName);
         const created = await tx.recurringTransaction.create({
           data: {
             householdId,

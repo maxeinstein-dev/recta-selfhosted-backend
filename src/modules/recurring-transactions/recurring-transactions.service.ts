@@ -469,6 +469,22 @@ export async function executeRecurringTransaction(
 
   // Create the actual transaction and update next run date
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // The category read above may have been merged since: lock the custom category the recurrence points at NOW (a merge
+    // holds it FOR UPDATE and re-points the recurrence), re-reading until the locked name is the stored one.
+    let categoryName = recurring.categoryName;
+    for (let attempt = 0; ; attempt++) {
+      const fresh = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { categoryName: true } });
+      if (!fresh) throw new NotFoundError('Recurring transaction');
+      categoryName = fresh.categoryName;
+      try {
+        await lockCustomCategory(tx, householdId, categoryName);
+      } catch (error) {
+        if (attempt >= 2) throw error;
+        continue;
+      }
+      const again = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { categoryName: true } });
+      if (again?.categoryName === categoryName || attempt >= 2) break;
+    }
     // Idempotency guard: a monthly recurrence has at most one occurrence per month. When the month already holds a
     // transaction of this recurrence (generated earlier, or taken over by an imported sheet row), nothing is created
     // and the recurrence just moves on. The check runs under a per-recurrence lock, so two executions (cron, manual,
@@ -496,9 +512,9 @@ export async function executeRecurringTransaction(
         householdId,
         type: transactionType,
         accountId: recurring.accountId,
-        categoryName: recurring.categoryName,
+        categoryName,
         amount: recurring.amount,
-        description: recurring.description || `Recurring: ${recurring.categoryName}`,
+        description: recurring.description || `Recurring: ${categoryName}`,
         date: transactionDate,
         notes: `Auto-generated from recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
         paid: isPaid,

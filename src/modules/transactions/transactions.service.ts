@@ -1327,6 +1327,9 @@ export async function batchCreateTransactions(input: BatchCreateTransactionsInpu
 
   // Execute batch creation
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Every distinct custom category is share-locked (ids sorted: a stable lock order) and must still exist.
+    const customNames = [...new Set(transactionsData.map((t: { categoryName: string }) => t.categoryName).filter((n: string) => isCustomCategoryName(n)))].sort() as string[];
+    for (const name of customNames) await lockCustomCategory(tx, householdId, name);
     const created = await tx.transaction.createMany({
       data: transactionsData.map((t: { accountId: string; categoryName: string; amount: number; description?: string; date: Date; notes?: string; paid: boolean; recurringTransactionId?: string; installmentId?: string; installmentNumber?: number; totalInstallments?: number; sourceRef?: string }) => {
         const isInc = isIncomeForCategory(t.categoryName);
