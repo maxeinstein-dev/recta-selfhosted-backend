@@ -193,4 +193,24 @@ describe('computeClosing', () => {
 
     expect(result).toMatchObject({ ofxTotal: 100, recordedTotal: 100, delta: 0, explained: true });
   });
+  it('counts an unpaired advance payment as recorded once its proposal is selected (and explains it)', () => {
+    const rows = [row('Mercado', 100, '2026-02-01')];
+    const lines = [line('a', 'Mercado Zeta', -100, '2026-02-10'), line('p', 'Pagamento recebido', 40, '2026-02-12'), line('q', 'Pagamento recebido', 900, '2026-02-06')];
+
+    const result = closing(lines, rows, rows, false, { paymentReference: 900 });
+
+    expect(result.components.advancePayments).toBe(-40);
+    expect(result).toMatchObject({ ofxTotal: 100, recordedTotal: 60, delta: 40, explained: true });
+  });
+
+  it('leaves a held-back advance payment out of the card total', () => {
+    const rows = [row('Mercado', 100, '2026-02-01')];
+    const credit = row('Pagamento', 40.03, '2026-02-01', { type: 'INCOME' });
+    const lines = [line('a', 'Mercado Zeta', -100, '2026-02-10'), line('p', 'Pagamento recebido', 40, '2026-02-12'), line('q', 'Pagamento recebido', 900, '2026-02-06')];
+
+    const result = closing(lines, [...rows, credit], [...rows, credit], false, { paymentReference: 900 });
+
+    expect(result.components.advancePayments).toBe(0);
+    expect(result.explained).toBe(true);
+  });
 });

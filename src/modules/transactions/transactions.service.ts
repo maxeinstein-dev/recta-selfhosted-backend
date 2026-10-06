@@ -2125,7 +2125,8 @@ export async function calculateCreditCardInvoice(
       currentExpenses: currentNetExpenses, // Net expenses (expenses - income)
       currentPayments: currentPaymentsTotal,
       total: Math.max(0, invoiceTotal),
-      isPaid: currentPaymentsTotal > 0 && invoiceTotal <= 0.01,
+      // Sums of cents drift in binary (0.01000000000793): compare in whole cents.
+      isPaid: currentPaymentsTotal > 0 && Math.round(invoiceTotal * 100) <= 1,
       paymentTransactions: currentPayments,
       invoiceTransactions: transactions.map(t => ({
         ...t,

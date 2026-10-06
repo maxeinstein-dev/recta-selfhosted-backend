@@ -350,6 +350,7 @@ describe('card OFX import: a month that has sheet rows', () => {
       created: 1,
       futureInstallments: 0,
       reversalsImported: 0,
+      advancePayments: 0,
       payment: { action: 'adjusted', transactionId: expect.any(String), amount: 1500, date: '2026-09-03' },
       skipped: 0,
       createdCategories: [],
@@ -1052,8 +1053,46 @@ describe('card OFX import: several "Pagamento recebido" lines', () => {
 
     expect(preview.payment).toMatchObject({ amount: 1000.5, invoiceMonthKey: '2026-07', proposal: 'create' });
     expect(preview.proposals.find((p) => p.target?.transactionId === advanceRow.id)).toMatchObject({ kind: 'enrich-exact' });
-    expect(preview.lines.find((l) => l.amount === 152.4)).toMatchObject({ status: 'payment', group: null });
-    expect(preview.warnings).toEqual([expect.stringContaining('Pagamento antecipado de R$ 152,40')]);
+    // The advance no sheet credit holds becomes a proposal, selected, a credit on the bank's day.
+    const advance = preview.proposals.find((p) => p.kind === 'advance-payment')!;
+    expect(advance).toMatchObject({ defaultSelected: true, target: null, reason: null });
+    expect(preview.lines.find((l) => l.amount === 152.4)).toMatchObject({ status: 'proposed', group: advance.group });
+    expect(preview.warnings).toEqual([]);
+    // Payments are not in the OFX total: the recorded credit shows up as the closing's advancePayments component.
+    expect(preview.closing.components.advancePayments).toBe(-(31 + 152.4));
+    expect(preview.closing.explained).toBe(true);
+  });
+
+  it('records the unpaired advance as a credit on the card with its ref, and a second confirm creates nothing', async () => {
+    const card = seedCard();
+    seedTransaction({ householdId: HH, accountId: CARD, amount: 600, date: '2026-07-01', description: 'Compras', sourceRef: 'maxfin:2026-07:credit:5' });
+    seedTransaction({ householdId: HH, accountId: CARD, amount: 400, date: '2026-07-01', description: 'Outras', sourceRef: 'maxfin:2026-07:credit:6' });
+    seedTransaction({ householdId: HH, accountId: CARD, amount: 77, date: '2026-08-01', description: 'Mercado', sourceRef: 'maxfin:2026-08:credit:5' });
+    seedTransaction({ householdId: HH, accountId: CARD, type: 'INCOME', amount: 31, date: '2026-08-01', description: 'Adiantamento', sourceRef: 'maxfin:2026-08:credit:6' });
+    const buffer = ofx(AUGUST, { start: '20260702', end: '20260802' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer });
+    const advance = preview.proposals.find((p) => p.kind === 'advance-payment')!;
+    const first = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: preview.proposals.filter((p) => p.defaultSelected).map((p) => p.group), payment: null }),
+      account: card,
+      userId: 'user-1',
+    });
+
+    expect(first.advancePayments).toBe(1);
+    const credit = store.transactions.find((t) => t.sourceRef === advance.refs[0])!;
+    expect(credit).toMatchObject({ accountId: CARD, type: 'INCOME', amount: 152.4, date: '2026-07-11', categoryName: 'OTHER_INCOME', description: 'Pagamento recebido', paid: true });
+    expect(store.refs.filter((r) => r.ref === advance.refs[0])).toHaveLength(1);
+
+    const again = await buildCardOfxPreview({ account: card, buffer });
+    expect(again.proposals.filter((p) => p.defaultSelected)).toEqual([]);
+    expect(again.lines.find((l) => l.amount === 152.4)).toMatchObject({ status: 'reconciled' });
+    expect(again.closing.components.advancePayments).toBe(-(31 + 152.4));
+    const count = store.transactions.length;
+    const second = await confirmCardOfxImport({ request: confirmRequest(again, { selectedGroups: [advance.group], payment: null }), account: card });
+    expect(second.advancePayments).toBe(0);
+    expect(second.skipped).toBe(1);
+    expect(store.transactions).toHaveLength(count);
   });
 });
 
@@ -1749,5 +1788,73 @@ describe('card OFX import: near amounts', () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(NEAR, OPTS) });
 
     expect(preview.warnings.some((w) => w.includes('já tem pagamento registrado'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The same statement again, and an updated one
+// ---------------------------------------------------------------------------
+
+describe('card OFX import: re-importing and updated statements', () => {
+  const OPEN: Trn[] = [
+    { fitid: 'u1', date: '20261005', amount: '-100.00', memo: 'Loja Alfa' },
+    { fitid: 'u2', date: '20261006', amount: '-40.00', memo: 'Loja Beta' },
+    { fitid: 'u3', date: '20261007', amount: '-25.50', memo: 'Loja Gama' },
+  ];
+  const opts = { start: '20261002', end: '20261102' };
+
+  async function importOnce(buffer: Buffer, card: ResolvedCardAccount, groups?: (p: CardOfxPreviewResponse) => string[]) {
+    const preview = await buildCardOfxPreview({ account: card, buffer });
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { selectedGroups: groups ? groups(preview) : preview.proposals.filter((p) => p.defaultSelected).map((p) => p.group), payment: null }),
+      account: card,
+    });
+    return { preview, result };
+  }
+
+  it('the same file twice: nothing proposed, nothing created, even forcing every group', async () => {
+    const card = seedCard();
+    const first = await importOnce(ofx(OPEN, opts), card);
+    expect(first.result.created).toBe(3);
+    const count = store.transactions.length;
+
+    const again = await importOnce(ofx(OPEN, opts), card, (p) => p.proposals.map((x) => x.group));
+
+    expect(again.preview.proposals).toEqual([]);
+    expect(again.preview.warnings).toEqual([]);
+    expect(again.result).toMatchObject({ created: 0, advancePayments: 0, enriched: 0 });
+    expect(store.transactions).toHaveLength(count);
+  });
+
+  it('an updated file: only the new lines are proposed, a vanished one is warned about and kept, a changed one is held back', async () => {
+    const card = seedCard();
+    await importOnce(ofx(OPEN, opts), card);
+    const before = store.transactions.length;
+    const updated: Trn[] = [
+      OPEN[0]!, // unchanged
+      { fitid: 'u2', date: '20261006', amount: '-40.03', memo: 'Loja Beta' }, // amount changed by cents: new ref, same FITID
+      // u3 vanished
+      { fitid: 'u4', date: '20261010', amount: '-12.00', memo: 'Loja Delta' }, // new
+      { fitid: 'u5', date: '20261011', amount: '-80.00', memo: 'Loja Epsilon - Parcela 1/4' }, // new installment plan
+    ];
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(updated, opts) });
+
+    const selected = preview.proposals.filter((p) => p.defaultSelected);
+    expect(selected.map((p) => p.refs.length)).toEqual([1, 1]);
+    expect(selected.map((p) => preview.lines.find((l) => l.ref === p.refs[0])!.fitid).sort()).toEqual(['u4', 'u5']);
+    const held = preview.proposals.find((p) => p.reason === 'changed-in-statement')!;
+    expect(held.counterpart).toMatchObject({ description: 'Loja Beta', amount: 40 });
+    expect(preview.lines.find((l) => l.fitid === 'u1')!.status).toBe('reconciled');
+    expect(preview.warnings).toEqual([expect.stringContaining('mudaram de valor'), expect.stringContaining('não aparece(m) mais neste arquivo')]);
+    expect(preview.warnings[1]).toContain('Loja Gama');
+    expect(preview.warnings[1]).not.toContain('Loja Beta');
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result.created).toBe(2);
+    // Nothing the user had is deleted: the vanished and the changed row both stay.
+    expect(store.transactions.filter((t) => ['Loja Gama', 'Loja Beta'].includes(t.description ?? ''))).toHaveLength(2);
+    expect(store.transactions).toHaveLength(before + 2 + (result.futureInstallments ?? 0));
   });
 });

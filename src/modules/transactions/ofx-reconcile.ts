@@ -30,7 +30,12 @@
  *     the row then adopts the bank amount;
  *  7. the rest of the OFX is new (grouped by FITID, selected in months without sheet rows, when the purchase date is
  *     before the earliest sheet month stored on the card, or when no sheet row of the month is left over); what is left of
- *     the month's sheet is reported, never deleted.
+ *     the month's sheet is reported, never deleted;
+ *  7b. a left-over purchase whose FITID (and installment number) is already tied to a row of the file's date range under
+ *     another ref (the updated statement changed its amount, date or memo) is held back as 'changed-in-statement';
+ *  8. advance payments: the "Pagamento recebido" lines that are neither the previous invoice's payment nor paired with a
+ *     sheet credit are real payments the card never recorded: one `advance-payment` proposal per line (a credit on the
+ *     card dated on the bank day), selected unless a sheet credit of the month is left over within 5 cents of it.
  */
 import { clampText, parseInstallment } from './parsers/maxfin.parser.js';
 import { fitidToken, type CardOfxStatementLine } from './parsers/ofx-card.parser.js';
@@ -69,7 +74,8 @@ export type ProposalKind =
   | 'enrich-near'
   | 'consume-future'
   | 'create'
-  | 'reversal';
+  | 'reversal'
+  | 'advance-payment';
 
 export const PROPOSAL_KINDS: readonly ProposalKind[] = [
   'enrich-exact',
@@ -82,6 +88,7 @@ export const PROPOSAL_KINDS: readonly ProposalKind[] = [
   'consume-future',
   'create',
   'reversal',
+  'advance-payment',
 ];
 
 export interface ReconcileInput {
@@ -120,6 +127,13 @@ export interface ReconcileInput {
    * linked to an OFX line). A neighbour match is selected by default only for those months.
    */
   neighbourStatementMonths?: ReadonlySet<string>;
+  /**
+   * Card rows tied to OFX lines (by ref) dated inside this file's date range whose refs are not among its lines: what a
+   * re-imported, updated statement no longer lists as it was (removed, or changed amount/date/memo, which changes the
+   * ref), within the statement's period. `fitids` are the FITID tokens of their refs. A left-over purchase with the same FITID and installment number
+   * is held back (`changed-in-statement`) instead of becoming a second copy.
+   */
+  vanished?: Array<{ row: StoredCardRow; fitids: string[] }>;
 }
 
 export interface ReconcileProposal {
@@ -163,7 +177,7 @@ export interface ReconcileResult {
   sheetOnly: StoredCardRow[];
   /** The previous invoice's payment, and a legacy card credit that already holds it (it would count twice). */
   payment: { line: ReconcileLine; legacyDuplicateId: string | null } | null;
-  /** Payment lines that are not the previous invoice's payment and paired with no sheet credit. */
+  /** Payment lines that are not the previous invoice's payment and paired with no sheet credit (each has an `advance-payment` proposal). */
   unpairedAdvances: ReconcileLine[];
   monthHasSheet: boolean;
   /** The merge search ran out of its work budget: some bank lines got no merge proposal. */
@@ -190,6 +204,8 @@ export const SUM_COUNT_BUDGET = 40_000_000;
 export const MAX_GROUP_REFS = 150;
 /** Longest group id the confirm endpoint accepts. */
 export const MAX_GROUP_ID_LENGTH = 16_000;
+/** A left-over sheet credit this close (cents) to an unpaired advance payment may be the same payment typed differently. */
+export const ADVANCE_LOOKALIKE_CENTS = 5;
 /** Sheet rows one bank line may merge (2 to 4). */
 export const MERGE_MIN_ROWS = 2;
 export const MERGE_MAX_ROWS = 4;
@@ -886,22 +902,43 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       const counterpart = history ? (residueRows.find((row) => part.some((s) => plausibleCounterpart(s, row))) ?? null) : null;
       // Selected: a month without sheet, history without a look-alike, or no sheet row left that could explain the
       // line (every row found its bank line, so what is left of the OFX is missing from Recta).
-      const selected = !monthHasSheet || (history && counterpart === null) || !sheetResidue;
+      let selected = !monthHasSheet || (history && counterpart === null) || !sheetResidue;
+      let reason: string | null = selected ? null : 'sheet-residue';
+      let heldCounterpart: StoredCardRow | null = selected ? null : counterpart;
+      // The same purchase (FITID and installment number) is already tied to a row of this period under another ref: the
+      // bank changed its amount, date or memo. A second copy would double it, so it is held back for the user.
+      const token = fitidToken(part[0]!.line.fitid);
+      const changed = (input.vanished ?? []).find(
+        (v) =>
+          v.fitids.includes(token) &&
+          v.row.type === part[0]!.line.type &&
+          (v.row.installmentNumber ?? null) === (part[0]!.line.installment?.number ?? null),
+      );
+      if (changed) {
+        selected = false;
+        reason = 'changed-in-statement';
+        heldCounterpart = changed.row;
+      }
       propose('create', part, null, {
         defaultSelected: selected,
-        reason: selected ? null : 'sheet-residue',
-        counterpart: selected ? null : counterpart,
+        reason,
+        counterpart: heldCounterpart,
         futureNumbers: plan?.numbers ?? [],
         futureBaseRef: plan?.baseRef ?? null,
       });
     }
   }
+  // 8. Advance payments no sheet credit took: a credit on the card (the payment reduces the debt), one per line.
   const unpairedAdvances: ReconcileLine[] = [];
   for (const state of lines) {
-    if (state.status === 'free' && state.advance) {
-      state.status = 'payment';
-      unpairedAdvances.push(state.line);
-    }
+    if (state.status !== 'free' || !state.advance) continue;
+    unpairedAdvances.push(state.line);
+    const lookAlike = sheet.find((r) => !r.used && r.row.type === 'INCOME' && Math.abs(r.cents - state.cents) <= ADVANCE_LOOKALIKE_CENTS);
+    propose('advance-payment', [state], null, {
+      defaultSelected: !lookAlike,
+      reason: lookAlike ? 'sheet-credit-near' : null,
+      counterpart: lookAlike?.row ?? null,
+    });
   }
 
   return {

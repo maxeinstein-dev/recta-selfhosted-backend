@@ -304,6 +304,10 @@ interface CardContext {
    * none of its purchases, so a payment for it would be recorded against nothing.
    */
   paymentBeforeSheet: boolean;
+  /** See ReconcileInput.vanished. */
+  vanished: Array<{ row: StoredCardRow; fitids: string[] }>;
+  /** Rows tied to OFX lines strictly inside the statement's period (preview only) that the file no longer lists. */
+  gone: Array<{ row: StoredCardRow; fitids: string[] }>;
 }
 
 /** Earliest invoice month ('YYYY-MM') with sheet rows (not generated futures) on the card; null when there is none. */
@@ -321,7 +325,12 @@ export async function loadEarliestSheetMonth(householdId: string, cardId: string
   return earliest;
 }
 
-async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, lines: CardOfxStatementLine[]): Promise<CardContext> {
+async function loadCardContext(
+  card: ResolvedCardAccount,
+  month: MaxFinMonth,
+  lines: CardOfxStatementLine[],
+  period?: { start: string; end: string },
+): Promise<CardContext> {
   const { householdId } = card;
   const key = monthKey(month);
   const previous = addMonths(month, -1);
@@ -401,6 +410,67 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
   const linkedTransactionIds = new Set(externalRefs.map((r) => r.transactionId));
   const ofxLinkedIds = new Set(externalRefs.filter((r) => r.ref.startsWith('ofx:')).map((r) => r.transactionId));
 
+  // Rows tied to OFX refs the file does not list. Never touched: they hold back look-alike new purchases (the same
+  // FITID and installment number under another ref: the statement changed the amount, date or memo) and feed a warning.
+  const fileRefs = new Set(refs);
+  const rowsByIds = async (ids: string[], range?: { gte: Date; lte: Date }) =>
+    new Map(
+      (
+        await prisma.transaction.findMany({
+          where: { householdId, accountId: card.id, attachmentUrl: null, id: { in: ids }, ...(range ? { date: range } : {}) },
+          select: CARD_ROW_SELECT,
+        })
+      ).map((t) => [t.id, t] as const),
+    );
+  const groupRefs = (tied: Array<{ ref: string; transactionId: string }>, records: Map<string, CardRowRecord>) => {
+    const byRow = new Map<string, { record: CardRowRecord; refs: string[] }>();
+    for (const t of tied) {
+      const record = records.get(t.transactionId);
+      if (!record) continue;
+      const entry = byRow.get(record.id) ?? { record, refs: [] };
+      entry.refs.push(t.ref);
+      byRow.set(record.id, entry);
+    }
+    const out: Array<{ row: StoredCardRow; fitids: string[] }> = [];
+    for (const { record, refs: rowRefs } of byRow.values()) {
+      if (rowRefs.some((r) => fileRefs.has(r))) continue;
+      const row = toStoredRow(record);
+      if (row) out.push({ row, fitids: rowRefs.map((r) => r.split(':')[1] ?? '') });
+    }
+    return out;
+  };
+  const tokens = Array.from(new Set(lines.filter((l) => l.kind !== 'payment').map((l) => fitidToken(l.fitid))));
+  const vanished: CardContext['vanished'] = [];
+  // Only inside the statement's own period (boundary days included): the lines of one plan (purchase, discount, refund)
+  // share a FITID across statements, so the same FITID elsewhere in time is not the same line.
+  if (tokens.length > 0 && period) {
+    const periodRange = { gte: parseLocalDateString(period.start), lte: parseLocalDateString(period.end) };
+    periodRange.lte.setHours(23, 59, 59, 999);
+    const sameFitid = await prisma.transactionExternalRef.findMany({
+      where: { householdId, OR: tokens.map((t) => ({ ref: { startsWith: `ofx:${t}:` } })) },
+      select: { ref: true, transactionId: true },
+    });
+    vanished.push(...groupRefs(sameFitid, await rowsByIds(Array.from(new Set(sameFitid.map((r) => r.transactionId))), periodRange)));
+  }
+  // What the warning lists: rows strictly inside the statement's period (the boundary days belong to two statements).
+  const gone: CardContext['vanished'] = [];
+  if (period) {
+    const first = parseLocalDateString(period.start);
+    first.setDate(first.getDate() + 1);
+    const last = parseLocalDateString(period.end);
+    last.setDate(last.getDate() - 2);
+    last.setHours(23, 59, 59, 999);
+    const inside = await prisma.transaction.findMany({
+      where: { householdId, accountId: card.id, attachmentUrl: null, date: { gte: first, lte: last } },
+      select: CARD_ROW_SELECT,
+    });
+    const tied = await prisma.transactionExternalRef.findMany({
+      where: { householdId, ref: { startsWith: 'ofx:' }, transactionId: { in: inside.map((t) => t.id) } },
+      select: { ref: true, transactionId: true },
+    });
+    gone.push(...groupRefs(tied, new Map(inside.map((t) => [t.id, t] as const))));
+  }
+
   const planIds = Array.from(new Set(lines.filter((l) => l.installment).map((l) => ofxPlanId(l.fitid))));
   const planNumbers = new Map<string, Set<number>>();
   if (planIds.length > 0) {
@@ -454,6 +524,7 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
       paymentReference,
       historyBefore,
       neighbourRows,
+      vanished,
       neighbourStatementMonths: new Set(
         neighbourRows
           .filter((row) => ofxLinkedIds.has(row.id))
@@ -462,6 +533,8 @@ async function loadCardContext(card: ResolvedCardAccount, month: MaxFinMonth, li
       ),
     },
     recordedPayments,
+    vanished,
+    gone,
     paymentBeforeSheet: recordedPayments.length === 0 && earliestSheetMonth !== null && monthKey(previous) < earliestSheetMonth,
   };
 }
@@ -751,7 +824,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     );
   }
 
-  const context = await loadCardContext(account, month, statement.lines);
+  const context = await loadCardContext(account, month, statement.lines, period);
   const result = reconcileCardOfx(context.input);
   const lineByRef = new Map(statement.lines.map((l) => [l.ref, l]));
 
@@ -798,7 +871,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       `${heldMerges.length} mesclagem(ns) de linhas da planilha vieram desmarcadas (ambígua, sem palavras em comum com a compra, ou categorias diferentes): confira antes de aplicar.`,
     );
   }
-  const lookAlikes = result.proposals.filter((p) => p.kind === 'create' && p.counterpart);
+  const lookAlikes = result.proposals.filter((p) => p.kind === 'create' && p.counterpart && p.reason !== 'changed-in-statement');
   if (lookAlikes.length > 0) {
     const rows = new Map(lookAlikes.map((p) => [p.counterpart!.id, p.counterpart!]));
     const listed = [...rows.values()].map((row) => `${row.description} (${formatBRL(row.amount)})`).join('; ');
@@ -817,9 +890,30 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       `Já existe no cartão um crédito "${line.memo}" de ${formatBRL(line.amount)} em ${formatDay(line.date)} (importação genérica): com o pagamento da fatura ele conta duas vezes; apague esse lançamento.`,
     );
   }
-  for (const advance of result.unpairedAdvances) {
+  const held = result.proposals.filter((p) => p.kind === 'create' && p.reason === 'changed-in-statement');
+  if (held.length > 0) {
     warnings.push(
-      `Pagamento antecipado de ${formatBRL(advance.amount)} em ${formatDay(advance.date)} não será importado: o Recta registra só o pagamento da fatura anterior.`,
+      `${held.length} compra(s) mudaram de valor, data ou descrição no OFX em relação ao que já foi importado e vieram desmarcadas para não duplicar: ` +
+        `${held.map((p) => `${p.counterpart!.description} (${formatBRL(p.counterpart!.amount)} em ${formatDay(p.counterpart!.date)} no Recta; ${formatBRL(lineByRef.get(p.refs[0]!)!.amount)} em ${formatDay(lineByRef.get(p.refs[0]!)!.date)} no OFX)`).slice(0, 5).join('; ')}. ` +
+        'Corrija o lançamento existente à mão (ou apague-o) antes de marcar a nova compra.',
+    );
+  }
+  const heldIds = new Set(held.map((p) => p.counterpart!.id));
+  const gone = context.gone.filter((v) => !heldIds.has(v.row.id));
+  if (gone.length > 0) {
+    const sum = netCents(gone.map((v) => ({ type: v.row.type, amount: v.row.amount }))) / 100;
+    warnings.push(
+      `${gone.length} lançamento(s) importado(s) de um OFX deste período não aparece(m) mais neste arquivo (saldo líquido ${formatBRL(sum)}): ` +
+        `${gone.slice(0, 5).map((v) => `${v.row.description} (${formatBRL(v.row.amount)} em ${formatDay(v.row.date)})`).join('; ')}. ` +
+        'O Recta não apaga nada sozinho: se a compra foi cancelada, apague o lançamento.',
+    );
+  }
+  const advanceProposals = result.proposals.filter((p) => p.kind === 'advance-payment');
+  const heldAdvances = advanceProposals.filter((p) => !p.defaultSelected);
+  if (heldAdvances.length > 0) {
+    const listed = heldAdvances.map((p) => `${formatBRL(lineByRef.get(p.refs[0]!)!.amount)} em ${formatDay(lineByRef.get(p.refs[0]!)!.date)}`).join('; ');
+    warnings.push(
+      `${heldAdvances.length} pagamento(s) antecipado(s) vieram desmarcados porque sobra na planilha um crédito de valor quase igual (${listed}): se for o mesmo pagamento, resolva a linha da planilha antes; se não, marque-o.`,
     );
   }
   const latestPayment = context.recordedPayments[0];
@@ -1250,6 +1344,9 @@ async function applyConsumeFuture(householdId: string, proposal: ReconcilePropos
   return true;
 }
 
+/** Category of an advance payment credit (the same the sheet gives its "Pagamento recebido" rows). */
+const ADVANCE_PAYMENT_CATEGORY = 'OTHER_INCOME';
+
 interface CreateContext {
   householdId: string;
   card: ResolvedCardAccount;
@@ -1265,7 +1362,7 @@ interface CreateContext {
  * A line whose ref is already used elsewhere is left alone (the transaction just created is removed again).
  * Returns how many were created.
  */
-async function createLines(ctx: CreateContext, refs: string[]): Promise<number> {
+async function createLines(ctx: CreateContext, refs: string[], fixedCategory?: string): Promise<number> {
   let created = 0;
   const ordered = [...refs].sort((a, b) => ctx.lineOrder.get(a)! - ctx.lineOrder.get(b)!);
   for (const ref of ordered) {
@@ -1278,7 +1375,7 @@ async function createLines(ctx: CreateContext, refs: string[]): Promise<number> 
           householdId: ctx.householdId,
           accountId: ctx.card.id,
           type: line.type === 'INCOME' ? TransactionType.INCOME : TransactionType.EXPENSE,
-          categoryName: ctx.categories.categoryNameFor(line),
+          categoryName: fixedCategory ?? ctx.categories.categoryNameFor(line),
           amount: line.amount,
           description: line.memo.slice(0, MAX_DESCRIPTION),
           date: parseLocalDateString(line.date),
@@ -1509,6 +1606,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   let created = 0;
   let futureInstallments = 0;
   let reversalsImported = 0;
+  let advancePayments = 0;
   for (const proposal of toApply) {
     switch (proposal.kind) {
       case 'enrich-exact':
@@ -1551,6 +1649,13 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
         else skipped += 1;
         break;
       }
+      case 'advance-payment': {
+        // A credit on the card on the bank's day: the debt drops, no bank account moves (the source is unknown).
+        const count = await createLines(createContext, proposal.refs, ADVANCE_PAYMENT_CATEGORY);
+        if (count > 0) advancePayments += count;
+        else skipped += 1;
+        break;
+      }
     }
   }
 
@@ -1572,6 +1677,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
     created,
     futureInstallments,
     reversalsImported,
+    advancePayments,
     payment,
     skipped,
     createdCategories: categories.created,

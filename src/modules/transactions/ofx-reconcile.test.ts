@@ -692,7 +692,7 @@ describe('reconcileCardOfx: payments', () => {
     expect(run({ lines: pays, paymentReference: null }).payment?.line.ref).toBe(pays[2]!.ref);
   });
 
-  it('pairs the other payments (advances) with sheet credits of the same amount, the rest staying information', () => {
+  it('pairs the other payments (advances) with sheet credits of the same amount, the rest becoming advance-payment proposals', () => {
     const credits = [sheetRow('Pagamento antecipado', 31, { type: 'INCOME' }), sheetRow('Adiantamento', 207.15, { type: 'INCOME' })];
 
     const result = run({ lines: pays, paymentReference: 1000, sheetRows: credits });
@@ -702,8 +702,39 @@ describe('reconcileCardOfx: payments', () => {
       [pays[3]!.ref, credits[1]!.id],
     ]);
     expect(result.unpairedAdvances.map((l) => l.ref)).toEqual([pays[1]!.ref]);
-    expect(result.lines.map((s) => s.status)).toEqual(['proposed', 'payment', 'payment', 'proposed']);
+    expect(result.lines.map((s) => s.status)).toEqual(['proposed', 'proposed', 'payment', 'proposed']);
     expect(result.proposals.some((p) => p.kind === 'create')).toBe(false);
+    const advance = proposalsOf(result, 'advance-payment');
+    expect(advance.map((p) => [p.refs, p.defaultSelected, p.target, p.reason])).toEqual([[[pays[1]!.ref], true, null, null]]);
+  });
+
+  it('proposes every advance no sheet credit took, and not the previous invoice payment', () => {
+    const result = run({ lines: pays, paymentReference: 1000 });
+
+    expect(proposalsOf(result, 'advance-payment').map((p) => p.refs[0]).sort()).toEqual([pays[0]!.ref, pays[1]!.ref, pays[3]!.ref].sort());
+    expect(result.payment?.line.ref).toBe(pays[2]!.ref);
+    expect(result.lines[2]!.status).toBe('payment');
+  });
+
+  it('holds an advance back when a left-over sheet credit is within 5 cents of it', () => {
+    const credit = sheetRow('Adiantamento', 207.12, { type: 'INCOME' });
+
+    const result = run({ lines: pays, paymentReference: 1000, sheetRows: [credit] });
+    const held = proposalsOf(result, 'advance-payment').find((p) => p.refs[0] === pays[3]!.ref)!;
+
+    expect(held.defaultSelected).toBe(false);
+    expect(held.reason).toBe('sheet-credit-near');
+    expect(held.counterpart?.id).toBe(credit.id);
+  });
+
+  it('is idempotent: an advance whose ref is recorded is reconciled, never proposed again', () => {
+    const known = new Map([[pays[0]!.ref, 'tx-a'], [pays[1]!.ref, 'tx-b'], [pays[3]!.ref, 'tx-c']]);
+
+    const result = run({ lines: pays, paymentReference: 1000, knownRefs: known });
+
+    expect(proposalsOf(result, 'advance-payment')).toEqual([]);
+    expect(result.unpairedAdvances).toEqual([]);
+    expect(result.lines.map((s) => s.status)).toEqual(['reconciled', 'reconciled', 'payment', 'reconciled']);
   });
 
   it('flags a legacy card credit that already holds the payment', () => {
@@ -1190,5 +1221,40 @@ describe('performance', () => {
 
     expect(proposalsOf(result, 'enrich-exact').length).toBeGreaterThanOrEqual(60);
     expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+describe('reconcileCardOfx: an updated statement (vanished rows)', () => {
+  const kept = line('k1', 'Loja Omega', -50, '2026-09-10');
+  const changed = line('c1', 'Loja Sigma', -30.05, '2026-09-11');
+
+  it('holds a new purchase back when the same FITID is already tied to a row under another ref', () => {
+    const old = storedRow({ id: 'old-c1', description: 'Loja Sigma', amount: 30, date: '2026-09-11' });
+
+    const result = run({ lines: [kept, changed], vanished: [{ row: old, fitids: ['c1'] }] });
+
+    const held = proposalFor(result, changed.ref);
+    expect(held).toMatchObject({ kind: 'create', defaultSelected: false, reason: 'changed-in-statement' });
+    expect(held.counterpart?.id).toBe('old-c1');
+    expect(proposalFor(result, kept.ref)).toMatchObject({ kind: 'create', defaultSelected: true, reason: null });
+  });
+
+  it('does not hold back another installment of the same plan (different number) nor another FITID', () => {
+    const second = line('c1', 'Loja Sigma - Parcela 2/3', -30.05, '2026-09-11');
+    const old = storedRow({ id: 'old-c1', description: 'Loja Sigma 1/3', amount: 30, date: '2026-09-11', installmentNumber: 1, totalInstallments: 3 });
+
+    const result = run({ lines: [second, kept], vanished: [{ row: old, fitids: ['c1'] }] });
+
+    expect(proposalFor(result, second.ref)).toMatchObject({ defaultSelected: true, reason: null });
+    expect(proposalFor(result, kept.ref).defaultSelected).toBe(true);
+  });
+
+  it('does not hold back a refund or discount that shares a FITID with a recorded purchase (different type)', () => {
+    const old = storedRow({ id: 'old-c1', description: 'Loja Sigma', amount: 30, date: '2026-09-11' });
+    const refund = line('c1', 'Estorno de "Loja Sigma"', 30, '2026-09-20');
+
+    const result = run({ lines: [refund], vanished: [{ row: old, fitids: ['c1'] }] });
+
+    expect(proposalFor(result, refund.ref)).toMatchObject({ kind: 'create', defaultSelected: true, reason: null });
   });
 });

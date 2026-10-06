@@ -12,7 +12,8 @@
  *  - foreignIn:      other card rows dated inside the period that this statement does not account for (rows of a
  *                    neighbouring sheet month, manual entries);
  *  - residual:       what none of the above explains (cents of rounding, matched rows dated outside the period).
- *  - advancePayments: sheet credits paired with advance payment lines (the payment is not in the OFX total);
+ *  - advancePayments: credits of advance payment lines, whether a sheet credit paired with them or recorded from the
+ *                    OFX (the payment is not in the OFX total);
  * delta = uncreated + heldMatches - sheetOnlyIn - foreignIn - advancePayments + residual.
  */
 import type { CardOfxClosing } from './card-ofx-import.types.js';
@@ -72,7 +73,9 @@ export function computeClosing(input: ClosingInput): CardOfxClosing {
   for (const proposal of result.proposals) {
     const lineNet = netOf(proposal.refs);
     if (!proposal.defaultSelected) {
-      if (proposal.kind === 'create' || proposal.kind === 'reversal') {
+      if (proposal.kind === 'advance-payment') {
+        // Not in the OFX total (payments are left out) and not recorded: nothing to explain.
+      } else if (proposal.kind === 'create' || proposal.kind === 'reversal') {
         uncreated += lineNet;
       } else if (proposal.target) {
         const rows = [proposal.target, ...proposal.absorbed];
@@ -90,6 +93,13 @@ export function computeClosing(input: ClosingInput): CardOfxClosing {
         break;
       case 'reversal':
         break;
+      case 'advance-payment': {
+        const id = `new:${proposal.group}:0`;
+        const line = lineByRef.get(proposal.refs[0]!)!;
+        projected.set(id, { cents: signedCents(line.type, line.amount), date: line.date, ofSheetOnly: false });
+        advanceIds.add(id);
+        break;
+      }
       default: {
         const target = proposal.target!;
         // An advance payment line is not in the OFX total; the sheet credit it pairs with stays in the card total.

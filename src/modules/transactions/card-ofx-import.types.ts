@@ -23,7 +23,11 @@ export interface CardOfxLine {
   date: string;
   /** > 0 */
   amount: number;
-  /** purchase = EXPENSE; refund and discount = INCOME; payment = INCOME (never becomes a transaction). */
+  /**
+   * purchase = EXPENSE; refund and discount = INCOME; payment = INCOME. A payment line becomes a transaction only as an
+   * `advance-payment` proposal (a payment made before the due date that no sheet credit already holds); the previous
+   * invoice's payment is handled apart (payment).
+   */
   type: 'INCOME' | 'EXPENSE';
   kind: CardOfxKind;
   memo: string;
@@ -35,7 +39,7 @@ export interface CardOfxLine {
   group: string | null;
 }
 
-export type CardOfxProposalKind = 'enrich-exact' | 'enrich-plan' | 'enrich-sum' | 'enrich-merge' | 'enrich-neighbour' | 'enrich-group' | 'enrich-near' | 'consume-future' | 'create' | 'reversal';
+export type CardOfxProposalKind = 'enrich-exact' | 'enrich-plan' | 'enrich-sum' | 'enrich-merge' | 'enrich-neighbour' | 'enrich-group' | 'enrich-near' | 'consume-future' | 'create' | 'reversal' | 'advance-payment';
 
 export interface CardOfxTransactionRef {
   transactionId: string;
@@ -65,10 +69,10 @@ export interface CardOfxProposal {
   /**
    * Why the proposal is not selected by default: 'ambiguous', 'no-shared-words', 'mixed-categories' (merges),
    * 'neighbour-ambiguous' (the line or the row of the adjacent month has other candidates), 'pool-too-large' (groups), 'near-amount' (a few cents apart without a strong signal), 'near-ambiguous', 'neighbour-weak', 'neighbour-month-not-imported',
-   * 'sheet-residue' (new purchases while sheet rows of the month are left without a bank line), or null.
+   * 'sheet-residue' (new purchases while sheet rows of the month are left without a bank line), 'sheet-credit-near' (advance-payment: a left-over sheet credit within 5 cents may be the same payment), 'changed-in-statement' (create: the same purchase is already recorded under another ref because the statement changed its amount, date or memo; counterpart = the recorded row), or null.
    */
   reason: string | null;
-  /** 'sheet-residue' on history: the card row left over that the new purchase may be a copy of. */
+  /** 'sheet-residue' on history, 'sheet-credit-near' on an advance payment: the card row left over that the line may be a copy of. */
   counterpart: null | CardOfxTransactionRef;
   /** How the target ends up (enrich and consume). */
   result: null | { date: string; description: string; notesAppend: string | null };
@@ -183,6 +187,8 @@ export interface CardOfxConfirmResponse {
   futureInstallments: number;
   /** Transactions created from reversal pairs (two per pair). */
   reversalsImported: number;
+  /** Advance payments recorded as credits on the card (one per `advance-payment` proposal applied). */
+  advancePayments: number;
   payment: null | { action: 'adjusted' | 'created'; transactionId: string; amount: number; date: string };
   /** Selected groups that no longer exist in the recomputation (or were applied meanwhile by another confirm). */
   skipped: number;
