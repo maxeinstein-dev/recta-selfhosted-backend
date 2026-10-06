@@ -82,6 +82,7 @@ export type BatchRow = ForecastRow & { id: string; householdId: string; category
  * The inputs of `expectedAmountFor` for MANY recurrences of one household at once (lists, the dashboard and the card
  * statement forecast): one category query for the custom categories and one transaction query for the history of the
  * CONSERVATIVE ones, instead of one query per recurrence. `expected(row, referenceMonth)` is then pure.
+ * All rows must belong to ONE household (checked): the queries are scoped to it.
  */
 export async function forecastBatch(
   db: Pick<Prisma.TransactionClient, 'transaction'> & Partial<Pick<Prisma.TransactionClient, 'category'>>,
@@ -91,6 +92,8 @@ export async function forecastBatch(
   history(row: BatchRow): ConfirmedOccurrence[];
   expected(row: BatchRow, referenceMonth: string): NextForecast;
 }> {
+  // The queries below are scoped to ONE household (the first row's): a mixed set would read the wrong categories/history
+  if (rows.some((r) => r.householdId !== rows[0]!.householdId)) throw new Error('forecastBatch needs recurrences of a single household');
   const incomeBuiltIn = new Set<string>(getCategoriesByType(CategoryType.INCOME));
   const customTypes = new Map<string, string>();
   const customIds = [...new Set(rows.filter((r) => isCustomCategoryName(r.categoryName)).map((r) => toCustomCategoryId(r.categoryName)!))];

@@ -270,6 +270,28 @@ describe('preview: the sheet takes over a recurrence', () => {
     expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ status: 'matches-recurring', existingTransactionId: null, existingAmount: 90 });
   });
 
+  it('existingAmount of a recurrence that has not run is what its STRATEGY expects for the month, not the stored amount', async () => {
+    // per business day: 36,00 x the 21 business days of october/2026 (12/10 is a Monday holiday), stored amount 90
+    energyRecurrence({ nextRunAt: '2026-10-05', amount: 90, forecastStrategy: 'PER_BUSINESS_DAY', dailyRate: 36, followLastAmount: false });
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ status: 'matches-recurring', existingTransactionId: null, existingAmount: 756 });
+    // the reference month of the occurrence decides: counts for november (november/2026 has 19 business days)
+    resetStore();
+    for (const id of [BILLS, DEBIT, CREDIT, INCOME]) seedAccount({ id, householdId: HH, balance: 0 });
+    energyRecurrence({ nextRunAt: '2026-10-05', amount: 90, forecastStrategy: 'PER_BUSINESS_DAY', dailyRate: 36, competenceOffsetMonths: 1, followLastAmount: false });
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ existingAmount: 684 });
+    // conservative expense: the largest of the last 3 confirmed
+    resetStore();
+    for (const id of [BILLS, DEBIT, CREDIT, INCOME]) seedAccount({ id, householdId: HH, balance: 0 });
+    const cons = energyRecurrence({ nextRunAt: '2026-10-05', amount: 90, forecastStrategy: 'CONSERVATIVE', followLastAmount: false });
+    [80, 130, 110, 999].forEach((amount, i) => seedTransaction({ householdId: HH, accountId: BILLS, description: 'Energia', amount, date: `2026-0${9 - i}-05`, paid: true, recurringTransactionId: cons.id }));
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ existingAmount: 130 });
+    // fixed keeps its typed amount
+    resetStore();
+    for (const id of [BILLS, DEBIT, CREDIT, INCOME]) seedAccount({ id, householdId: HH, balance: 0 });
+    energyRecurrence({ nextRunAt: '2026-10-05', amount: 75, forecastStrategy: 'FIXED', followLastAmount: false });
+    expect(rowNamed(await previewCsv(), 'Energia')).toMatchObject({ existingAmount: 75 });
+  });
+
   it('existingAmount is null for every other status', async () => {
     const preview = await previewCsv({ bills: [['Energia', 'Casa', 10]], debit: [['Padaria', 'Casa', 5]] });
     expect(preview.rows.map((r) => [r.status, r.existingAmount])).toEqual([['new', null], ['new', null]]);

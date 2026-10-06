@@ -192,6 +192,16 @@ describe('list queries', () => {
   });
 });
 
+describe('forecastBatch', () => {
+  it('refuses recurrences of more than one household (its queries are scoped to one)', async () => {
+    const { forecastBatch } = await import('./recurring-forecast.js');
+    const row = (householdId: string) => ({ id: householdId, householdId, categoryName: 'SALARY', amount: { toNumber: () => 1 } });
+    await expect(forecastBatch(fakePrisma as never, [row('a'), row('b')])).rejects.toThrow(/single household/);
+    await expect(forecastBatch(fakePrisma as never, [row('a'), row('a')])).resolves.toBeDefined();
+    await expect(forecastBatch(fakePrisma as never, [])).resolves.toBeDefined();
+  });
+});
+
 describe('create and update', () => {
   const base = { householdId: HH, accountId: ACC, categoryName: 'SALARY', amount: 700, frequency: 'MONTHLY', startDate: '2099-01-05', nextRunAt: '2099-01-05' };
   const parse = (extra: Record<string, unknown>) => createRecurringTransactionSchema.parse({ ...base, ...extra });
