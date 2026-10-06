@@ -3,6 +3,7 @@ import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
 import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
@@ -112,7 +113,9 @@ export async function createRecurringTransaction(
     if (!cat) throw new BadRequestError('Custom category not found or does not belong to this household');
   }
 
-  const recurring = await prisma.recurringTransaction.create({
+  const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+  await lockCustomCategory(tx, householdId, categoryName);
+  return tx.recurringTransaction.create({
     data: {
       householdId,
       accountId,
@@ -131,6 +134,7 @@ export async function createRecurringTransaction(
         select: { id: true, name: true, type: true },
       },
     },
+  });
   });
 
   // REGRA DE NEGÓCIO: Edge case de timing
@@ -305,7 +309,9 @@ export async function updateRecurringTransaction(
     if (!cat) throw new BadRequestError('Custom category not found or does not belong to this household');
   }
 
-  const recurring = await prisma.recurringTransaction.update({
+  const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+  await lockCustomCategory(tx, householdId, input.categoryName);
+  return tx.recurringTransaction.update({
     where: { id: recurringId },
     data: {
       ...(input.accountId && { accountId: input.accountId }),
@@ -324,6 +330,7 @@ export async function updateRecurringTransaction(
         select: { id: true, name: true, type: true },
       },
     },
+  });
   });
 
   // REGRA DE NEGÓCIO: Edge case de timing

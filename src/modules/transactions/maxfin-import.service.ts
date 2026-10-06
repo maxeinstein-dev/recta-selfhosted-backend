@@ -1,7 +1,7 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
-import { BadRequestError } from '../../shared/errors/app-error.js';
+import { BadRequestError, CategoryNameTakenError } from '../../shared/errors/app-error.js';
 import {
   AccountType,
   CATEGORY_NAME_DISPLAY,
@@ -10,7 +10,7 @@ import {
   TransactionType,
   getCategoriesByType,
 } from '../../shared/enums/index.js';
-import { toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { toCustomCategoryName, normalizeCategoryName } from '../../shared/utils/categoryHelpers.js';
 import { bufferToGrid, type Grid } from '../../shared/csv/grid.js';
 import { DEFAULT_WORKBOOK_LIMITS, readWorkbookSheets, type WorkbookSheet } from '../../shared/xlsx/workbook.js';
 import { createCategory } from '../categories/categories.service.js';
@@ -996,7 +996,16 @@ export async function buildCategoryResolver(householdId: string, entries: MaxFin
     } else if (target.kind === 'create') {
       const name = target.name.trim().slice(0, 100);
       if (!name) throw new BadRequestError(`Empty name for new category (key "${entry.key}")`);
-      toCreate.push({ mapKey, name, type: entry.type });
+      // A name equal to a system category of the type (ignoring case/accents) maps to that system category: creating a
+      // custom one would be refused (409) halfway through the map, after other categories were already created.
+      const system = (getCategoriesByType(entry.type as CategoryType) as CategoryName[]).find(
+        (n) => normalizeCategoryName(CATEGORY_NAME_DISPLAY[n]) === normalizeCategoryName(name),
+      );
+      if (system) {
+        resolvedNames.set(mapKey, system);
+      } else {
+        toCreate.push({ mapKey, name, type: entry.type });
+      }
     } else {
       resolvedNames.set(mapKey, defaultCategoryFor(entry.type));
     }
@@ -1006,10 +1015,20 @@ export async function buildCategoryResolver(householdId: string, entries: MaxFin
   for (const { mapKey, name, type } of toCreate) {
     let custom = findCustom(name, type);
     if (!custom) {
-      const createdCat = await createCategory({ householdId, name, type: type as CategoryType });
-      custom = { id: createdCat.id, name: createdCat.name, type };
-      customs.push(custom);
-      created.push({ id: custom.id, name: custom.name, type });
+      try {
+        const createdCat = await createCategory({ householdId, name, type: type as CategoryType });
+        custom = { id: createdCat.id, name: createdCat.name, type };
+        customs.push(custom);
+        created.push({ id: custom.id, name: custom.name, type });
+      } catch (error) {
+        // Someone created the same name meanwhile: use theirs instead of failing the whole import halfway.
+        if (!(error instanceof CategoryNameTakenError)) throw error;
+        const fresh = await prisma.category.findMany({ where: { householdId, type: type as CategoryType }, select: { id: true, name: true, type: true } });
+        const theirs = fresh.find((c) => normalizeLabel(c.name) === normalizeLabel(name) || normalizeCategoryName(c.name) === normalizeCategoryName(name));
+        if (!theirs) throw error;
+        custom = { id: theirs.id, name: theirs.name, type };
+        customs.push(custom);
+      }
     }
     resolvedNames.set(mapKey, toCustomCategoryName(custom.id));
   }

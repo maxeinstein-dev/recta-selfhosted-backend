@@ -7,7 +7,9 @@ import {
   CATEGORY_NAME_DISPLAY,
   getCategoriesByType,
 } from '../../shared/enums/index.js';
-import { toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { toCustomCategoryName, normalizeCategoryName } from '../../shared/utils/categoryHelpers.js';
+
+export { normalizeCategoryName };
 import type {
   CreateCategoryInput,
   UpdateCategoryInput,
@@ -37,11 +39,6 @@ export async function createCategory(input: CreateCategoryInput) {
     }
     throw error;
   }
-}
-
-/** Case/accent/space-insensitive form used to compare category names. */
-export function normalizeCategoryName(name: string): string {
-  return name.normalize('NFD').replace(/\p{M}/gu, '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 /**

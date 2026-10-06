@@ -948,6 +948,23 @@ describe('confirmMaxFinImport: category map validation', () => {
   });
 });
 
+describe('confirmMaxFinImport: create target named like a system category', () => {
+  it('maps to the system category (no create, no 409) and leaves no partial creations', async () => {
+    const categoryMap: MaxFinCategoryMapInput[] = [
+      { key: 'Casa', type: 'EXPENSE', target: { kind: 'create', name: 'Casa' } },
+      { key: 'invest', type: 'INCOME', target: { kind: 'create', name: '  INVESTIMENTOS ' } },
+    ];
+    const rows = [makeConfirmRow({ section: 'debit', categoryKey: 'Casa' }), makeConfirmRow({ section: 'income', categoryKey: 'invest' })];
+
+    const result = await confirm(rows, { categoryMap });
+
+    expect(db.createCategory).toHaveBeenCalledTimes(1);
+    expect(db.createCategory).toHaveBeenCalledWith({ householdId: HOUSEHOLD, name: 'Casa', type: 'EXPENSE' });
+    expect(createdInputs().map((input) => input.categoryName)).toEqual(['CUSTOM:cat-new-1', CategoryName.INVESTMENTS]);
+    expect(result.createdCategories).toEqual([{ id: 'cat-new-1', name: 'Casa', type: 'EXPENSE' }]);
+  });
+});
+
 describe('confirmMaxFinImport: category map resolution', () => {
   it('creates each distinct (type, normalised name) once and stores CUSTOM:<new id> on the transactions', async () => {
     const categoryMap: MaxFinCategoryMapInput[] = [
