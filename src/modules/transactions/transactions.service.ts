@@ -11,6 +11,8 @@ import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
+import { dayString } from '../recurring-transactions/recurring-dates.js';
+import { fromCents, invoiceDates, invoiceState, loadInvoiceForecast, toCents } from './credit-card-invoice-forecast.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
   CreateTransactionInput,
@@ -1868,10 +1870,13 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
  */
 export function creditCardInvoiceWindow(year: number, month: number, closingDay: number | null | undefined) {
   if (closingDay) {
+    // A closing day past the end of a short month closes on that month's last day (30 in February is the 28th), so
+    // every window starts where the previous one ended and the closing date never spills into the next month.
+    const closeOn = (zeroBasedMonth: number) => Math.min(closingDay, new Date(Date.UTC(year, zeroBasedMonth + 1, 0)).getUTCDate());
     return {
-      start: new Date(Date.UTC(year, month - 2, closingDay)),
-      end: new Date(Date.UTC(year, month - 1, closingDay - 1)),
-      previousStart: new Date(Date.UTC(year, month - 3, closingDay)),
+      start: new Date(Date.UTC(year, month - 2, closeOn(month - 2))),
+      end: new Date(Date.UTC(year, month - 1, closeOn(month - 1) - 1)),
+      previousStart: new Date(Date.UTC(year, month - 3, closeOn(month - 3))),
     };
   }
   return {
@@ -2117,6 +2122,25 @@ export async function calculateCreditCardInvoice(
   // Get total count for pagination info
   const totalCount = await prisma.transaction.count({ where: whereClause });
 
+  const isPaid = currentPaymentsTotal > 0 && Math.round(invoiceTotal * 100) <= 1;
+
+  // Statement view: dates, state and what the recurrences are still expected to add before closing.
+  // `today` is the UTC date-only value (the recurrence cron uses the server's local date, which can differ by a day
+  // late in the evening). A future invoice's debt does not include the forecast of the invoices before it.
+  const todayDay = dayString(options?.today ?? utcToday());
+  const dates = invoiceDates(window, account.dueDay);
+  const statementTotalCents = toCents(currentNetExpenses);
+  // One-cent residues of summed decimals are not a debt: they do not show as outstanding and do not count in the debt.
+  const outstandingCents = Math.abs(toCents(previousBalance)) <= 1 ? 0 : toCents(previousBalance);
+  const debtCents = Math.max(0, outstandingCents + statementTotalCents - toCents(currentPaymentsTotal));
+  const forecast = await loadInvoiceForecast(prisma, {
+    householdId,
+    accountId,
+    dates,
+    today: todayDay,
+    statementTotalCents,
+  });
+
   return {
     data: {
       accountId,
@@ -2126,7 +2150,15 @@ export async function calculateCreditCardInvoice(
       currentPayments: currentPaymentsTotal,
       total: Math.max(0, invoiceTotal),
       // Sums of cents drift in binary (0.01000000000793): compare in whole cents.
-      isPaid: currentPaymentsTotal > 0 && Math.round(invoiceTotal * 100) <= 1,
+      isPaid,
+      // Additive statement fields: what the bank charges for this invoice, what is still owed from earlier invoices.
+      statementTotal: fromCents(statementTotalCents),
+      outstandingFromPrevious: fromCents(outstandingCents),
+      debtTotal: isPaid || debtCents <= 1 ? 0 : fromCents(debtCents),
+      closingDate: dates.closingDate,
+      dueDate: dates.dueDate,
+      state: invoiceState(dates.closingDate, todayDay, isPaid),
+      forecast,
       paymentTransactions: currentPayments,
       invoiceTransactions: transactions.map(t => ({
         ...t,

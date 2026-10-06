@@ -11,6 +11,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
   prisma: {
     account: { findFirst: db.accountFindFirst },
     transaction: { findMany: db.transactionFindMany, count: db.transactionCount },
+    recurringTransaction: { findMany: async () => [] },
   },
 }));
 
