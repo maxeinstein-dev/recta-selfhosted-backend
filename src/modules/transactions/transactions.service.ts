@@ -11,6 +11,8 @@ import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
+import { dayString } from '../recurring-transactions/recurring-dates.js';
+import { fromCents, invoiceDates, invoiceState, loadInvoiceForecast, toCents } from './credit-card-invoice-forecast.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
   CreateTransactionInput,
@@ -2117,6 +2119,20 @@ export async function calculateCreditCardInvoice(
   // Get total count for pagination info
   const totalCount = await prisma.transaction.count({ where: whereClause });
 
+  const isPaid = currentPaymentsTotal > 0 && Math.round(invoiceTotal * 100) <= 1;
+
+  // Statement view: dates, state and what the recurrences are still expected to add before closing.
+  const todayDay = dayString(options?.today ?? utcToday());
+  const dates = invoiceDates(window, account.dueDay);
+  const statementTotalCents = toCents(currentNetExpenses);
+  const forecast = await loadInvoiceForecast(prisma, {
+    householdId,
+    accountId,
+    dates,
+    today: todayDay,
+    statementTotalCents,
+  });
+
   return {
     data: {
       accountId,
@@ -2126,7 +2142,15 @@ export async function calculateCreditCardInvoice(
       currentPayments: currentPaymentsTotal,
       total: Math.max(0, invoiceTotal),
       // Sums of cents drift in binary (0.01000000000793): compare in whole cents.
-      isPaid: currentPaymentsTotal > 0 && Math.round(invoiceTotal * 100) <= 1,
+      isPaid,
+      // Additive statement fields: what the bank charges for this invoice, what is still owed from earlier invoices.
+      statementTotal: fromCents(statementTotalCents),
+      outstandingFromPrevious: fromCents(toCents(previousBalance)),
+      debtTotal: fromCents(Math.max(0, toCents(invoiceTotal))),
+      closingDate: dates.closingDate,
+      dueDate: dates.dueDate,
+      state: invoiceState(dates.closingDate, todayDay, isPaid),
+      forecast,
       paymentTransactions: currentPayments,
       invoiceTransactions: transactions.map(t => ({
         ...t,

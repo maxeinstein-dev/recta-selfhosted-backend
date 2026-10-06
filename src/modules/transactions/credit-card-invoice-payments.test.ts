@@ -69,6 +69,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
   prisma: {
     account: accountApi,
     transaction: transactionApi,
+    recurringTransaction: { findMany: async () => [] },
     $transaction: async (cb: (tx: unknown) => unknown) => cb({ account: accountApi, transaction: transactionApi }),
   },
 }));
