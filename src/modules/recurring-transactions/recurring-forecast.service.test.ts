@@ -174,6 +174,24 @@ describe('list: what the next occurrence is expected to carry', () => {
   });
 });
 
+describe('list queries', () => {
+  it('reads the history of all conservative recurrences with ONE query (no query per recurrence)', async () => {
+    const one = seedRecurrence({ householdId: HH, accountId: ACC, description: 'A', amount: 500, nextRunAt: '2026-10-05', categoryName: 'SALARY', forecastStrategy: 'CONSERVATIVE' });
+    const two = seedRecurrence({ householdId: HH, accountId: ACC, description: 'B', amount: 90, nextRunAt: '2026-10-07', categoryName: 'UTILITIES', forecastStrategy: 'CONSERVATIVE' });
+    seedRecurrence({ householdId: HH, accountId: ACC, description: 'C', amount: 70, nextRunAt: '2026-10-09', categoryName: 'UTILITIES' });
+    confirmed(one.id, [700, 640]);
+    confirmed(two.id, [100, 120, 110, 900], { type: 'EXPENSE', category: 'UTILITIES' });
+    fakePrisma.transaction.findMany.mockClear();
+    const rows = await listRecurringTransactions({ householdId: HH });
+    const historyQueries = fakePrisma.transaction.findMany.mock.calls.filter(([args]) => (args as { where?: { paid?: boolean } }).where?.paid === true);
+    expect(historyQueries).toHaveLength(1);
+    const by = Object.fromEntries(rows.map((r) => [r.description, r.forecast]));
+    expect(by.A).toMatchObject({ amount: 640 });
+    expect(by.B).toMatchObject({ amount: 120, usedValues: [100, 120, 110] });
+    expect(by.C).toMatchObject({ amount: 70, strategy: 'LAST' });
+  });
+});
+
 describe('create and update', () => {
   const base = { householdId: HH, accountId: ACC, categoryName: 'SALARY', amount: 700, frequency: 'MONTHLY', startDate: '2099-01-05', nextRunAt: '2099-01-05' };
   const parse = (extra: Record<string, unknown>) => createRecurringTransactionSchema.parse({ ...base, ...extra });
@@ -243,6 +261,13 @@ describe('request validation', () => {
     expect(createRecurringTransactionSchema.safeParse({ ...base, nonWorkingDays: ['02-30'] }).success).toBe(false);
     expect(createRecurringTransactionSchema.safeParse({ ...base, optionalHolidays: ['EASTER'] }).success).toBe(false);
     expect(createRecurringTransactionSchema.safeParse({ ...base, nonWorkingDays: ['06-24', '2026-07-08'], optionalHolidays: ['CORPUS_CHRISTI'] }).success).toBe(true);
+  });
+  it('a daily rate is a number or a numeric string, never a boolean (true must not become 1)', () => {
+    expect(createRecurringTransactionSchema.safeParse({ ...base, dailyRate: true }).success).toBe(false);
+    expect(createRecurringTransactionSchema.safeParse({ ...base, dailyRate: '' }).success).toBe(false);
+    expect(createRecurringTransactionSchema.parse({ ...base, dailyRate: '36.5' }).dailyRate).toBe(36.5);
+    expect(createRecurringTransactionSchema.parse({ ...base, dailyRate: 36 }).dailyRate).toBe(36);
+    expect(updateRecurringTransactionSchema.safeParse({ dailyRate: false }).success).toBe(false);
   });
   it('update accepts null for the window and the rate (clears them)', () => {
     expect(updateRecurringTransactionSchema.parse({ forecastWindow: null, dailyRate: null })).toEqual({ forecastWindow: null, dailyRate: null });

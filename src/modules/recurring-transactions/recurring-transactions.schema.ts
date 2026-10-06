@@ -19,7 +19,7 @@ export const forecastStrategySchema = z.enum(FORECAST_STRATEGIES);
 /** N of CONSERVATIVE; null = the default of the kind (6 for income, 3 for expense). */
 export const forecastWindowSchema = z.number().int().min(1).max(MAX_CONSERVATIVE_WINDOW);
 /** Amount per business day (PER_BUSINESS_DAY). */
-export const dailyRateSchema = z.coerce.number().positive().max(1_000_000_000);
+export const dailyRateSchema = z.union([z.number(), z.string().trim().min(1)]).pipe(z.coerce.number().positive().max(1_000_000_000));
 /** Business days discounted from the month, "descontar N dias uteis". */
 export const safetyBusinessDaysSchema = z.number().int().min(0).max(31);
 /** "Dias sem vale" of the recurrence: 'MM-DD' (every year) or 'YYYY-MM-DD'. Sorted and de-duplicated. */

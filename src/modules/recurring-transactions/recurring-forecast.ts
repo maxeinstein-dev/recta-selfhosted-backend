@@ -69,19 +69,64 @@ export async function loadConfirmedHistory(
   return rows.map((r) => ({ amount: r.amount.toNumber(), date: dayString(r.date), competenceMonth: r.competenceMonth }));
 }
 
-/** What the next occurrence of a recurrence is expected to carry, for the lists. */
+/** What an occurrence of a recurrence is expected to carry, and how it was reached. */
 export interface NextForecast extends ExpectedAmountDetail {
-  /** 'YYYY-MM' the next occurrence counts for. */
+  /** 'YYYY-MM' the amount is for. */
   referenceMonth: string;
 }
 
-export async function nextForecastOf(
-  row: ForecastRow & { id: string; householdId: string; nextRunAt: Date },
-  isIncome: boolean,
-): Promise<NextForecast> {
-  const history = await loadConfirmedHistory(prisma, row, isIncome);
-  const referenceMonth = referenceMonthOf(row.nextRunAt, row.competenceOffsetMonths);
-  return { ...explainExpectedAmount(forecastInputOf(row, isIncome), history, referenceMonth), referenceMonth };
+/** The recurrences a batch is computed for (one household). */
+export type BatchRow = ForecastRow & { id: string; householdId: string; categoryName: string };
+
+/**
+ * The inputs of `expectedAmountFor` for MANY recurrences of one household at once (lists, the dashboard and the card
+ * statement forecast): one category query for the custom categories and one transaction query for the history of the
+ * CONSERVATIVE ones, instead of one query per recurrence. `expected(row, referenceMonth)` is then pure.
+ */
+export async function forecastBatch(
+  db: Pick<Prisma.TransactionClient, 'transaction'> & Partial<Pick<Prisma.TransactionClient, 'category'>>,
+  rows: readonly BatchRow[],
+): Promise<{
+  isIncome(row: BatchRow): boolean;
+  history(row: BatchRow): ConfirmedOccurrence[];
+  expected(row: BatchRow, referenceMonth: string): NextForecast;
+}> {
+  const incomeBuiltIn = new Set<string>(getCategoriesByType(CategoryType.INCOME));
+  const customTypes = new Map<string, string>();
+  const customIds = [...new Set(rows.filter((r) => isCustomCategoryName(r.categoryName)).map((r) => toCustomCategoryId(r.categoryName)!))];
+  if (customIds.length > 0 && db.category) {
+    const cats = await db.category.findMany({ where: { householdId: rows[0]!.householdId, id: { in: customIds } }, select: { id: true, type: true } });
+    for (const c of cats) customTypes.set(c.id, c.type);
+  }
+  const isIncome = (row: BatchRow): boolean =>
+    isCustomCategoryName(row.categoryName)
+      ? customTypes.get(toCustomCategoryId(row.categoryName)!) === CategoryType.INCOME
+      : incomeBuiltIn.has(row.categoryName);
+
+  const conservative = rows.filter((r) => normalizeStrategy(r.forecastStrategy) === 'CONSERVATIVE');
+  const histories = new Map<string, ConfirmedOccurrence[]>();
+  if (conservative.length > 0) {
+    const found = await db.transaction.findMany({
+      where: { householdId: conservative[0]!.householdId, recurringTransactionId: { in: conservative.map((r) => r.id) }, paid: true },
+      select: { recurringTransactionId: true, amount: true, date: true, competenceMonth: true },
+      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    });
+    for (const t of found) {
+      if (!t.recurringTransactionId) continue;
+      const list = histories.get(t.recurringTransactionId) ?? [];
+      list.push({ amount: t.amount.toNumber(), date: dayString(t.date), competenceMonth: t.competenceMonth });
+      histories.set(t.recurringTransactionId, list);
+    }
+    for (const r of conservative) {
+      histories.set(r.id, (histories.get(r.id) ?? []).slice(0, conservativeWindowOf({ forecastWindow: r.forecastWindow, type: isIncome(r) ? 'INCOME' : 'EXPENSE' })));
+    }
+  }
+  const history = (row: BatchRow): ConfirmedOccurrence[] => histories.get(row.id) ?? [];
+  return {
+    isIncome,
+    history,
+    expected: (row, referenceMonth) => ({ ...explainExpectedAmount(forecastInputOf(row, isIncome(row)), history(row), referenceMonth), referenceMonth }),
+  };
 }
 
 /** The strategy rules that span fields: refuses a recurrence that could not compute its amount. */

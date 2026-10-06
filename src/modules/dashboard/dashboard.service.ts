@@ -1,6 +1,7 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { parseMonthFilter } from '../../shared/utils/pagination.js';
-import { effectiveMonthWhere } from '../../shared/utils/competence.js';
+import { addMonths, effectiveMonthWhere } from '../../shared/utils/competence.js';
+import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
 import { AccountType, TransactionType, CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import type {
@@ -94,8 +95,12 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
 
   // Infer transaction type from category for recurring transactions
   const incomeCategories = getCategoriesByType(CategoryType.INCOME);
+  // What each recurrence is expected to carry next month (its forecast strategy decides, not the stored amount)
+  const nextMonth = addMonths(month, 1);
+  const forecastBatchOf = await forecastBatch(prisma, recurringTransactionsRaw);
   const recurringTransactions = recurringTransactionsRaw.map(rt => ({
     ...rt,
+    expectedAmount: forecastBatchOf.expected(rt, nextMonth).amount,
     type: incomeCategories.includes(rt.categoryName as any) 
       ? TransactionType.INCOME 
       : TransactionType.EXPENSE,
@@ -231,6 +236,8 @@ function calculateForecast(
   recurringTransactions: Array<{
     type: string;
     amount: { toNumber: () => number } | number;
+    /** The amount of the next occurrence by the recurrence's forecast strategy (falls back to `amount`). */
+    expectedAmount?: number;
     accountId: string | null;
     account: { type: string } | null;
     frequency?: string;
@@ -246,7 +253,7 @@ function calculateForecast(
     if (rt.accountId && creditCardIds.has(rt.accountId)) continue;
     if (rt.account && rt.account.type === AccountType.CREDIT) continue;
 
-    const amount = typeof rt.amount === 'number' ? rt.amount : rt.amount.toNumber();
+    const amount = rt.expectedAmount ?? (typeof rt.amount === 'number' ? rt.amount : rt.amount.toNumber());
     // For periodic transactions (e.g. BIWEEKLY salary), the per-occurrence amount
     // needs to be multiplied by the number of occurrences that fall in a month
     // so that the monthly forecast reflects the real impact (e.g. quinzenal 8,000 -> 16,000).

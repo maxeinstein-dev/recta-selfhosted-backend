@@ -6,7 +6,7 @@ import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/cat
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
 import { expectedAmountFor, normalizeStrategy } from './expected-amount.js';
-import { assertForecastConsistent, forecastInputOf, isIncomeCategory, loadConfirmedHistory, nextForecastOf, referenceMonthOf } from './recurring-forecast.js';
+import { assertForecastConsistent, forecastInputOf, forecastBatch, isIncomeCategory, loadConfirmedHistory, referenceMonthOf } from './recurring-forecast.js';
 import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
@@ -282,9 +282,9 @@ export async function listRecurringTransactions(
 
   const last = await lastOccurrenceDates(householdId as string, recurring.map((r) => r.id));
   // What each recurrence expects for its next occurrence (CONSERVATIVE reads the confirmed history)
-  const forecasts = await Promise.all(
-    recurring.map(async (r) => nextForecastOf(r, await isIncomeCategory(prisma, r.householdId, r.categoryName))),
-  );
+  // (two queries for the whole list, not two per recurrence)
+  const batch = await forecastBatch(prisma, recurring);
+  const forecasts = recurring.map((r) => batch.expected(r, referenceMonthOf(r.nextRunAt, r.competenceOffsetMonths)));
   // Convert Prisma.Decimal to number for JSON serialization
   return recurring.map((r, i) => ({
     ...plain(r),
