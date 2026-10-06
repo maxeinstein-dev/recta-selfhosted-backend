@@ -170,6 +170,12 @@ export interface CardOfxConfirmRequest {
   lines: CardOfxConfirmLine[];
   /** The preview's `ledgerBalance`, echoed (optional: without it the previous invoice's payment is the line closest to its reference). */
   ledgerBalance?: number | null;
+  /**
+   * `payment.ref` of the preview, echoed. With several "Pagamento recebido" lines, when it differs from the line the confirm
+   * picks, neither the payment nor the advances are applied; when absent and the confirm has no solid evidence (balance or
+   * an exact reference), they are not applied either. Single-payment statements need neither.
+   */
+  paymentLineRef?: string | null;
   selectedGroups: string[];
   /** For the create proposals. */
   categoryMap: MaxFinCategoryMapInput[];

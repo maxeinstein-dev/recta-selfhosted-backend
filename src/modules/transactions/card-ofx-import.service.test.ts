@@ -151,6 +151,7 @@ function confirmRequest(preview: CardOfxPreviewResponse, overrides: Partial<Card
     monthKey: preview.monthKey,
     lines: preview.lines.map(({ status: _status, group: _group, ...line }) => line),
     ledgerBalance: preview.ledgerBalance,
+    paymentLineRef: preview.payment?.ref ?? null,
     selectedGroups: preview.proposals.filter((p) => p.defaultSelected).map((p) => p.group),
     categoryMap: acceptedMap(preview),
     payment: { apply: true },
@@ -1045,7 +1046,7 @@ describe('card OFX import: several "Pagamento recebido" lines', () => {
     const card = seedCard();
     // July's sheet rows on the card: what July's invoice amounted to.
     seedTransaction({ householdId: HH, accountId: CARD, amount: 600, date: '2026-07-01', description: 'Compras', sourceRef: 'maxfin:2026-07:credit:5' });
-    seedTransaction({ householdId: HH, accountId: CARD, amount: 400, date: '2026-07-01', description: 'Outras', sourceRef: 'maxfin:2026-07:credit:6' });
+    seedTransaction({ householdId: HH, accountId: CARD, amount: 400.5, date: '2026-07-01', description: 'Outras', sourceRef: 'maxfin:2026-07:credit:6' });
     // August's sheet: the purchase and an advance the user typed as a negative card row.
     seedTransaction({ householdId: HH, accountId: CARD, amount: 77, date: '2026-08-01', description: 'Mercado', sourceRef: 'maxfin:2026-08:credit:5' });
     const advanceRow = seedTransaction({ householdId: HH, accountId: CARD, type: 'INCOME', amount: 31, date: '2026-08-01', description: 'Adiantamento', sourceRef: 'maxfin:2026-08:credit:6' });
@@ -1067,7 +1068,7 @@ describe('card OFX import: several "Pagamento recebido" lines', () => {
   it('records the unpaired advance as a credit on the card with its ref, and a second confirm creates nothing', async () => {
     const card = seedCard();
     seedTransaction({ householdId: HH, accountId: CARD, amount: 600, date: '2026-07-01', description: 'Compras', sourceRef: 'maxfin:2026-07:credit:5' });
-    seedTransaction({ householdId: HH, accountId: CARD, amount: 400, date: '2026-07-01', description: 'Outras', sourceRef: 'maxfin:2026-07:credit:6' });
+    seedTransaction({ householdId: HH, accountId: CARD, amount: 400.5, date: '2026-07-01', description: 'Outras', sourceRef: 'maxfin:2026-07:credit:6' });
     seedTransaction({ householdId: HH, accountId: CARD, amount: 77, date: '2026-08-01', description: 'Mercado', sourceRef: 'maxfin:2026-08:credit:5' });
     seedTransaction({ householdId: HH, accountId: CARD, type: 'INCOME', amount: 31, date: '2026-08-01', description: 'Adiantamento', sourceRef: 'maxfin:2026-08:credit:6' });
     const buffer = ofx(AUGUST, { start: '20260702', end: '20260802' });
@@ -1872,7 +1873,7 @@ describe('card OFX import: guards of the updated-statement checks', () => {
 
     const preview = await buildCardOfxPreview({
       account: card,
-      buffer: ofx([{ fitid: 'fx1', date: '20261010', amount: '15.00', memo: 'Estorno Loja Alfa' }], opts),
+      buffer: ofx([{ fitid: 'fx1', date: '20261010', amount: '20.00', memo: 'Estorno Loja Alfa' }], opts),
     });
 
     expect(preview.proposals.map((p) => [p.kind, p.defaultSelected, p.reason])).toEqual([['create', true, null]]);
@@ -1928,5 +1929,126 @@ describe('card OFX import: guards of the updated-statement checks', () => {
     expect(held.counterpart).toMatchObject({ amount: 40 });
     expect(changed.warnings).toEqual([expect.stringContaining('mudaram de valor')]);
     expect(store.transactions).toHaveLength(count);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The confirm must agree with the preview about which payment line pays the previous invoice
+// ---------------------------------------------------------------------------
+
+describe('card OFX import: the confirm and the payment classification', () => {
+  // Purchases 4500, a payment of 500 (the previous invoice's) and an advance of 4000; balance owed 500 = 4500 - 4000.
+  const STATEMENT: Trn[] = [
+    { fitid: 'pm', date: '20261003', amount: '500.00', memo: 'Pagamento recebido' },
+    { fitid: 'pa', date: '20261005', amount: '4000.00', memo: 'Pagamento recebido' },
+    { fitid: 'b1', date: '20261010', amount: '-4500.00', memo: 'Loja Zeta' },
+  ];
+  const buffer = () => ofx(STATEMENT, { start: '20261002', end: '20261102', balance: '-500.00' });
+
+  async function run(overrides: (preview: CardOfxPreviewResponse) => Partial<CardOfxConfirmRequest>) {
+    const card = seedCard();
+    const preview = await buildCardOfxPreview({ account: card, buffer: buffer() });
+    const request = confirmRequest(preview, { payment: { apply: true, sourceAccountId: BANK }, ...overrides(preview) });
+    const result = await confirmCardOfxImport({ request, account: card });
+    return { preview, result };
+  }
+  const credits = () => store.transactions.filter((t) => t.accountId === CARD && t.type === 'INCOME');
+
+  it('the preview classifies by the balance: 500 is the previous invoice payment, 4000 the advance', async () => {
+    const card = seedCard();
+    const preview = await buildCardOfxPreview({ account: card, buffer: buffer() });
+
+    expect(preview.ledgerBalance).toBe(500);
+    expect(preview.payment).toMatchObject({ amount: 500 });
+    expect(preview.proposals.find((p) => p.kind === 'advance-payment')).toMatchObject({ defaultSelected: true });
+  });
+
+  it('with the echoed balance the confirm pays 500 and records the 4000 advance', async () => {
+    const { result } = await run(() => ({ paymentLineRef: undefined }));
+
+    expect(result.payment).toMatchObject({ action: 'created', amount: 500 });
+    expect(result.advancePayments).toBe(1);
+    expect(credits().map((t) => t.amount)).toEqual([4000]);
+  });
+
+  it('without the balance nor the payment line, the confirm applies neither (reopen the preview)', async () => {
+    const { result } = await run(() => ({ ledgerBalance: undefined, paymentLineRef: undefined }));
+
+    expect(result.payment).toBeNull();
+    expect(result.advancePayments).toBe(0);
+    expect(result.warnings).toEqual([expect.stringContaining('Reabra a prévia')]);
+    expect(credits()).toEqual([]);
+    expect(store.transactions.filter((t) => t.attachmentUrl?.startsWith('invoice_pay:'))).toEqual([]);
+  });
+
+  it.each([4500, -500, 0])('a forged balance (%s) that singles out no line applies neither', async (forged) => {
+    const { result } = await run(() => ({ ledgerBalance: forged, paymentLineRef: undefined }));
+
+    expect(result.payment).toBeNull();
+    expect(result.advancePayments).toBe(0);
+    expect(credits()).toEqual([]);
+  });
+
+  it('a matching payment line applies', async () => {
+    const { result } = await run((preview) => ({ paymentLineRef: preview.payment!.ref }));
+
+    expect(result.payment).toMatchObject({ amount: 500 });
+    expect(result.advancePayments).toBe(1);
+  });
+
+  it('a payment line that differs from the one the confirm picks applies neither the payment nor the advance', async () => {
+    // No balance: the confirm falls back on the largest line (4000) while the preview showed 500.
+    const { result } = await run((preview) => ({ ledgerBalance: undefined, paymentLineRef: preview.payment!.ref }));
+
+    expect(result.payment).toBeNull();
+    expect(result.advancePayments).toBe(0);
+    expect(result.warnings).toEqual([expect.stringContaining('outro que o da prévia')]);
+    expect(store.transactions.filter((t) => t.attachmentUrl?.startsWith('invoice_pay:'))).toEqual([]);
+    expect(credits()).toEqual([]);
+  });
+
+  it('a made-up payment line applies neither', async () => {
+    const { result } = await run(() => ({ paymentLineRef: 'ofx:nope:00000000' }));
+
+    expect(result.payment).toBeNull();
+    expect(result.advancePayments).toBe(0);
+  });
+
+  it('a single-payment statement needs neither the balance nor the payment line', async () => {
+    const card = seedCard();
+    const preview = await buildCardOfxPreview({
+      account: card,
+      buffer: ofx([{ fitid: 'pm', date: '20261003', amount: '500.00', memo: 'Pagamento recebido' }, { fitid: 'b1', date: '20261010', amount: '-500.00', memo: 'Loja Zeta' }], { start: '20261002', end: '20261102' }),
+    });
+
+    const result = await confirmCardOfxImport({
+      request: confirmRequest(preview, { ledgerBalance: undefined, paymentLineRef: undefined, payment: { apply: true, sourceAccountId: BANK } }),
+      account: card,
+    });
+
+    expect(result.payment).toMatchObject({ amount: 500 });
+  });
+
+  it('a repriced purchase (same FITID, 200,00 to 215,00) is held, not created a second time', async () => {
+    const card = seedCard();
+    const first = await buildCardOfxPreview({ account: card, buffer: ofx([{ fitid: 'rp', date: '20261010', amount: '-200.00', memo: 'Loja Eta Intl' }], { start: '20261002', end: '20261102' }) });
+    await confirmCardOfxImport({ request: confirmRequest(first, { payment: null }), account: card });
+    const count = store.transactions.length;
+
+    const repriced = await buildCardOfxPreview({ account: card, buffer: ofx([{ fitid: 'rp', date: '20261011', amount: '-215.00', memo: 'Loja Eta Intl' }], { start: '20261002', end: '20261102' }) });
+
+    expect(repriced.proposals.map((p) => [p.kind, p.defaultSelected, p.reason])).toEqual([['create', false, 'changed-in-statement']]);
+    expect(repriced.proposals[0]!.counterpart).toMatchObject({ amount: 200 });
+    expect(store.transactions).toHaveLength(count);
+  });
+
+  it('a second partial refund of the same FITID (other day, other amount) is not taken for the first one', async () => {
+    const card = seedCard();
+    const earlier = seedTransaction({ householdId: HH, accountId: CARD, type: 'INCOME', categoryName: 'OTHER_INCOME', amount: 72.1, paid: true, date: '2026-10-05', description: 'Estorno', sourceRef: 'ofx:rf:aaaaaaaa' });
+    seedRef({ householdId: HH, transactionId: earlier.id, ref: 'ofx:rf:aaaaaaaa' });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx([{ fitid: 'rf', date: '20261020', amount: '1.85', memo: 'Estorno' }], { start: '20261002', end: '20261102' }) });
+
+    expect(preview.proposals.map((p) => [p.kind, p.defaultSelected, p.reason])).toEqual([['create', true, null]]);
   });
 });

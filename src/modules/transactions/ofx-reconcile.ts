@@ -142,6 +142,8 @@ export interface ReconcileInput {
   vanished?: Array<{ row: StoredCardRow; fitids: string[] }>;
 }
 
+export type PaymentBasis = 'ledger' | 'reference' | 'dominant' | 'ambiguous' | 'single';
+
 export interface ReconcileProposal {
   /** Why a proposal is not selected by default (machine code), or null. */
   reason: string | null;
@@ -183,6 +185,12 @@ export interface ReconcileResult {
   sheetOnly: StoredCardRow[];
   /** The previous invoice's payment, and a legacy card credit that already holds it (it would count twice). */
   payment: { line: ReconcileLine; legacyDuplicateId: string | null } | null;
+  /**
+   * How the previous invoice's payment line was singled out: 'ledger' (statement balance cross-check), 'reference' (equal
+   * to its recorded payment or sheet total within 2 cents), 'dominant' (no reference, clearly the largest), 'ambiguous'
+   * (several payment lines and no evidence), 'single' (one payment line or none).
+   */
+  paymentBasis: PaymentBasis;
   /** Payment lines that are not the previous invoice's payment and paired with no sheet credit (each has an `advance-payment` proposal). */
   unpairedAdvances: ReconcileLine[];
   monthHasSheet: boolean;
@@ -213,11 +221,13 @@ export const MAX_GROUP_ID_LENGTH = 16_000;
 /** A left-over sheet credit this close (cents) to an unpaired advance payment may be the same payment typed differently. */
 export const ADVANCE_LOOKALIKE_CENTS = 5;
 /** A left-over sheet credit whose description names a payment holds any advance back, whatever its amount. */
-export const PAYMENT_WORDS = /pagamento|antecip/i;
+export const PAYMENT_WORDS = /pagamento/i;
 /** The advances implied by the statement balance must match a payment line within this many cents. */
 export const PAYMENT_CROSSCHECK_CENTS = 2;
 /** A recorded line is a changed copy of a statement line when the amounts differ by at most this many cents (a moved date keeps the amount). */
 export const CHANGED_AMOUNT_CENTS = 5;
+/** ...or, on the same day or within this share of the recorded amount, a repricing of the same line. */
+export const CHANGED_AMOUNT_RATIO = 0.1;
 /** Sheet rows one bank line may merge (2 to 4). */
 export const MERGE_MIN_ROWS = 2;
 export const MERGE_MAX_ROWS = 4;
@@ -490,6 +500,7 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
   const allPaymentLines = lines.filter((s) => s.line.kind === 'payment');
   let payment: LineState | null = null;
   let paymentAmbiguous = false;
+  let paymentBasis: PaymentBasis = allPaymentLines.length > 1 ? 'ambiguous' : 'single';
   if (paymentLines.length > 0) {
     const reference = input.paymentReference != null && input.paymentReference > 0 ? toCents(input.paymentReference) : null;
     const byReference = paymentLines.reduce((best, candidate) => {
@@ -510,16 +521,19 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       if (fits.length > 0 && fits.every((s) => s.cents === fits[0]!.cents)) {
         payment = fits.find((s) => s === byReference) ?? fits[0]!;
         crossChecked = true;
+        paymentBasis = 'ledger';
       }
     }
     if (!crossChecked && allPaymentLines.length > 1) {
       // Without the cross-check the reference must single the main payment out: an exact reference (within 2 cents),
       // or the chosen line more than twice any other (advances are small next to an invoice).
       const others = paymentLines.filter((s) => s !== payment).map((s) => s.cents);
+      // A reference that is not exact is no evidence (and dominance does not rescue it): only a statement with no
+      // reference at all (the first one) may fall back on a line being clearly larger than the others.
       const exact = reference !== null && Math.abs(payment.cents - reference) <= PAYMENT_CROSSCHECK_CENTS;
-      const dominant = others.every((c) => payment!.cents > 2 * c);
-      const clear = exact || dominant;
-      paymentAmbiguous = !clear;
+      const dominant = reference === null && others.every((c) => payment!.cents > 2 * c);
+      paymentAmbiguous = !(exact || dominant);
+      paymentBasis = exact ? 'reference' : dominant ? 'dominant' : 'ambiguous';
     }
     payment.status = 'payment';
     for (const state of paymentLines) if (state !== payment) state.advance = true;
@@ -995,6 +1009,7 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     sheetOnly: sheet.filter((row) => !row.used).map((row) => row.row),
     payment: payment ? { line: payment.line, legacyDuplicateId: paymentLegacy?.id ?? null } : null,
     unpairedAdvances,
+    paymentBasis,
     monthHasSheet,
     mergeBudgetExhausted,
   };
@@ -1086,7 +1101,10 @@ function isChangedCopy(v: { row: StoredCardRow; fitids: string[] }, state: LineS
   if (v.row.type !== state.line.type) return false;
   if ((v.row.installmentNumber ?? null) !== (state.line.installment?.number ?? null)) return false;
   const diff = Math.abs(toCents(v.row.amount) - state.cents);
-  return diff <= CHANGED_AMOUNT_CENTS;
+  if (diff <= CHANGED_AMOUNT_CENTS) return true;
+  // Repriced (exchange or IOF adjustment): the same day, or within 10%. A later partial refund of the same FITID has
+  // another date and a very different amount.
+  return v.row.date === state.line.date || diff <= Math.round(toCents(v.row.amount) * CHANGED_AMOUNT_RATIO);
 }
 
 /** Days between two YYYY-MM-DD dates. */

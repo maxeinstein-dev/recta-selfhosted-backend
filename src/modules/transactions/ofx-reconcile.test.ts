@@ -695,7 +695,7 @@ describe('reconcileCardOfx: payments', () => {
   it('pairs the other payments (advances) with sheet credits of the same amount, the rest becoming advance-payment proposals', () => {
     const credits = [sheetRow('Pagamento antecipado', 31, { type: 'INCOME' }), sheetRow('Adiantamento', 207.15, { type: 'INCOME' })];
 
-    const result = run({ lines: pays, paymentReference: 1000, sheetRows: credits });
+    const result = run({ lines: pays, paymentReference: 1000.5, sheetRows: credits });
 
     expect(proposalsOf(result, 'enrich-exact').map((p) => [p.refs[0], p.target?.id])).toEqual([
       [pays[0]!.ref, credits[0]!.id],
@@ -1288,6 +1288,20 @@ describe('reconcileCardOfx: which payment line is the previous invoice\'s', () =
     expect(result.payment?.line.ref).toBe(big.ref);
   });
 
+  it('a reference that is not exact is no evidence: dominance does not rescue it', () => {
+    const result = run({ lines: [purchase, big, small], paymentReference: 3000 });
+
+    expect(result.paymentBasis).toBe('ambiguous');
+    expect(proposalsOf(result, 'advance-payment').map((p) => p.reason)).toEqual(['payment-ambiguous']);
+  });
+
+  it('reports how the payment was singled out', () => {
+    expect(run({ lines: [purchase, big, small], ledgerBalance: 1000 }).paymentBasis).toBe('ledger');
+    expect(run({ lines: [purchase, big, small], paymentReference: 500 }).paymentBasis).toBe('reference');
+    expect(run({ lines: [purchase, big, small] }).paymentBasis).toBe('dominant');
+    expect(run({ lines: [purchase, small] }).paymentBasis).toBe('single');
+  });
+
   it('holds the advances back (payment-ambiguous) when no balance fits and no line is clearly the main one', () => {
     const a = line('pc', 'Pagamento recebido', 1000, '2026-09-05');
     const b = line('pd', 'Pagamento recebido', 900, '2026-09-06');
@@ -1317,6 +1331,12 @@ describe('reconcileCardOfx: advance payments held back', () => {
 
     expect(held).toMatchObject({ defaultSelected: false, reason: 'sheet-credit-near' });
     expect(held.counterpart?.id).toBe(credit.id);
+  });
+
+  it('does not hold on a leftover discount credit (only a credit that names a payment holds any advance)', () => {
+    const credit = sheetRow('Desconto Antecipação Loja', 999, { type: 'INCOME' });
+
+    expect(proposalsOf(run({ lines, paymentReference: 900, sheetRows: [credit] }), 'advance-payment')[0]!.defaultSelected).toBe(true);
   });
 
   it('does not hold on an unrelated credit of another amount', () => {

@@ -66,6 +66,8 @@ export const cardOfxConfirmBodySchema = z.object({
   monthKey: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'monthKey must be YYYY-MM'),
   lines: z.array(cardOfxLineSchema).min(1).max(MAX_CARD_OFX_LINES),
   /** The preview's `ledgerBalance`, echoed: it tells the previous invoice's payment from the advances. */
+  /** The preview's `payment.ref`, echoed. */
+  paymentLineRef: z.string().min(1).max(120).nullable().optional(),
   ledgerBalance: z.number().finite().min(-1_000_000_000).max(1_000_000_000).nullable().optional(),
   // A group id is kind|sorted refs|target and a proposal covers at most MAX_GROUP_REFS lines.
   selectedGroups: z.array(z.string().min(1).max(MAX_GROUP_ID_LENGTH)).max(MAX_CARD_OFX_LINES),

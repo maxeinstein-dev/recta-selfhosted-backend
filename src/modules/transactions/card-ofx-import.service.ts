@@ -1595,7 +1595,31 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   let skipped = selected.size - toApply.length;
 
   const warnings: string[] = [];
-  const paymentPlan = await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth, context.paymentBeforeSheet);
+  // With several "Pagamento recebido" lines the confirm must pick the same previous-invoice payment the user saw in the
+  // preview, else it would pay (or credit) the wrong amount: it applies neither the payment nor the advances unless the
+  // request proves agreement (the echoed payment line) or the confirm itself has solid evidence (the echoed balance, or
+  // a reference equal to the recorded payment).
+  const paymentLineCount = lines.filter((l) => l.kind === 'payment').length;
+  let paymentBlocked = false;
+  if (paymentLineCount > 1) {
+    const chosen = result.payment?.line.ref ?? null;
+    if (request.paymentLineRef != null) {
+      if (request.paymentLineRef !== chosen) {
+        paymentBlocked = true;
+        warnings.push(
+          'O pagamento da fatura anterior escolhido agora é outro que o da prévia (os pagamentos recebidos desta fatura foram classificados de outro jeito): o pagamento e os antecipados não foram aplicados. Reabra a prévia.',
+        );
+      }
+    } else if (result.paymentBasis !== 'ledger' && result.paymentBasis !== 'reference') {
+      paymentBlocked = true;
+      warnings.push(
+        'Esta fatura tem mais de um "Pagamento recebido" e o pedido não trouxe o saldo do extrato (ledgerBalance) nem a linha do pagamento principal (paymentLineRef), ou eles não bastam para distinguir o pagamento da fatura anterior: o pagamento e os antecipados não foram aplicados. Reabra a prévia.',
+      );
+    }
+  }
+  const paymentPlan = paymentBlocked
+    ? ({ kind: 'none' } as PaymentPlan)
+    : await planPayment(request.payment, result, context.recordedPayments, householdId, invoiceMonth, context.paymentBeforeSheet);
   if (paymentPlan.kind === 'adjust') {
     const collapse = collapseWarning(paymentPlan.recorded, monthKey(invoiceMonth));
     if (collapse) warnings.push(collapse);
@@ -1665,6 +1689,10 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
         break;
       }
       case 'advance-payment': {
+        if (paymentBlocked) {
+          skipped += 1;
+          break;
+        }
         // A credit on the card on the bank's day: the debt drops, no bank account moves (the source is unknown).
         const count = await createLines(createContext, proposal.refs, ADVANCE_PAYMENT_CATEGORY);
         if (count > 0) advancePayments += count;
