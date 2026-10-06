@@ -1,11 +1,12 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError, AppError } from '../../shared/errors/index.js';
-import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
+import { getCategoryColor, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
-import { expectedAmountFor } from './expected-amount.js';
+import { expectedAmountFor, normalizeStrategy } from './expected-amount.js';
+import { assertForecastConsistent, forecastInputOf, forecastBatch, isIncomeCategory, loadConfirmedHistory, referenceMonthOf } from './recurring-forecast.js';
 import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
@@ -64,6 +65,11 @@ export function occurrenceDateFor(
   return scheduled <= today ? scheduled : today;
 }
 
+/** JSON-safe view of a stored recurrence: decimals as numbers. */
+function plain<T extends { amount: { toNumber(): number }; dailyRate?: { toNumber(): number } | null }>(r: T) {
+  return { ...r, amount: r.amount.toNumber(), dailyRate: r.dailyRate ? r.dailyRate.toNumber() : null };
+}
+
 /**
  * REGRA DE NEGÓCIO CRÍTICA:
  * Criar uma recorrência NÃO cria transações antecipadamente.
@@ -98,7 +104,15 @@ export async function createRecurringTransaction(
     isActive,
     followLastAmount,
     competenceOffsetMonths,
+    forecastStrategy,
+    forecastWindow,
+    dailyRate,
+    safetyBusinessDays,
+    nonWorkingDays,
+    optionalHolidays,
   } = input;
+
+  assertForecastConsistent({ forecastStrategy, dailyRate: dailyRate ?? null, frequency });
 
   // Verify account belongs to household
   const account = await prisma.account.findFirst({
@@ -130,8 +144,15 @@ export async function createRecurringTransaction(
       endDate,
       nextRunAt,
       isActive,
-      followLastAmount,
+      // Only the LAST strategy follows the last confirmed value; the others ignore (and do not store) the flag
+      followLastAmount: forecastStrategy === 'LAST' ? followLastAmount : false,
       competenceOffsetMonths: competenceOffsetMonths ?? null,
+      forecastStrategy,
+      forecastWindow: forecastWindow ?? null,
+      dailyRate: dailyRate != null ? new Prisma.Decimal(dailyRate) : null,
+      safetyBusinessDays,
+      nonWorkingDays,
+      optionalHolidays,
     },
     include: {
       account: {
@@ -196,10 +217,7 @@ export async function createRecurringTransaction(
   }
 
   // Convert Prisma.Decimal to number for JSON serialization
-  return {
-    ...recurring,
-    amount: recurring.amount.toNumber(),
-  };
+  return plain(recurring);
 }
 
 /**
@@ -238,10 +256,7 @@ export async function getRecurringTransaction(recurringId: string) {
   }
 
   // Convert Prisma.Decimal to number for JSON serialization
-  return {
-    ...recurring,
-    amount: recurring.amount.toNumber(),
-  };
+  return plain(recurring);
 }
 
 /**
@@ -266,11 +281,15 @@ export async function listRecurringTransactions(
   });
 
   const last = await lastOccurrenceDates(householdId as string, recurring.map((r) => r.id));
+  // What each recurrence expects for its next occurrence (CONSERVATIVE reads the confirmed history)
+  // (two queries for the whole list, not two per recurrence)
+  const batch = await forecastBatch(prisma, recurring);
+  const forecasts = recurring.map((r) => batch.expected(r, referenceMonthOf(r.nextRunAt, r.competenceOffsetMonths)));
   // Convert Prisma.Decimal to number for JSON serialization
-  return recurring.map(r => ({
-    ...r,
-    amount: r.amount.toNumber(),
+  return recurring.map((r, i) => ({
+    ...plain(r),
     lastOccurrenceDate: last.get(r.id) ?? null,
+    forecast: forecasts[i],
   }));
 }
 
@@ -313,6 +332,13 @@ export async function updateRecurringTransaction(
     if (!cat) throw new BadRequestError('Custom category not found or does not belong to this household');
   }
 
+  const mergedStrategy = input.forecastStrategy ?? normalizeStrategy(existing.forecastStrategy);
+  assertForecastConsistent({
+    forecastStrategy: mergedStrategy,
+    dailyRate: input.dailyRate !== undefined ? input.dailyRate : existing.dailyRate?.toNumber() ?? null,
+    frequency: input.frequency ?? existing.frequency,
+  });
+
   const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
   await lockCustomCategory(tx, householdId, input.categoryName);
   return tx.recurringTransaction.update({
@@ -327,8 +353,17 @@ export async function updateRecurringTransaction(
       ...(input.endDate !== undefined && { endDate: input.endDate }),
       ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
       ...(input.isActive !== undefined && { isActive: input.isActive }),
-      ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
+      // Only the LAST strategy follows the last confirmed value: leaving it clears the flag
+      ...(mergedStrategy !== 'LAST'
+        ? { followLastAmount: false }
+        : input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
       ...(input.competenceOffsetMonths !== undefined && { competenceOffsetMonths: input.competenceOffsetMonths }),
+      ...(input.forecastStrategy !== undefined && { forecastStrategy: input.forecastStrategy }),
+      ...(input.forecastWindow !== undefined && { forecastWindow: input.forecastWindow }),
+      ...(input.dailyRate !== undefined && { dailyRate: input.dailyRate === null ? null : new Prisma.Decimal(input.dailyRate) }),
+      ...(input.safetyBusinessDays !== undefined && { safetyBusinessDays: input.safetyBusinessDays }),
+      ...(input.nonWorkingDays !== undefined && { nonWorkingDays: input.nonWorkingDays }),
+      ...(input.optionalHolidays !== undefined && { optionalHolidays: input.optionalHolidays }),
     },
     include: {
       account: {
@@ -392,10 +427,7 @@ export async function updateRecurringTransaction(
   }
 
   // Convert Prisma.Decimal to number for JSON serialization
-  return {
-    ...recurring,
-    amount: recurring.amount.toNumber(),
-  };
+  return plain(recurring);
 }
 
 /**
@@ -451,24 +483,18 @@ export async function executeRecurringTransaction(
   const isPaid = input.paid ?? false; // Default: false (pendente)
 
   const anchorDay = anchorDayOf(recurring.startDate);
-  // The amount of the occurrence comes from one function (the extension point for forecast strategies).
-  const occurrenceAmount = expectedAmountFor(
-    { amount: recurring.amount.toNumber(), followLastAmount: recurring.followLastAmount },
-    [],
-    // The month the occurrence counts for (its reference month), not the month of its date
-    recurring.competenceOffsetMonths != null ? addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths) : monthOfDate(transactionDate),
-  );
 
-  let isIncome: boolean;
-  if (isCustomCategoryName(recurring.categoryName)) {
-    const cat = await prisma.category.findFirst({
-      where: { id: toCustomCategoryId(recurring.categoryName)!, householdId },
-      select: { type: true },
-    });
-    isIncome = cat?.type === CategoryType.INCOME;
-  } else {
-    isIncome = getCategoriesByType(CategoryType.INCOME).includes(recurring.categoryName as any);
-  }
+  const isIncome = await isIncomeCategory(prisma, householdId, recurring.categoryName);
+
+  // The amount of the occurrence comes from one function (the extension point for forecast strategies). Its history is
+  // the recurrence's last confirmed occurrences, read only when the strategy uses it.
+  const history = await loadConfirmedHistory(prisma, recurring, isIncome);
+  const occurrenceAmount = expectedAmountFor(
+    forecastInputOf(recurring, isIncome),
+    history,
+    // The month the occurrence counts for (its reference month), not the month of its date
+    referenceMonthOf(transactionDate, recurring.competenceOffsetMonths),
+  );
 
   function calculateBalanceChange(amount: number, isInc: boolean, accountType: string): number {
     const isCreditCard = accountType === AccountType.CREDIT;

@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { RecurrenceFrequency } from '../../shared/enums/index.js';
 import { localDateSchema } from '../../shared/utils/dateSchema.js';
 import { categoryNameSchema } from '../categories/categories.schema.js';
+import { isValidNonWorkingDay, normalizeNonWorkingDays, OPTIONAL_HOLIDAYS } from './br-calendar.js';
+import { FORECAST_STRATEGIES, MAX_CONSERVATIVE_WINDOW } from './expected-amount.js';
 
 /**
  * Recurrence frequency enum
@@ -11,6 +13,25 @@ export const recurrenceFrequencyEnum = z.nativeEnum(RecurrenceFrequency);
 /** 0..12 months between an occurrence's date and its reference month. */
 /** 0..12 months; 0 ("same month") is stored as null, like the UI sends it, so there is one way to say it. */
 export const competenceOffsetSchema = z.number().int().min(0).max(12).transform((n) => (n === 0 ? null : n));
+
+/** How the amount of the next occurrence is forecast (default LAST: the amount follows the last value, as before). */
+export const forecastStrategySchema = z.enum(FORECAST_STRATEGIES);
+/** N of CONSERVATIVE; null = the default of the kind (6 for income, 3 for expense). */
+export const forecastWindowSchema = z.number().int().min(1).max(MAX_CONSERVATIVE_WINDOW);
+/** Amount per business day (PER_BUSINESS_DAY). */
+export const dailyRateSchema = z.union([z.number(), z.string().trim().min(1)]).pipe(z.coerce.number().positive().max(1_000_000_000));
+/** Business days discounted from the month, "descontar N dias uteis". */
+export const safetyBusinessDaysSchema = z.number().int().min(0).max(31);
+/** "Dias sem vale" of the recurrence: 'MM-DD' (every year) or 'YYYY-MM-DD'. Sorted and de-duplicated. */
+export const nonWorkingDaysSchema = z
+  .array(z.string().trim().refine(isValidNonWorkingDay, "Use 'MM-DD' or 'YYYY-MM-DD'"))
+  .max(60)
+  .transform((days) => normalizeNonWorkingDays(days));
+/** Optional holidays that also count as non-business days. */
+export const optionalHolidaysSchema = z
+  .array(z.enum(OPTIONAL_HOLIDAYS))
+  .max(OPTIONAL_HOLIDAYS.length)
+  .transform((days) => [...new Set(days)]);
 
 /**
  * Create recurring transaction request
@@ -30,6 +51,13 @@ export const createRecurringTransactionSchema = z.object({
   followLastAmount: z.boolean().default(false),
   // Months between the occurrence date and the month it refers to (1 = the following month); null/omitted = same month
   competenceOffsetMonths: competenceOffsetSchema.nullish(),
+  // Forecast strategy (default LAST) and its parameters; PER_BUSINESS_DAY needs dailyRate (checked by the service)
+  forecastStrategy: forecastStrategySchema.default('LAST'),
+  forecastWindow: forecastWindowSchema.nullish(),
+  dailyRate: dailyRateSchema.nullish(),
+  safetyBusinessDays: safetyBusinessDaysSchema.default(0),
+  nonWorkingDays: nonWorkingDaysSchema.default([]),
+  optionalHolidays: optionalHolidaysSchema.default([]),
 });
 
 export type CreateRecurringTransactionInput = z.infer<
@@ -51,6 +79,12 @@ export const updateRecurringTransactionSchema = z.object({
   isActive: z.boolean().optional(),
   followLastAmount: z.boolean().optional(),
   competenceOffsetMonths: competenceOffsetSchema.nullable().optional(), // null clears (back to the same month)
+  forecastStrategy: forecastStrategySchema.optional(),
+  forecastWindow: forecastWindowSchema.nullable().optional(), // null = the default of the kind
+  dailyRate: dailyRateSchema.nullable().optional(),
+  safetyBusinessDays: safetyBusinessDaysSchema.optional(),
+  nonWorkingDays: nonWorkingDaysSchema.optional(),
+  optionalHolidays: optionalHolidaysSchema.optional(),
 });
 
 export type UpdateRecurringTransactionInput = z.infer<

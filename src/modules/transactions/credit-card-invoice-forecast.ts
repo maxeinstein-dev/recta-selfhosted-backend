@@ -1,8 +1,7 @@
 import type { Prisma } from '../../generated/prisma/client.js';
-import { CategoryType, getCategoriesByType } from '../../shared/enums/index.js';
-import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { addMonthsClamped, anchorDayOf, dayString, daysInMonth, localDate } from '../recurring-transactions/recurring-dates.js';
 import { calculateNextRunDate, occurrenceDateFor } from '../recurring-transactions/recurring-transactions.service.js';
+import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
 
 /** Upper bound of occurrences walked per recurrence (a daily one over a month, or a very stale monthly one). */
 const MAX_STEPS = 800;
@@ -88,6 +87,8 @@ export interface ForecastRecurrence {
   endDate: Date | null;
   nextRunAt: Date;
   followLastAmount: boolean;
+  /** Amount of the occurrence dated `day` ('YYYY-MM-DD'), when it depends on the month (forecast strategies); else `amount`. */
+  amountOn?: (day: string) => number;
   /** Sign of the amount on the card: -1 for an income / refund recurrence. */
   sign: 1 | -1;
 }
@@ -122,7 +123,7 @@ export function projectRecurrence(
           description: rec.description?.trim() || rec.categoryName,
           categoryName: rec.categoryName,
           date,
-          amount: fromCents(toCents(rec.amount) * rec.sign),
+          amount: fromCents(toCents(rec.amountOn ? rec.amountOn(date) : rec.amount) * rec.sign),
           followsLastAmount: rec.followLastAmount,
         });
       }
@@ -176,17 +177,9 @@ export async function loadInvoiceForecast(
   });
   if (rows.length === 0) return buildForecast([], new Set(), dates, today, statementTotalCents);
 
-  const customIds = rows.filter((r) => isCustomCategoryName(r.categoryName)).map((r) => toCustomCategoryId(r.categoryName)!);
-  const customTypes = new Map<string, string>();
-  if (customIds.length > 0 && client.category) {
-    const cats = await client.category.findMany({ where: { householdId, id: { in: customIds } }, select: { id: true, type: true } });
-    for (const c of cats) customTypes.set(c.id, c.type);
-  }
-  const incomeBuiltIn = new Set<string>(getCategoriesByType(CategoryType.INCOME));
-  const signOf = (categoryName: string): 1 | -1 => {
-    if (isCustomCategoryName(categoryName)) return customTypes.get(toCustomCategoryId(categoryName)!) === CategoryType.INCOME ? -1 : 1;
-    return incomeBuiltIn.has(categoryName) ? -1 : 1;
-  };
+  // Kind of each recurrence and the confirmed history of the conservative ones, for the whole card at once
+  const batch = await forecastBatch(client, rows);
+  const signOf = (row: (typeof rows)[number]): 1 | -1 => (batch.isIncome(row) ? -1 : 1);
 
   // Occurrences already created inside the window months (a monthly one counts per calendar month).
   const monthStart = localUtc(dates.windowStart.slice(0, 7) + '-01');
@@ -217,8 +210,11 @@ export async function loadInvoiceForecast(
     startDate: r.startDate,
     endDate: r.endDate,
     nextRunAt: r.nextRunAt,
-    followLastAmount: r.followLastAmount,
-    sign: signOf(r.categoryName),
+    // Only the last-value strategy follows the confirmed value
+    followLastAmount: r.followLastAmount && (r.forecastStrategy ?? 'LAST') === 'LAST',
+    // The strategy amount of each occurrence: its reference month (date + offset) decides the business days
+    amountOn: (day: string) => batch.expected(r, referenceMonthOf(localDate(day), r.competenceOffsetMonths)).amount,
+    sign: signOf(r),
   }));
   return buildForecast(recurrences, generated, dates, today, statementTotalCents);
 }

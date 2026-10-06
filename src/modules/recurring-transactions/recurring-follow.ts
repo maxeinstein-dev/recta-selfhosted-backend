@@ -44,7 +44,8 @@ export async function followLastAmountInTx(
   const newAmount = Math.round(update.amount * 100) / 100;
 
   const recurrence = await tx.recurringTransaction.findFirst({
-    where: { id: recurringId, householdId: before.householdId, isActive: true, followLastAmount: true },
+    // Only the LAST strategy follows the last confirmed value (FIXED / CONSERVATIVE / PER_BUSINESS_DAY never adopt it)
+    where: { id: recurringId, householdId: before.householdId, isActive: true, followLastAmount: true, forecastStrategy: 'LAST' },
     select: { id: true, amount: true },
   });
   if (!recurrence || Math.abs(recurrence.amount.toNumber() - newAmount) < 0.005) return null;

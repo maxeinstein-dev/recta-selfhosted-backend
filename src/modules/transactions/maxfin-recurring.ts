@@ -9,6 +9,7 @@ import { prisma } from '../../shared/db/prisma.js';
 import { normalizeDescription } from '../recurring-transactions/detect.js';
 import { anchorDayOf, dayString } from '../recurring-transactions/recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from '../recurring-transactions/recurring-follow.js';
+import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
 import type { MaxFinInstallment, MaxFinSectionKey } from './parsers/maxfin.types.js';
 
 export type RecurringMatch =
@@ -94,12 +95,15 @@ export async function loadRecurringMatcher(
 
   const recurrences = await prisma.recurringTransaction.findMany({
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
-    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true },
+    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true,
+      householdId: true, categoryName: true, forecastStrategy: true, forecastWindow: true, dailyRate: true, safetyBusinessDays: true, nonWorkingDays: true, optionalHolidays: true },
   });
   // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
   // followLastAmountInTx): a sheet of a far future month must not consume it.
   const limit = plusDays(now, FOLLOW_LOOKAHEAD_DAYS);
   const due = recurrences.filter((r) => inMonth(dayString(r.nextRunAt), monthKey) && dayString(r.nextRunAt) <= limit);
+  // The amount a recurrence is EXPECTED to carry for the month the occurrence counts for (its strategy decides), not the stored one
+  const expected = await forecastBatch(prisma, due);
   const occupied = new Set<string>();
   if (due.length > 0) {
     const present = await prisma.transaction.findMany({
@@ -145,10 +149,11 @@ export async function loadRecurringMatcher(
         transactionId: null,
         recurringId: r.id,
         day: nextRun,
-        followLastAmount: r.followLastAmount,
+        // Only the LAST strategy takes over the sheet's value
+        followLastAmount: r.followLastAmount && (r.forecastStrategy ?? 'LAST') === 'LAST',
         endDate,
         anchorDay: anchorDayOf(r.startDate),
-        amount: r.amount.toNumber(),
+        amount: expected.expected(r, referenceMonthOf(r.nextRunAt, r.competenceOffsetMonths)).amount,
         competenceOffsetMonths: r.competenceOffsetMonths ?? null,
       });
     });

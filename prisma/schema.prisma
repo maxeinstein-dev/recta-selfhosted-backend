@@ -397,6 +397,14 @@ enum RecurrenceFrequency {
   YEARLY
 }
 
+// How the amount of the next occurrence is forecast (see modules/recurring-transactions/expected-amount.ts).
+enum ForecastStrategy {
+  LAST
+  FIXED
+  CONSERVATIVE
+  PER_BUSINESS_DAY
+}
+
 model RecurringTransaction {
   id           String              @id @default(uuid()) @db.Uuid
   householdId  String              @map("household_id") @db.Uuid
@@ -414,6 +422,16 @@ model RecurringTransaction {
   followLastAmount Boolean         @default(false) @map("follow_last_amount")
   // Months between the occurrence date and the month it refers to (1 = the following month); null = same month.
   competenceOffsetMonths Int?      @map("competence_offset_months")
+  // Forecast strategy of the occurrence amount. LAST (default) keeps the behaviour that existed before the column.
+  forecastStrategy ForecastStrategy @default(LAST) @map("forecast_strategy")
+  // CONSERVATIVE: how many confirmed occurrences to look at (null = 6 for income, 3 for expense).
+  forecastWindow Int?              @map("forecast_window")
+  // PER_BUSINESS_DAY: amount per business day, business days to discount from the month, and the recurrence's own
+  // "dias sem vale" ('MM-DD' every year or 'YYYY-MM-DD') and optional holidays ('CARNIVAL', 'CORPUS_CHRISTI').
+  dailyRate    Decimal?            @map("daily_rate") @db.Decimal(15, 2)
+  safetyBusinessDays Int           @default(0) @map("safety_business_days")
+  nonWorkingDays String[]          @default([]) @map("non_working_days")
+  optionalHolidays String[]        @default([]) @map("optional_holidays")
   createdAt    DateTime            @default(now()) @map("created_at")
   updatedAt    DateTime            @updatedAt @map("updated_at")
 
