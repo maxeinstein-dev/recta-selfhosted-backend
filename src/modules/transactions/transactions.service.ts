@@ -4,12 +4,12 @@ import { NotFoundError, BadRequestError, ForbiddenError, ConflictError } from '.
 import {
   createPaginatedResponse,
   buildPaginationArgs,
-  parseMonthFilter,
 } from '../../shared/utils/pagination.js';
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
+import { monthOrRangeWhere, effectiveMonthWhere, addMonths, competenceWithinRange } from '../../shared/utils/competence.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
@@ -26,6 +26,20 @@ import type {
   CreditCardInvoiceParams,
   UndoPaymentParams,
 } from './transactions.schema.js';
+
+/**
+ * A reference month only makes sense on INCOME/EXPENSE rows (transfers and allocations are cash moves) and within
+ * +-24 months of the transaction date (a typo like 2062-10 would hide the row from every month view).
+ */
+export function assertValidCompetence(competenceMonth: string | null, type: string, date: Date): void {
+  if (competenceMonth === null) return;
+  if (type !== TransactionType.INCOME && type !== TransactionType.EXPENSE) {
+    throw new BadRequestError('competenceMonth only applies to INCOME and EXPENSE transactions');
+  }
+  if (!competenceWithinRange(competenceMonth, date)) {
+    throw new BadRequestError('competenceMonth must be within 24 months of the transaction date');
+  }
+}
 
 /**
  * Order of every cursor-paginated transaction listing. Cursor pagination needs a total order: `date` is a day
@@ -189,6 +203,8 @@ export async function createTransaction(
 
   // Create transaction and update balance in a single transaction
   const isPaid = input.paid !== undefined ? input.paid : true;
+  const competenceMonth = input.competenceMonth ?? null;
+  assertValidCompetence(competenceMonth, transactionType, date);
   const isSplit = input.isSplit === true && input.splits && input.splits.length > 0;
   
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -212,6 +228,7 @@ export async function createTransaction(
         ...(input.totalInstallments && { totalInstallments: input.totalInstallments }),
         ...(input.sourceRef && { sourceRef: input.sourceRef }),
         ...(input.attachmentUrl && { attachmentUrl: input.attachmentUrl }),
+        ...(competenceMonth && { competenceMonth }),
       },
       include: {
         account: {
@@ -429,6 +446,7 @@ export async function createTransaction(
                 notes: notes ? `${notes} - Split da transação ${transaction.id}` : `Split da transação ${transaction.id}`,
                 paid: true,
                 isSplit: false, // This is the individual split transaction, not the main one
+                ...(competenceMonth && { competenceMonth }),
               },
             });
             
@@ -514,7 +532,8 @@ export async function createTransaction(
         categoryName,
         date,
         amount,
-        transactionType
+        transactionType,
+        competenceMonth
       );
     } catch (error) {
       // Log error but don't fail transaction creation if notification fails
@@ -629,23 +648,18 @@ export async function listTransactions(query: ListTransactionsQuery) {
     categoryName,
     type,
     month,
+    monthFrom,
+    monthTo,
     startDate,
     endDate,
     search,
+    paid,
     cursor,
     limit,
   } = query;
 
-  // Build date filter
-  let dateFilter: { gte?: Date; lte?: Date } | undefined;
-  if (month) {
-    const { start, end } = parseMonthFilter(month);
-    dateFilter = { gte: start, lte: end };
-  } else if (startDate || endDate) {
-    dateFilter = {};
-    if (startDate) dateFilter.gte = startDate;
-    if (endDate) dateFilter.lte = endDate;
-  }
+  // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
+  const periodWhere = monthOrRangeWhere({ month, monthFrom, monthTo, startDate, endDate });
 
   // Build where clause
   const where: Prisma.TransactionWhereInput = {
@@ -656,7 +670,8 @@ export async function listTransactions(query: ListTransactionsQuery) {
     ...(type && {
       type: type as TransactionType,
     }),
-    ...(dateFilter && { date: dateFilter }),
+    ...periodWhere,
+    ...(paid !== undefined && { paid }),
     ...(search && {
       OR: [
         { description: { contains: search, mode: 'insensitive' } },
@@ -827,6 +842,13 @@ async function updateTransactionOnce(
     }
   }
 
+  // Reference month: only INCOME/EXPENSE rows carry one, and it stays within 24 months of the (new) date
+  {
+    const finalType = input.type ?? existingTransaction.type;
+    const finalCompetence = input.competenceMonth !== undefined ? input.competenceMonth : existingTransaction.competenceMonth;
+    assertValidCompetence(finalCompetence ?? null, finalType, input.date ?? existingTransaction.date);
+  }
+
   // Calculate balance adjustments
   const oldAmount = existingTransaction.amount.toNumber();
   const newAmount = input.amount ?? oldAmount;
@@ -966,6 +988,7 @@ async function updateTransactionOnce(
         ...(input.totalInstallments !== undefined && { totalInstallments: input.totalInstallments }),
         ...(input.attachmentUrl !== undefined && { attachmentUrl: input.attachmentUrl }),
         ...(input.sourceRef !== undefined && { sourceRef: input.sourceRef }),
+        ...(input.competenceMonth !== undefined && { competenceMonth: input.competenceMonth }),
       },
       include: {
         account: {
@@ -1107,7 +1130,8 @@ async function updateTransactionOnce(
         finalCategoryName,
         transactionDate,
         newAmount,
-        finalTransactionType
+        finalTransactionType,
+        input.competenceMonth !== undefined ? input.competenceMonth : existingTransaction.competenceMonth
       );
     } catch (error) {
       // Log error but don't fail transaction update if notification fails
@@ -1466,22 +1490,14 @@ export async function batchDeleteTransactions(input: BatchDeleteTransactionsInpu
 export async function getTransactionSummary(query: TransactionSummaryQuery) {
   const { householdId, month, startDate, endDate } = query;
 
-  // Build date filter
-  let dateFilter: { gte?: Date; lte?: Date } | undefined;
-  if (month) {
-    const { start, end } = parseMonthFilter(month);
-    dateFilter = { gte: start, lte: end };
-  } else if (startDate || endDate) {
-    dateFilter = {};
-    if (startDate) dateFilter.gte = startDate;
-    if (endDate) dateFilter.lte = endDate;
-  }
+  // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
+  const periodWhere = monthOrRangeWhere({ month, startDate, endDate });
 
   // Get transactions with account information to filter credit cards
   const transactions = await prisma.transaction.findMany({
     where: {
       householdId,
-      ...(dateFilter && { date: dateFilter }),
+      ...periodWhere,
     },
     include: {
       account: {
@@ -1539,16 +1555,8 @@ export async function getTransactionSummary(query: TransactionSummaryQuery) {
 export async function getSpendingByCategory(query: TransactionSummaryQuery) {
   const { householdId, month, startDate, endDate } = query;
 
-  // Build date filter
-  let dateFilter: { gte?: Date; lte?: Date } | undefined;
-  if (month) {
-    const { start, end } = parseMonthFilter(month);
-    dateFilter = { gte: start, lte: end };
-  } else if (startDate || endDate) {
-    dateFilter = {};
-    if (startDate) dateFilter.gte = startDate;
-    if (endDate) dateFilter.lte = endDate;
-  }
+  // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
+  const periodWhere = monthOrRangeWhere({ month, startDate, endDate });
 
   const expenseSystem = getCategoriesByType(CategoryType.EXPENSE);
   const customExpense = await prisma.category.findMany({
@@ -1562,7 +1570,7 @@ export async function getSpendingByCategory(query: TransactionSummaryQuery) {
     by: ['categoryName'],
     where: {
       householdId,
-      ...(dateFilter && { date: dateFilter }),
+      ...periodWhere,
       categoryName: { in: expenseCategoryNames },
     },
     _sum: {
@@ -1605,20 +1613,15 @@ export async function getMonthlyRecap(query: { householdId: string; month?: stri
     targetMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   }
 
-  const { start, end } = parseMonthFilter(targetMonth);
-  const dateFilter = { gte: start, lte: end };
-
-  // Calculate previous month for comparison
-  const [year, monthNum] = targetMonth.split('-').map(Number);
-  const prevMonthStart = new Date(year, monthNum - 2, 1);
-  const prevMonthEnd = new Date(year, monthNum - 1, 0, 23, 59, 59, 999);
-  const prevDateFilter = { gte: prevMonthStart, lte: prevMonthEnd };
+  // The recap is month planning: rows count in their reference month when set, else in the month of their date.
+  const monthWhere = effectiveMonthWhere(targetMonth);
+  const prevMonthWhere = effectiveMonthWhere(addMonths(targetMonth, -1));
 
   // Get all transactions for the month
   const transactions = await prisma.transaction.findMany({
     where: {
       householdId,
-      date: dateFilter,
+      AND: [monthWhere],
     },
     include: {
       account: {
@@ -1634,7 +1637,7 @@ export async function getMonthlyRecap(query: { householdId: string; month?: stri
   const prevTransactions = await prisma.transaction.findMany({
     where: {
       householdId,
-      date: prevDateFilter,
+      AND: [prevMonthWhere],
     },
     include: {
       account: {

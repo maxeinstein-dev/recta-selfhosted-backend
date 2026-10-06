@@ -3,6 +3,10 @@ import { paginationSchema, monthFilterSchema } from '../../shared/utils/paginati
 import { CategoryName, TransactionType } from '../../shared/enums/index.js';
 import { localDateSchema } from '../../shared/utils/dateSchema.js';
 import { categoryNameSchema } from '../categories/categories.schema.js';
+import { COMPETENCE_MONTH_RE } from '../../shared/utils/competence.js';
+
+/** Reference month 'YYYY-MM' (a calendar month, 01..12). */
+export const competenceMonthSchema = z.string().regex(COMPETENCE_MONTH_RE, 'competenceMonth must be in YYYY-MM format');
 
 /**
  * Transaction split input (for expense sharing)
@@ -45,6 +49,7 @@ export const createTransactionSchema = z.object({
   totalInstallments: z.number().int().positive().optional(),
   attachmentUrl: z.string().max(500).optional(), // Pode ser URL ou identificador técnico (ex: invoice_pay:xxx:xxx)
   sourceRef: z.string().max(120).optional(), // Identificador de origem de importação (dedup exata / reimportação idempotente)
+  competenceMonth: competenceMonthSchema.nullish(), // Mês de referência (INCOME/EXPENSE); null/omitido = mês da data
   // Split expense fields (only for EXPENSE transactions in shared households)
   isSplit: z.boolean().optional().default(false),
   splits: z.array(transactionSplitInputSchema).optional(), // Array of splits when isSplit is true
@@ -65,6 +70,13 @@ export const createTransactionSchema = z.object({
   return !!data.accountId && !!data.categoryName;
 }, {
   message: 'Invalid combination of fields for transaction type',
+}).refine((data) => {
+  // A reference month belongs to income/expense rows; transfers and allocations are cash moves
+  if (data.competenceMonth && (data.type === TransactionType.TRANSFER || data.type === TransactionType.ALLOCATION)) return false;
+  return true;
+}, {
+  message: 'competenceMonth only applies to INCOME and EXPENSE transactions',
+  path: ['competenceMonth'],
 }).refine((data) => {
   // If isSplit is true, splits array must be provided and not empty
   if (data.isSplit === true) {
@@ -120,6 +132,7 @@ export const updateTransactionSchema = z.object({
   installmentNumber: z.number().int().positive().nullable().optional(),
   totalInstallments: z.number().int().positive().nullable().optional(),
   attachmentUrl: z.string().max(500).nullable().optional(), // Pode ser URL ou identificador técnico (ex: invoice_pay:xxx:xxx)
+  competenceMonth: competenceMonthSchema.nullable().optional(), // Mês de referência; null limpa (volta ao mês da data)
 });
 
 export type UpdateTransactionInput = z.infer<typeof updateTransactionSchema>;
@@ -145,7 +158,20 @@ export const listTransactionsQuerySchema = paginationSchema
     type: z.nativeEnum(TransactionType).optional(), // Now supports TRANSFER and ALLOCATION
     startDate: localDateSchema.optional(),
     endDate: localDateSchema.optional(),
+    // Inclusive range of planning months ('YYYY-MM'): rows whose reference month (else the month of the date) is in it
+    monthFrom: competenceMonthSchema.optional(),
+    monthTo: competenceMonthSchema.optional(),
     search: z.string().max(100).optional(),
+    // paid=false lists the pending ones (forecasts waiting to be confirmed); paid=true the settled ones
+    paid: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  })
+  .refine((q) => !(q.month && (q.monthFrom || q.monthTo)), {
+    message: 'Use either month or monthFrom/monthTo, not both',
+    path: ['month'],
+  })
+  .refine((q) => !(q.monthFrom && q.monthTo && q.monthFrom > q.monthTo), {
+    message: 'monthFrom must not be after monthTo',
+    path: ['monthFrom'],
   });
 
 export type ListTransactionsQuery = z.infer<typeof listTransactionsQuerySchema>;

@@ -416,6 +416,31 @@ describe('confirm: the sheet takes over', () => {
     expect(rowById('account', BILLS).balance).toBe(867.6);
   });
 
+  it('with only the recurrence: stamps the reference month from the recurrence offset, like its own occurrences', async () => {
+    energyRecurrence({ nextRunAt: '2026-10-05', competenceOffsetMonths: 1 });
+    await confirm(await previewCsv());
+    expect(rowsOf('transaction')[0]).toMatchObject({ date: '2026-10-01', competenceMonth: '2026-11' });
+  });
+
+  it('with only a recurrence without an offset: the reference month stays null', async () => {
+    energyRecurrence({ nextRunAt: '2026-10-05' });
+    await confirm(await previewCsv());
+    expect(rowsOf('transaction')[0]!.competenceMonth).toBeNull();
+  });
+
+  it('replace (delete + create) keeps the reference month the stored row had', async () => {
+    seedTransaction({
+      householdId: HH, accountId: BILLS, description: 'Energia', amount: 100, date: '2026-10-01', paid: true,
+      sourceRef: 'maxfin:2026-10:bills:4', competenceMonth: '2026-11', categoryName: 'UTILITIES',
+    });
+    const preview = await previewCsv();
+    expect(rowNamed(preview, 'Energia').status).toBe('changed');
+    const result = await confirm(preview);
+    expect(result.replaced).toBe(1);
+    expect(rowsOf('transaction')).toHaveLength(1);
+    expect(rowsOf('transaction')[0]).toMatchObject({ amount: 132.4, competenceMonth: '2026-11' });
+  });
+
   it('moves a recurrence past a short month keeping its day where it fits, and stops one that ended', async () => {
     const rec = energyRecurrence({ nextRunAt: '2026-10-31' });
     await confirm(await previewCsv());

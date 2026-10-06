@@ -5,6 +5,8 @@ import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, Trans
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
+import { expectedAmountFor } from './expected-amount.js';
+import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
 import type {
@@ -95,6 +97,7 @@ export async function createRecurringTransaction(
     nextRunAt,
     isActive,
     followLastAmount,
+    competenceOffsetMonths,
   } = input;
 
   // Verify account belongs to household
@@ -128,6 +131,7 @@ export async function createRecurringTransaction(
       nextRunAt,
       isActive,
       followLastAmount,
+      competenceOffsetMonths: competenceOffsetMonths ?? null,
     },
     include: {
       account: {
@@ -324,6 +328,7 @@ export async function updateRecurringTransaction(
       ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
       ...(input.isActive !== undefined && { isActive: input.isActive }),
       ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
+      ...(input.competenceOffsetMonths !== undefined && { competenceOffsetMonths: input.competenceOffsetMonths }),
     },
     include: {
       account: {
@@ -446,6 +451,13 @@ export async function executeRecurringTransaction(
   const isPaid = input.paid ?? false; // Default: false (pendente)
 
   const anchorDay = anchorDayOf(recurring.startDate);
+  // The amount of the occurrence comes from one function (the extension point for forecast strategies).
+  const occurrenceAmount = expectedAmountFor(
+    { amount: recurring.amount.toNumber(), followLastAmount: recurring.followLastAmount },
+    [],
+    // The month the occurrence counts for (its reference month), not the month of its date
+    recurring.competenceOffsetMonths != null ? addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths) : monthOfDate(transactionDate),
+  );
 
   let isIncome: boolean;
   if (isCustomCategoryName(recurring.categoryName)) {
@@ -516,12 +528,16 @@ export async function executeRecurringTransaction(
         type: transactionType,
         accountId: recurring.accountId,
         categoryName,
-        amount: recurring.amount,
+        amount: new Prisma.Decimal(occurrenceAmount),
         description: recurring.description || `Recurring: ${categoryName}`,
         date: transactionDate,
         notes: `Auto-generated from recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
         paid: isPaid,
         recurringTransactionId: recurring.id,
+        // Reference month of the occurrence (a voucher paid on 25 Sep that refers to October): date month + offset
+        ...(recurring.competenceOffsetMonths != null && {
+          competenceMonth: addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths),
+        }),
       },
       include: {
         account: {
@@ -534,7 +550,7 @@ export async function executeRecurringTransaction(
     // Para cartão de crédito: consome limite imediatamente
     // Para conta bancária: saldo só é atualizado quando confirmada
     if (isPaid && recurring.account) {
-      const amount = recurring.amount.toNumber();
+      const amount = occurrenceAmount;
       const balanceChange = calculateBalanceChange(amount, isIncome, recurring.account.type);
       
       // Use centralized balance update function to ensure consistency

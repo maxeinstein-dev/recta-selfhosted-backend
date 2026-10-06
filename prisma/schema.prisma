@@ -287,6 +287,10 @@ model Transaction {
   // Import provenance: stable id of the source row (e.g. maxfin:2026-10:credit:27, ofx:<fitid>:<hash>). Unique per household
   // (NULLs allowed, so manual transactions are unaffected): exact dedup, idempotent re-import and race-proof double submits
   sourceRef              String?         @map("source_ref") @db.VarChar(120)
+  // Reference month ('YYYY-MM') when the money belongs to a different month than the day it moves (a meal voucher
+  // deposited on 25 Sep that pays October). Null = the month of `date`. Balances, calendar, invoices and bank
+  // reconciliation keep using `date`; month planning (lists by month, summaries, budgets) uses COALESCE(competence_month, month of date).
+  competenceMonth        String?         @map("competence_month") @db.VarChar(7)
   createdAt              DateTime        @default(now()) @map("created_at")
   updatedAt              DateTime        @updatedAt @map("updated_at")
 
@@ -305,6 +309,7 @@ model Transaction {
   // Indexes for common queries
   @@index([householdId])
   @@index([householdId, date])
+  @@index([householdId, competenceMonth])
   @@index([householdId, categoryName])
   @@index([householdId, type])
   @@index([accountId])
@@ -407,6 +412,8 @@ model RecurringTransaction {
   isActive     Boolean             @default(true) @map("is_active")
   // When true, editing the most recent occurrence updates `amount` (predict the next value as the last real one)
   followLastAmount Boolean         @default(false) @map("follow_last_amount")
+  // Months between the occurrence date and the month it refers to (1 = the following month); null = same month.
+  competenceOffsetMonths Int?      @map("competence_offset_months")
   createdAt    DateTime            @default(now()) @map("created_at")
   updatedAt    DateTime            @updatedAt @map("updated_at")
 

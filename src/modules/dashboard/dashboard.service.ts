@@ -1,5 +1,6 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { parseMonthFilter } from '../../shared/utils/pagination.js';
+import { effectiveMonthWhere } from '../../shared/utils/competence.js';
 import { AccountType, TransactionType, CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import type {
@@ -28,7 +29,6 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
   const prevMonth = monthNum === 1 
     ? `${year - 1}-12` 
     : `${year}-${String(monthNum - 1).padStart(2, '0')}`;
-  const { start: prevMonthStart, end: prevMonthEnd } = parseMonthFilter(prevMonth);
 
   // Get credit card IDs to exclude. This set is only ever used to EXCLUDE credit
   // card transactions from bank income/expense figures, so it must include inactive
@@ -55,7 +55,8 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
     prisma.transaction.findMany({
       where: {
         householdId,
-        date: { gte: monthStart, lte: monthEnd },
+        // Planning month: reference month when set, else the month of the date
+        AND: [effectiveMonthWhere(month)],
       },
       include: {
         account: { select: { type: true } },
@@ -65,7 +66,7 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
     prisma.transaction.findMany({
       where: {
         householdId,
-        date: { gte: prevMonthStart, lte: prevMonthEnd },
+        AND: [effectiveMonthWhere(prevMonth)],
       },
       include: {
         account: { select: { type: true } },
@@ -364,12 +365,10 @@ async function getMonthlyAggregates(
     }
 
     const monthStr = `${targetYear}-${String(targetMonth).padStart(2, '0')}`;
-    const { start, end } = parseMonthFilter(monthStr);
-
     const transactions = await prisma.transaction.findMany({
       where: {
         householdId,
-        date: { gte: start, lte: end },
+        AND: [effectiveMonthWhere(monthStr)],
         NOT: {
           accountId: { in: Array.from(creditCardIds) },
         },
