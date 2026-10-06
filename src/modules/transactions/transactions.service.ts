@@ -9,6 +9,7 @@ import {
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
@@ -191,6 +192,8 @@ export async function createTransaction(
   const isSplit = input.isSplit === true && input.splits && input.splits.length > 0;
   
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // A custom category must still exist when the row is written (a merge/delete holds it FOR UPDATE), also with an explicit type.
+    await lockCustomCategory(tx, householdId, categoryName);
     const transaction = await tx.transaction.create({
       data: {
         householdId,
@@ -858,6 +861,7 @@ async function updateTransactionOnce(
 
   // Update transaction and adjust balances
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    if (input.categoryName) await lockCustomCategory(tx, householdId, input.categoryName);
     // Lock the row and read it again: what the balance math below uses must be what is stored now.
     await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
     const fresh = await tx.transaction.findFirst({ where: { id: transactionId, householdId } });
@@ -1323,6 +1327,9 @@ export async function batchCreateTransactions(input: BatchCreateTransactionsInpu
 
   // Execute batch creation
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Every distinct custom category is share-locked (ids sorted: a stable lock order) and must still exist.
+    const customNames = [...new Set(transactionsData.map((t: { categoryName: string }) => t.categoryName).filter((n: string) => isCustomCategoryName(n)))].sort() as string[];
+    for (const name of customNames) await lockCustomCategory(tx, householdId, name);
     const created = await tx.transaction.createMany({
       data: transactionsData.map((t: { accountId: string; categoryName: string; amount: number; description?: string; date: Date; notes?: string; paid: boolean; recurringTransactionId?: string; installmentId?: string; installmentNumber?: number; totalInstallments?: number; sourceRef?: string }) => {
         const isInc = isIncomeForCategory(t.categoryName);
