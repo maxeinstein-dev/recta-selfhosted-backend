@@ -423,8 +423,10 @@ export async function accountRoutes(app: FastifyInstance) {
         },
         body: {
           type: 'object',
+          required: ['newBalance'],
           properties: {
-            amount: { type: 'number' },
+            newBalance: { type: ['number', 'string'] },
+            date: { type: 'string', description: 'YYYY-MM-DD, not in the future (default: today)' },
             reason: { type: 'string' },
           },
         },
