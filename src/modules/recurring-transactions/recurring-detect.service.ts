@@ -15,6 +15,8 @@ import {
 import { addMonthsClamped, daysInMonth, dayString, localDate, startDayFor } from './recurring-dates.js';
 import type { DetectApplyInput, DetectRecurringInput } from './recurring-transactions.schema.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
+import { AppError } from '../../shared/errors/index.js';
+import { isCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 
 /** The slice of the Prisma client the detection reads from (the client itself, or a transaction's). */
 type DetectClient = Pick<Prisma.TransactionClient, 'account' | 'transaction' | 'recurringTransaction'>;
@@ -147,6 +149,25 @@ export async function applyDetectedRecurrences(
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring-detect:${householdId}`}))`;
       const { candidates } = await runDetection(tx, householdId, minMonths, months, now);
       const byId = new Map(candidates.map((c) => [c.id, c]));
+
+      // Before the first write: share-lock every custom category the chosen items touch (the recurrence's own and the ones of
+      // the history rows it links), in sorted id order like batchCreate. A merge locks its two categories in id order too, so
+      // the two cannot take them in opposite orders (deadlock 40P01).
+      const chosen = input.items.map((item) => byId.get(item.id)).filter((c): c is NonNullable<typeof c> => !!c);
+      const historyIds = [...new Set(chosen.flatMap((c) => c.transactionIds))];
+      const historyRows = historyIds.length > 0
+        ? await tx.transaction.findMany({ where: { id: { in: historyIds }, householdId }, select: { categoryName: true } })
+        : [];
+      const historyNames = new Set(historyRows.map((r: { categoryName: string | null }) => r.categoryName).filter((n: string | null): n is string => !!n && isCustomCategoryName(n)));
+      const ownNames = new Set(chosen.map((c) => c.categoryName).filter((n) => isCustomCategoryName(n)));
+      for (const name of [...new Set([...ownNames, ...historyNames])].sort()) {
+        try {
+          await lockCustomCategory(tx, householdId, name);
+        } catch (error) {
+          // A history row naming a category that no longer exists is not ours to refuse; the recurrence's own must exist.
+          if (!(error instanceof AppError && error.statusCode === 400) || ownNames.has(name)) throw error;
+        }
+      }
 
       const result: DetectApplyResult = { created: 0, skipped: 0, linkedTransactions: 0, warnings: [] };
       const handled = new Set<string>();

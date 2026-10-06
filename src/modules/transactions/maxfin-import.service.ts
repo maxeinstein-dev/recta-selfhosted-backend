@@ -1,7 +1,7 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
-import { BadRequestError, CategoryNameTakenError } from '../../shared/errors/app-error.js';
+import { BadRequestError } from '../../shared/errors/app-error.js';
 import {
   AccountType,
   CATEGORY_NAME_DISPLAY,
@@ -1024,7 +1024,7 @@ export async function buildCategoryResolver(householdId: string, entries: MaxFin
         created.push({ id: custom.id, name: custom.name, type });
       } catch (error) {
         // Someone created the same name meanwhile: use theirs instead of failing the whole import halfway.
-        if (!(error instanceof CategoryNameTakenError)) throw error;
+        if ((error as { code?: string }).code !== 'CATEGORY_NAME_TAKEN') throw error; // (not instanceof: AppError subclasses reset their prototype)
         const fresh = await prisma.category.findMany({ where: { householdId, type: type as CategoryType }, select: { id: true, name: true, type: true } });
         const theirs = fresh.find((c) => normalizeLabel(c.name) === normalizeLabel(name) || normalizeCategoryName(c.name) === normalizeCategoryName(name));
         if (!theirs) throw error;

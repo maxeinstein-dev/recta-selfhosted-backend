@@ -1,6 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
+import { NotFoundError, BadRequestError, AppError } from '../../shared/errors/index.js';
 import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
@@ -464,7 +464,8 @@ export async function executeRecurringTransaction(
     return isInc ? amount : -amount;
   }
 
-  // Determine transaction type
+  // Determine transaction type. isIncome/transactionType are computed OUTSIDE the transaction from the category read above:
+  // that stays valid when a merge re-points the recurrence meanwhile because a merge requires the same type (INCOME/EXPENSE).
   const transactionType = isIncome ? TransactionType.INCOME : TransactionType.EXPENSE;
 
   // Create the actual transaction and update next run date
@@ -479,7 +480,9 @@ export async function executeRecurringTransaction(
       try {
         await lockCustomCategory(tx, householdId, categoryName);
       } catch (error) {
-        if (attempt >= 2) throw error;
+        // Only "category gone" (400) is retried after a re-read; any other failure (deadlock, connection...) propagates.
+        // (AppError subclasses reset their prototype, so instanceof BadRequestError is false: the status code is the test.)
+        if (!(error instanceof AppError && error.statusCode === 400) || attempt >= 2) throw error;
         continue;
       }
       const again = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { categoryName: true } });
