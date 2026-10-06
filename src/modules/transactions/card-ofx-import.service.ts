@@ -330,6 +330,7 @@ async function loadCardContext(
   month: MaxFinMonth,
   lines: CardOfxStatementLine[],
   period?: { start: string; end: string },
+  ledgerBalance?: number | null,
 ): Promise<CardContext> {
   const { householdId } = card;
   const key = monthKey(month);
@@ -439,7 +440,7 @@ async function loadCardContext(
     }
     return out;
   };
-  const tokens = Array.from(new Set(lines.filter((l) => l.kind !== 'payment').map((l) => fitidToken(l.fitid))));
+  const tokens = Array.from(new Set(lines.map((l) => fitidToken(l.fitid))));
   const vanished: CardContext['vanished'] = [];
   // Only inside the statement's own period (boundary days included): the lines of one plan (purchase, discount, refund)
   // share a FITID across statements, so the same FITID elsewhere in time is not the same line.
@@ -522,6 +523,7 @@ async function loadCardContext(
       linkedTransactionIds,
       planNumbers,
       paymentReference,
+      ledgerBalance: ledgerBalance ?? null,
       historyBefore,
       neighbourRows,
       vanished,
@@ -824,7 +826,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     );
   }
 
-  const context = await loadCardContext(account, month, statement.lines, period);
+  const context = await loadCardContext(account, month, statement.lines, period, statement.balance === null ? null : -statement.balance);
   const result = reconcileCardOfx(context.input);
   const lineByRef = new Map(statement.lines.map((l) => [l.ref, l]));
 
@@ -890,12 +892,12 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       `Já existe no cartão um crédito "${line.memo}" de ${formatBRL(line.amount)} em ${formatDay(line.date)} (importação genérica): com o pagamento da fatura ele conta duas vezes; apague esse lançamento.`,
     );
   }
-  const held = result.proposals.filter((p) => p.kind === 'create' && p.reason === 'changed-in-statement');
+  const held = result.proposals.filter((p) => (p.kind === 'create' || p.kind === 'advance-payment') && p.reason === 'changed-in-statement');
   if (held.length > 0) {
     warnings.push(
-      `${held.length} compra(s) mudaram de valor, data ou descrição no OFX em relação ao que já foi importado e vieram desmarcadas para não duplicar: ` +
+      `${held.length} lançamento(s) mudaram de valor, data ou descrição no OFX em relação ao que já foi importado e vieram desmarcados para não duplicar: ` +
         `${held.map((p) => `${p.counterpart!.description} (${formatBRL(p.counterpart!.amount)} em ${formatDay(p.counterpart!.date)} no Recta; ${formatBRL(lineByRef.get(p.refs[0]!)!.amount)} em ${formatDay(lineByRef.get(p.refs[0]!)!.date)} no OFX)`).slice(0, 5).join('; ')}. ` +
-        'Corrija o lançamento existente à mão (ou apague-o) antes de marcar a nova compra.',
+        'Corrija o lançamento existente à mão (ou apague-o) antes de marcar o novo.',
     );
   }
   const heldIds = new Set(held.map((p) => p.counterpart!.id));
@@ -909,12 +911,24 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     );
   }
   const advanceProposals = result.proposals.filter((p) => p.kind === 'advance-payment');
-  const heldAdvances = advanceProposals.filter((p) => !p.defaultSelected);
-  if (heldAdvances.length > 0) {
-    const listed = heldAdvances.map((p) => `${formatBRL(lineByRef.get(p.refs[0]!)!.amount)} em ${formatDay(lineByRef.get(p.refs[0]!)!.date)}`).join('; ');
+  const heldAdvances = advanceProposals.filter((p) => !p.defaultSelected && p.reason !== 'changed-in-statement');
+  const advanceText = (p: (typeof advanceProposals)[number]) => `${formatBRL(lineByRef.get(p.refs[0]!)!.amount)} em ${formatDay(lineByRef.get(p.refs[0]!)!.date)}`;
+  const nearCredit = heldAdvances.filter((p) => p.reason === 'sheet-credit-near');
+  if (nearCredit.length > 0) {
+    const listed = nearCredit.map((p) => `${advanceText(p)} (planilha: ${p.counterpart!.description}, ${formatBRL(p.counterpart!.amount)})`).join('; ');
     warnings.push(
-      `${heldAdvances.length} pagamento(s) antecipado(s) vieram desmarcados porque sobra na planilha um crédito de valor quase igual (${listed}): se for o mesmo pagamento, resolva a linha da planilha antes; se não, marque-o.`,
+      `${nearCredit.length} pagamento(s) antecipado(s) vieram desmarcados porque sobra na planilha um crédito de pagamento ou de valor quase igual: ${listed}. Se for o mesmo pagamento, resolva a linha da planilha antes; se não, marque-o.`,
     );
+  }
+  const ambiguousAdvances = heldAdvances.filter((p) => p.reason === 'payment-ambiguous');
+  if (ambiguousAdvances.length > 0) {
+    warnings.push(
+      `${ambiguousAdvances.length} pagamento(s) antecipado(s) vieram desmarcados porque não deu para distinguir, entre os pagamentos recebidos desta fatura, qual quita a fatura anterior: ${ambiguousAdvances.map(advanceText).join('; ')}. Confira antes de marcar.`,
+    );
+  }
+  const selectedAdvances = advanceProposals.filter((p) => p.defaultSelected);
+  if (selectedAdvances.length > 0) {
+    warnings.push(`${selectedAdvances.length} pagamento(s) antecipado(s) a registrar como crédito no cartão: ${selectedAdvances.map(advanceText).join('; ')}.`);
   }
   const latestPayment = context.recordedPayments[0];
   const usableSource = latestPayment ? await usableRecordedSource(latestPayment, account.householdId) : null;
@@ -969,6 +983,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     monthSource,
     period,
     ofxTotal: ofxTotalCents / 100,
+    ledgerBalance: statement.balance === null ? null : -statement.balance,
     lines,
     proposals,
     sheetOnly: result.sheetOnly.map(toTransactionRef),
@@ -1574,7 +1589,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   const selected = new Set(parseSelectedGroups(request.selectedGroups, new Set(lineByRef.keys())));
 
   // Recompute on what is stored now; apply only the selected groups that still exist.
-  const context = await loadCardContext(account, month, lines);
+  const context = await loadCardContext(account, month, lines, undefined, request.ledgerBalance ?? null);
   const result = reconcileCardOfx(context.input);
   const toApply = result.proposals.filter((p) => selected.has(p.group));
   let skipped = selected.size - toApply.length;

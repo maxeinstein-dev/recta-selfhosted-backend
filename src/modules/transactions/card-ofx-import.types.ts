@@ -69,7 +69,7 @@ export interface CardOfxProposal {
   /**
    * Why the proposal is not selected by default: 'ambiguous', 'no-shared-words', 'mixed-categories' (merges),
    * 'neighbour-ambiguous' (the line or the row of the adjacent month has other candidates), 'pool-too-large' (groups), 'near-amount' (a few cents apart without a strong signal), 'near-ambiguous', 'neighbour-weak', 'neighbour-month-not-imported',
-   * 'sheet-residue' (new purchases while sheet rows of the month are left without a bank line), 'sheet-credit-near' (advance-payment: a left-over sheet credit within 5 cents may be the same payment), 'changed-in-statement' (create: the same purchase is already recorded under another ref because the statement changed its amount, date or memo; counterpart = the recorded row), or null.
+   * 'sheet-residue' (new purchases while sheet rows of the month are left without a bank line), 'sheet-credit-near' (advance-payment: a left-over sheet credit within 5 cents may be the same payment), 'changed-in-statement' (create and advance-payment: the same purchase or payment is already recorded under another ref because the statement changed its amount, date or memo; counterpart = the recorded row), 'payment-ambiguous' (advance-payment: the previous invoice's payment could not be told apart from the advances), or null.
    */
   reason: string | null;
   /** 'sheet-residue' on history, 'sheet-credit-near' on an advance payment: the card row left over that the line may be a copy of. */
@@ -140,6 +140,8 @@ export interface CardOfxPreviewResponse {
   period: { start: string; end: string };
   /** Purchases minus refunds and discounts (payments left out). */
   ofxTotal: number;
+  /** The statement's closing balance owed (LEDGERBAL, positive = debt); null when the file has none. Echo it in the confirm. */
+  ledgerBalance: number | null;
   lines: CardOfxLine[];
   proposals: CardOfxProposal[];
   sheetOnly: CardOfxSheetOnly[];
@@ -166,6 +168,8 @@ export interface CardOfxConfirmRequest {
   monthKey: string;
   /** The preview's lines, echoed (up to 1000). */
   lines: CardOfxConfirmLine[];
+  /** The preview's `ledgerBalance`, echoed (optional: without it the previous invoice's payment is the line closest to its reference). */
+  ledgerBalance?: number | null;
   selectedGroups: string[];
   /** For the create proposals. */
   categoryMap: MaxFinCategoryMapInput[];

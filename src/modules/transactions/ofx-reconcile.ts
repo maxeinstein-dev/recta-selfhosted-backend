@@ -112,6 +112,12 @@ export interface ReconcileInput {
   /** Amount of the previous invoice (its recorded payment, else its total); null: the largest payment line wins. */
   paymentReference: number | null;
   /**
+   * The statement's closing balance owed (LEDGERBAL, positive = debt), in reais; null when the file has none. The
+   * payment lines inside a statement are the advances plus the previous invoice's payment, and the balance is the
+   * purchases minus the advances only: purchases - balance = the advances, which tells the main payment apart.
+   */
+  ledgerBalance?: number | null;
+  /**
    * First day ('YYYY-MM-DD') of the calendar month of the card's earliest sheet month. A leftover purchase dated
    * before it is history the sheet never covered, so it is selected by default. Other leftovers of a sheet month are
    * selected only when every sheet row found its bank line (no residue). Null/undefined: no such history.
@@ -206,6 +212,12 @@ export const MAX_GROUP_REFS = 150;
 export const MAX_GROUP_ID_LENGTH = 16_000;
 /** A left-over sheet credit this close (cents) to an unpaired advance payment may be the same payment typed differently. */
 export const ADVANCE_LOOKALIKE_CENTS = 5;
+/** A left-over sheet credit whose description names a payment holds any advance back, whatever its amount. */
+export const PAYMENT_WORDS = /pagamento|antecip/i;
+/** The advances implied by the statement balance must match a payment line within this many cents. */
+export const PAYMENT_CROSSCHECK_CENTS = 2;
+/** A recorded line is a changed copy of a statement line when the amounts differ by at most this many cents (a moved date keeps the amount). */
+export const CHANGED_AMOUNT_CENTS = 5;
 /** Sheet rows one bank line may merge (2 to 4). */
 export const MERGE_MIN_ROWS = 2;
 export const MERGE_MAX_ROWS = 4;
@@ -469,18 +481,46 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     }
   }
 
-  // 0. The previous invoice's payment: the payment line closest to the reference, else the largest one.
+  // 0. The previous invoice's payment. With a statement balance (LEDGERBAL) the advances are implied exactly:
+  // purchases - balance = the advances, so the main payment is the one payment line whose removal leaves that sum
+  // (within 2 cents). Otherwise (no balance, no unique line, or a balance that does not fit, e.g. a refund on the
+  // boundary day) the line closest to the reference, else the largest one, and an invoice with several payment lines
+  // and no clear main is 'payment-ambiguous': its advances are proposed unselected.
   const paymentLines = lines.filter((s) => s.status === 'free' && s.line.kind === 'payment');
+  const allPaymentLines = lines.filter((s) => s.line.kind === 'payment');
   let payment: LineState | null = null;
+  let paymentAmbiguous = false;
   if (paymentLines.length > 0) {
     const reference = input.paymentReference != null && input.paymentReference > 0 ? toCents(input.paymentReference) : null;
-    payment = paymentLines.reduce((best, candidate) => {
+    const byReference = paymentLines.reduce((best, candidate) => {
       if (reference === null) return candidate.cents > best.cents ? candidate : best;
       const d = Math.abs(candidate.cents - reference);
       const bestD = Math.abs(best.cents - reference);
       if (d !== bestD) return d < bestD ? candidate : best;
       return candidate.cents > best.cents ? candidate : best;
     });
+    payment = byReference;
+    let crossChecked = false;
+    if (input.ledgerBalance != null && allPaymentLines.length > 1) {
+      const nonPayment = lines.filter((s) => s.line.kind !== 'payment').reduce((t, s) => t + (s.line.type === 'EXPENSE' ? s.cents : -s.cents), 0);
+      const implied = nonPayment - toCents(input.ledgerBalance);
+      const total = allPaymentLines.reduce((t, s) => t + s.cents, 0);
+      const fits = paymentLines.filter((s) => Math.abs(total - s.cents - implied) <= PAYMENT_CROSSCHECK_CENTS);
+      // Equal amounts are interchangeable: take the first of them.
+      if (fits.length > 0 && fits.every((s) => s.cents === fits[0]!.cents)) {
+        payment = fits.find((s) => s === byReference) ?? fits[0]!;
+        crossChecked = true;
+      }
+    }
+    if (!crossChecked && allPaymentLines.length > 1) {
+      // Without the cross-check the reference must single the main payment out: an exact reference (within 2 cents),
+      // or the chosen line more than twice any other (advances are small next to an invoice).
+      const others = paymentLines.filter((s) => s !== payment).map((s) => s.cents);
+      const exact = reference !== null && Math.abs(payment.cents - reference) <= PAYMENT_CROSSCHECK_CENTS;
+      const dominant = others.every((c) => payment!.cents > 2 * c);
+      const clear = exact || dominant;
+      paymentAmbiguous = !clear;
+    }
     payment.status = 'payment';
     for (const state of paymentLines) if (state !== payment) state.advance = true;
   }
@@ -907,13 +947,7 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       let heldCounterpart: StoredCardRow | null = selected ? null : counterpart;
       // The same purchase (FITID and installment number) is already tied to a row of this period under another ref: the
       // bank changed its amount, date or memo. A second copy would double it, so it is held back for the user.
-      const token = fitidToken(part[0]!.line.fitid);
-      const changed = (input.vanished ?? []).find(
-        (v) =>
-          v.fitids.includes(token) &&
-          v.row.type === part[0]!.line.type &&
-          (v.row.installmentNumber ?? null) === (part[0]!.line.installment?.number ?? null),
-      );
+      const changed = (input.vanished ?? []).find((v) => part.some((s) => isChangedCopy(v, s)));
       if (changed) {
         selected = false;
         reason = 'changed-in-statement';
@@ -928,16 +962,25 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
       });
     }
   }
-  // 8. Advance payments no sheet credit took: a credit on the card (the payment reduces the debt), one per line.
+  // 8. Advance payments no sheet credit took: a credit on the card (the payment reduces the debt), one per line. Held
+  // back (unselected) when it may be a payment already typed in the sheet (a left-over or reviewed credit of the month
+  // that names a payment, or one within 5 cents of it), when the bank changed a recorded one (same FITID, another
+  // ref), or when the main payment could not be told apart from the advances.
   const unpairedAdvances: ReconcileLine[] = [];
+  const ofxLinked = new Set<string>();
+  for (const [ref, id] of input.knownRefs) if (ref.startsWith('ofx:')) ofxLinked.add(id);
+  const usedRowIds = new Set(sheet.filter((r) => r.used).map((r) => r.row.id));
+  const creditRows = input.sheetRows.filter((r) => r.type === 'INCOME' && !usedRowIds.has(r.id) && !ofxLinked.has(r.id));
   for (const state of lines) {
     if (state.status !== 'free' || !state.advance) continue;
     unpairedAdvances.push(state.line);
-    const lookAlike = sheet.find((r) => !r.used && r.row.type === 'INCOME' && Math.abs(r.cents - state.cents) <= ADVANCE_LOOKALIKE_CENTS);
+    const changed = (input.vanished ?? []).find((v) => v.row.type === 'INCOME' && isChangedCopy(v, state));
+    const lookAlike = creditRows.find((r) => PAYMENT_WORDS.test(r.description) || Math.abs(toCents(r.amount) - state.cents) <= ADVANCE_LOOKALIKE_CENTS);
+    const reason = changed ? 'changed-in-statement' : lookAlike ? 'sheet-credit-near' : paymentAmbiguous ? 'payment-ambiguous' : null;
     propose('advance-payment', [state], null, {
-      defaultSelected: !lookAlike,
-      reason: lookAlike ? 'sheet-credit-near' : null,
-      counterpart: lookAlike?.row ?? null,
+      defaultSelected: reason === null,
+      reason,
+      counterpart: changed?.row ?? lookAlike ?? null,
     });
   }
 
@@ -1032,6 +1075,18 @@ const MERCHANT_STOP = new Set(['com', ...GENERIC_WORDS]);
 export function merchantTokens(text: string): Set<string> {
   const raw = text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
   return new Set(raw.filter((t) => (/^\d+$/.test(t) ? t.length >= 2 : t.length >= 3) && !MERCHANT_STOP.has(t)));
+}
+
+/**
+ * A recorded row (tied to an OFX ref the file does not list) that is the same line as `state` with a changed amount or
+ * date: same FITID, type and installment number, and an amount within 5 cents (a moved date keeps the amount). Lines that merely share a FITID (the purchase, its discount and a later refund of one plan) do not count.
+ */
+function isChangedCopy(v: { row: StoredCardRow; fitids: string[] }, state: LineState): boolean {
+  if (!v.fitids.includes(fitidToken(state.line.fitid))) return false;
+  if (v.row.type !== state.line.type) return false;
+  if ((v.row.installmentNumber ?? null) !== (state.line.installment?.number ?? null)) return false;
+  const diff = Math.abs(toCents(v.row.amount) - state.cents);
+  return diff <= CHANGED_AMOUNT_CENTS;
 }
 
 /** Days between two YYYY-MM-DD dates. */

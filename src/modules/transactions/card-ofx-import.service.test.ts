@@ -150,6 +150,7 @@ function confirmRequest(preview: CardOfxPreviewResponse, overrides: Partial<Card
     accountId: preview.accountId,
     monthKey: preview.monthKey,
     lines: preview.lines.map(({ status: _status, group: _group, ...line }) => line),
+    ledgerBalance: preview.ledgerBalance,
     selectedGroups: preview.proposals.filter((p) => p.defaultSelected).map((p) => p.group),
     categoryMap: acceptedMap(preview),
     payment: { apply: true },
@@ -1057,7 +1058,7 @@ describe('card OFX import: several "Pagamento recebido" lines', () => {
     const advance = preview.proposals.find((p) => p.kind === 'advance-payment')!;
     expect(advance).toMatchObject({ defaultSelected: true, target: null, reason: null });
     expect(preview.lines.find((l) => l.amount === 152.4)).toMatchObject({ status: 'proposed', group: advance.group });
-    expect(preview.warnings).toEqual([]);
+    expect(preview.warnings).toEqual([expect.stringContaining('1 pagamento(s) antecipado(s) a registrar')]);
     // Payments are not in the OFX total: the recorded credit shows up as the closing's advancePayments component.
     expect(preview.closing.components.advancePayments).toBe(-(31 + 152.4));
     expect(preview.closing.explained).toBe(true);
@@ -1856,5 +1857,76 @@ describe('card OFX import: re-importing and updated statements', () => {
     // Nothing the user had is deleted: the vanished and the changed row both stay.
     expect(store.transactions.filter((t) => ['Loja Gama', 'Loja Beta'].includes(t.description ?? ''))).toHaveLength(2);
     expect(store.transactions).toHaveLength(before + 2 + (result.futureInstallments ?? 0));
+  });
+});
+
+describe('card OFX import: guards of the updated-statement checks', () => {
+  const opts = { start: '20261002', end: '20261102' };
+  const stored = (extra: Partial<Parameters<typeof seedTransaction>[0]>) =>
+    seedTransaction({ householdId: HH, accountId: CARD, type: 'EXPENSE', categoryName: 'OTHER_EXPENSES', amount: 10, paid: true, ...extra });
+
+  it('a partial refund of the same FITID recorded in the previous statement is not held (the vanished query is bounded by the period)', async () => {
+    const card = seedCard();
+    const earlier = stored({ type: 'INCOME', amount: 20, date: '2026-09-20', description: 'Estorno Loja Alfa', sourceRef: 'ofx:fx1:aaaaaaaa' });
+    seedRef({ householdId: HH, transactionId: earlier.id, ref: 'ofx:fx1:aaaaaaaa' });
+
+    const preview = await buildCardOfxPreview({
+      account: card,
+      buffer: ofx([{ fitid: 'fx1', date: '20261010', amount: '15.00', memo: 'Estorno Loja Alfa' }], opts),
+    });
+
+    expect(preview.proposals.map((p) => [p.kind, p.defaultSelected, p.reason])).toEqual([['create', true, null]]);
+    expect(preview.warnings.filter((w) => w.includes('mudaram de valor'))).toEqual([]);
+  });
+
+  it('the same line listed by two consecutive statements (boundary day) stays reconciled, nothing held or warned', async () => {
+    const card = seedCard();
+    const line = { fitid: 'fx2', date: '20261002', amount: '15.00', memo: 'Estorno Loja Beta' };
+    const first = await buildCardOfxPreview({ account: card, buffer: ofx([line], opts) });
+    await confirmCardOfxImport({ request: confirmRequest(first, { payment: null }), account: card });
+    const count = store.transactions.length;
+
+    const second = await buildCardOfxPreview({ account: card, buffer: ofx([line], { start: '20260902', end: '20261002' }) });
+
+    expect(second.proposals).toEqual([]);
+    expect(second.warnings).toEqual([]);
+    expect(store.transactions).toHaveLength(count);
+  });
+
+  it('warns about vanished rows only strictly inside the period: first day + 1 through the closing day - 2', async () => {
+    const card = seedCard();
+    ['2026-10-02', '2026-10-03', '2026-10-31', '2026-11-01'].forEach((date, i) => {
+      const row = stored({ date, description: `Compra ${i}`, sourceRef: `ofx:gone${i}:aaaaaaaa` });
+      seedRef({ householdId: HH, transactionId: row.id, ref: `ofx:gone${i}:aaaaaaaa` });
+    });
+
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx([{ fitid: 'fx3', date: '20261015', amount: '-5.00', memo: 'Loja Gama' }], opts) });
+
+    const warning = preview.warnings.find((w) => w.includes('mais neste arquivo'))!;
+    expect(warning).toContain('2 lançamento(s)');
+    expect(warning).toContain('Compra 1');
+    expect(warning).toContain('Compra 2');
+    expect(warning).not.toContain('Compra 0');
+    expect(warning).not.toContain('Compra 3');
+  });
+
+  it('a changed advance payment (same FITID, amount +1 cent) is held, warned about, and not recorded twice', async () => {
+    const card = seedCard();
+    const original = ofx([{ fitid: 'pp1', date: '20261012', amount: '40.00', memo: 'Pagamento recebido' }, { fitid: 'pm1', date: '20261003', amount: '900.00', memo: 'Pagamento recebido' }], opts);
+    const first = await buildCardOfxPreview({ account: card, buffer: original });
+    expect(first.proposals.filter((p) => p.defaultSelected && p.kind === 'advance-payment')).toHaveLength(1);
+    await confirmCardOfxImport({ request: confirmRequest(first, { payment: null }), account: card });
+    const count = store.transactions.length;
+
+    const changed = await buildCardOfxPreview({
+      account: card,
+      buffer: ofx([{ fitid: 'pp1', date: '20261012', amount: '40.01', memo: 'Pagamento recebido' }, { fitid: 'pm1', date: '20261003', amount: '900.00', memo: 'Pagamento recebido' }], opts),
+    });
+
+    const held = changed.proposals.find((p) => p.kind === 'advance-payment')!;
+    expect(held).toMatchObject({ defaultSelected: false, reason: 'changed-in-statement' });
+    expect(held.counterpart).toMatchObject({ amount: 40 });
+    expect(changed.warnings).toEqual([expect.stringContaining('mudaram de valor')]);
+    expect(store.transactions).toHaveLength(count);
   });
 });

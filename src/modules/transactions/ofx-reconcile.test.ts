@@ -1258,3 +1258,131 @@ describe('reconcileCardOfx: an updated statement (vanished rows)', () => {
     expect(proposalFor(result, refund.ref)).toMatchObject({ kind: 'create', defaultSelected: true, reason: null });
   });
 });
+
+describe('reconcileCardOfx: which payment line is the previous invoice\'s', () => {
+  const purchase = line('b1', 'Loja Omega', -5000, '2026-09-10');
+  const big = line('pa', 'Pagamento recebido', 4000, '2026-09-12');
+  const small = line('pb', 'Pagamento recebido', 500, '2026-09-05');
+
+  it('uses the statement balance: purchases minus balance = the advances, so a large advance is not taken for the main payment', () => {
+    // balance owed 1000 = 5000 purchases - 4000 advance; the 500 is the previous invoice's payment.
+    const result = run({ lines: [purchase, big, small], ledgerBalance: 1000 });
+
+    expect(result.payment?.line.ref).toBe(small.ref);
+    expect(proposalsOf(result, 'advance-payment').map((p) => [p.refs[0], p.defaultSelected, p.reason])).toEqual([[big.ref, true, null]]);
+  });
+
+  it('without the balance the largest line wins when it is clearly the largest (legacy rule)', () => {
+    expect(run({ lines: [purchase, big, small], paymentReference: null }).payment?.line.ref).toBe(big.ref);
+  });
+
+  it('agrees with the closest-to-reference rule when both point to the same line', () => {
+    const result = run({ lines: [purchase, big, small], ledgerBalance: 1000, paymentReference: 500 });
+
+    expect(result.payment?.line.ref).toBe(small.ref);
+  });
+
+  it('degrades to the reference rule when the balance does not fit any line (a boundary-day refund)', () => {
+    const result = run({ lines: [purchase, big, small], ledgerBalance: 1072.08, paymentReference: 4000 });
+
+    expect(result.payment?.line.ref).toBe(big.ref);
+  });
+
+  it('holds the advances back (payment-ambiguous) when no balance fits and no line is clearly the main one', () => {
+    const a = line('pc', 'Pagamento recebido', 1000, '2026-09-05');
+    const b = line('pd', 'Pagamento recebido', 900, '2026-09-06');
+
+    const result = run({ lines: [purchase, a, b], paymentReference: null });
+
+    expect(proposalsOf(result, 'advance-payment').map((p) => [p.defaultSelected, p.reason])).toEqual([[false, 'payment-ambiguous']]);
+  });
+
+  it('a single payment line is never ambiguous and has no advance', () => {
+    const result = run({ lines: [purchase, small], paymentReference: null });
+
+    expect(result.payment?.line.ref).toBe(small.ref);
+    expect(proposalsOf(result, 'advance-payment')).toEqual([]);
+  });
+});
+
+describe('reconcileCardOfx: advance payments held back', () => {
+  const advance = line('pa', 'Pagamento recebido', 40, '2026-09-12');
+  const main = line('pm', 'Pagamento recebido', 900, '2026-09-05');
+  const lines = [advance, main];
+
+  it('holds on any unused sheet credit that names a payment, whatever its amount', () => {
+    const credit = sheetRow('Pagamento antecipado fatura', 999, { type: 'INCOME' });
+
+    const held = proposalsOf(run({ lines, paymentReference: 900, sheetRows: [credit] }), 'advance-payment')[0]!;
+
+    expect(held).toMatchObject({ defaultSelected: false, reason: 'sheet-credit-near' });
+    expect(held.counterpart?.id).toBe(credit.id);
+  });
+
+  it('does not hold on an unrelated credit of another amount', () => {
+    const credit = sheetRow('Estorno loja', 999, { type: 'INCOME' });
+
+    expect(proposalsOf(run({ lines, paymentReference: 900, sheetRows: [credit] }), 'advance-payment')[0]!.defaultSelected).toBe(true);
+  });
+
+  it('holds on a reviewed (kept) credit within 5 cents even though it is linked', () => {
+    const credit = sheetRow('Credito', 40.02, { type: 'INCOME' });
+
+    const held = proposalsOf(
+      run({ lines, paymentReference: 900, sheetRows: [credit], knownRefs: new Map([['kept:x', credit.id]]), linkedTransactionIds: new Set([credit.id]) }),
+      'advance-payment',
+    )[0]!;
+
+    expect(held).toMatchObject({ defaultSelected: false, reason: 'sheet-credit-near' });
+  });
+
+  it('does not hold on a credit already tied to an OFX line (it represents another payment)', () => {
+    const credit = sheetRow('Pagamento recebido', 40, { type: 'INCOME' });
+
+    const result = run({ lines, paymentReference: 900, sheetRows: [credit], knownRefs: new Map([['ofx:other:aaaaaaaa', credit.id]]), linkedTransactionIds: new Set([credit.id]) });
+
+    expect(proposalsOf(result, 'advance-payment')[0]!.defaultSelected).toBe(true);
+  });
+
+  it('holds a changed advance (same FITID recorded under another ref) and points at the recorded credit', () => {
+    const old = storedRow({ id: 'old-pa', description: 'Pagamento recebido', amount: 40.01, type: 'INCOME', date: '2026-09-12' });
+
+    const held = proposalsOf(run({ lines, paymentReference: 900, vanished: [{ row: old, fitids: ['pa'] }] }), 'advance-payment')[0]!;
+
+    expect(held).toMatchObject({ defaultSelected: false, reason: 'changed-in-statement' });
+    expect(held.counterpart?.id).toBe('old-pa');
+  });
+
+  it('does not take an expense recorded under the same FITID for a changed advance', () => {
+    const old = storedRow({ id: 'old-x', description: 'Loja', amount: 40, type: 'EXPENSE', date: '2026-09-12' });
+
+    expect(proposalsOf(run({ lines, paymentReference: 900, vanished: [{ row: old, fitids: ['pa'] }] }), 'advance-payment')[0]!.defaultSelected).toBe(true);
+  });
+
+  it('checks every line of a plan, not just the first, for a changed purchase', () => {
+    const first = line('pl', 'Loja Sigma - Parcela 1/3', -30, '2026-09-11');
+    const second = line('pl', 'Loja Sigma - Parcela 2/3', -30, '2026-09-11');
+    const old = storedRow({ id: 'old-pl2', description: 'Loja Sigma 2/3', amount: 29.99, date: '2026-09-11', installmentNumber: 2, totalInstallments: 3 });
+
+    const result = run({ lines: [first, second], vanished: [{ row: old, fitids: ['pl'] }] });
+
+    expect(result.proposals.filter((p) => p.reason === 'changed-in-statement')).toHaveLength(1);
+  });
+
+  it('does not hold a plan line because another line of the same FITID (a later refund, a discount) is recorded with a very different amount', () => {
+    const purchaseLine = line('pr', 'Loja Sigma - Parcela 1/2', -37.07, '2026-09-11');
+    const discount = line('pr', 'Desconto Antecipação Loja Sigma', 1.85, '2026-09-11');
+    const laterRefund = storedRow({ id: 'refund', description: 'Estorno de Loja Sigma', amount: 72.1, type: 'INCOME', date: '2026-09-20' });
+
+    const result = run({ lines: [purchaseLine, discount], vanished: [{ row: laterRefund, fitids: ['pr'] }] });
+
+    expect(result.proposals.filter((p) => p.reason === 'changed-in-statement')).toEqual([]);
+  });
+
+  it('holds a line whose date moved (same amount) as a changed copy', () => {
+    const moved = line('pm2', 'Loja Tau', -20, '2026-09-12');
+    const old = storedRow({ id: 'old-pm2', description: 'Loja Tau', amount: 20, date: '2026-09-11' });
+
+    expect(proposalFor(run({ lines: [moved], vanished: [{ row: old, fitids: ['pm2'] }] }), moved.ref)).toMatchObject({ defaultSelected: false, reason: 'changed-in-statement' });
+  });
+});
