@@ -201,6 +201,18 @@ describe('calculateCreditCardInvoice payments by invoice tag', () => {
     expect(sep.paymentTransactions).toHaveLength(1);
   });
 
+  it('calls an invoice paid when binary drift leaves a hair over one cent (whole-cent compare)', async () => {
+    // 0.1 + 0.2 style drift: 3015.5 + 188.42 + 0.01 - 3203.92 = 0.0100000000002 in doubles.
+    store.rows = [purchase('2026-08-20', 1000.1), purchase('2026-08-21', 2000.2), purchase('2026-08-22', 3.21)];
+    store.rows.push(payment('2026-09-02', 3003.5, '2026-09'));
+
+    const sep = await invoice('2026-09');
+
+    expect(sep.total).toBeGreaterThan(0.01);
+    expect(sep.total).toBeLessThan(0.0100001);
+    expect(sep.isPaid).toBe(true);
+  });
+
   it('keeps counting legacy payments dated inside the invoice window', async () => {
     seedSepAndOct();
     store.rows.push(payment('2026-09-20', 1000, '2026-10'));
