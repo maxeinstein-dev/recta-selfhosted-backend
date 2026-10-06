@@ -164,6 +164,14 @@ export const listTransactionsQuerySchema = paginationSchema
     search: z.string().max(100).optional(),
     // paid=false lists the pending ones (forecasts waiting to be confirmed); paid=true the settled ones
     paid: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  })
+  .refine((q) => !(q.month && (q.monthFrom || q.monthTo)), {
+    message: 'Use either month or monthFrom/monthTo, not both',
+    path: ['month'],
+  })
+  .refine((q) => !(q.monthFrom && q.monthTo && q.monthFrom > q.monthTo), {
+    message: 'monthFrom must not be after monthTo',
+    path: ['monthFrom'],
   });
 
 export type ListTransactionsQuery = z.infer<typeof listTransactionsQuerySchema>;

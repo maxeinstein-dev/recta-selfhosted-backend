@@ -455,7 +455,8 @@ export async function executeRecurringTransaction(
   const occurrenceAmount = expectedAmountFor(
     { amount: recurring.amount.toNumber(), followLastAmount: recurring.followLastAmount },
     [],
-    monthOfDate(transactionDate),
+    // The month the occurrence counts for (its reference month), not the month of its date
+    recurring.competenceOffsetMonths != null ? addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths) : monthOfDate(transactionDate),
   );
 
   let isIncome: boolean;

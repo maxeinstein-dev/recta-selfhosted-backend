@@ -57,6 +57,14 @@ describe('transaction schemas: competenceMonth', () => {
     expect(createTransactionSchema.safeParse({ ...base, type: 'ALLOCATION', competenceMonth: '2026-10' }).success).toBe(false);
     expect(createTransactionSchema.safeParse({ ...base, type: 'TRANSFER' }).success).toBe(true);
   });
+  it('the list query refuses month together with monthFrom/monthTo, and monthFrom after monthTo', () => {
+    expect(listTransactionsQuerySchema.safeParse({ month: '2026-10', monthFrom: '2026-09' }).success).toBe(false);
+    expect(listTransactionsQuerySchema.safeParse({ month: '2026-10', monthTo: '2026-11' }).success).toBe(false);
+    expect(listTransactionsQuerySchema.safeParse({ monthFrom: '2026-11', monthTo: '2026-10' }).success).toBe(false);
+    expect(listTransactionsQuerySchema.safeParse({ monthFrom: '2026-10', monthTo: '2026-10' }).success).toBe(true);
+    expect(listTransactionsQuerySchema.safeParse({ monthFrom: '2026-10' }).success).toBe(true);
+    expect(listTransactionsQuerySchema.safeParse({ month: '2026-10' }).success).toBe(true);
+  });
   it('the list query takes paid=true|false and rejects anything else', () => {
     expect(listTransactionsQuerySchema.parse({ paid: 'false' }).paid).toBe(false);
     expect(listTransactionsQuerySchema.parse({ paid: 'true' }).paid).toBe(true);
@@ -70,7 +78,7 @@ describe('recurrence schemas: competenceOffsetMonths', () => {
   it('accepts an integer 0..12, absent or null', () => {
     expect(createRecurringTransactionSchema.parse({ ...create, competenceOffsetMonths: 1 }).competenceOffsetMonths).toBe(1);
     expect(createRecurringTransactionSchema.parse({ ...create, competenceOffsetMonths: 12 }).competenceOffsetMonths).toBe(12);
-    expect(createRecurringTransactionSchema.parse({ ...create, competenceOffsetMonths: 0 }).competenceOffsetMonths).toBe(0);
+    expect(createRecurringTransactionSchema.parse({ ...create, competenceOffsetMonths: 0 }).competenceOffsetMonths).toBeNull(); // same month = null
     expect(createRecurringTransactionSchema.parse(create).competenceOffsetMonths).toBeUndefined();
     expect(createRecurringTransactionSchema.parse({ ...create, competenceOffsetMonths: null }).competenceOffsetMonths).toBeNull();
   });
@@ -177,13 +185,13 @@ describe('recurrence with a competence offset', () => {
     expect(months).toEqual(['2027-01', '2027-01']);
   });
 
-  it('offset 0 stamps the month of the date; no offset leaves the reference month null (regression)', async () => {
-    const zero = rec({ competenceOffsetMonths: 0 });
+  it('offset 0 (same month) and no offset both leave the reference month null', async () => {
+    const zero = rec({ competenceOffsetMonths: null });
     await executeRecurringTransaction(zero.id, HH, { date: new Date(2026, 8, 25) });
     const none = rec({ description: 'Sem', nextRunAt: '2026-09-26', startDate: '2026-09-26' });
     await executeRecurringTransaction(none.id, HH, { date: new Date(2026, 8, 26) });
     const txs = rowsOf('transaction');
-    expect(txs.find((t) => t.recurringTransactionId === zero.id)!.competenceMonth).toBe('2026-09');
+    expect(txs.find((t) => t.recurringTransactionId === zero.id)!.competenceMonth).toBeNull();
     expect(txs.find((t) => t.recurringTransactionId === none.id)!.competenceMonth).toBeNull();
   });
 

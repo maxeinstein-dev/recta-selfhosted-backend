@@ -222,6 +222,7 @@ export const fakeServices = {
       householdId: input.householdId, accountId: input.accountId, type: input.type ?? 'EXPENSE', categoryName: input.categoryName,
       amount: input.amount, description: input.description ?? null, date: input.date, notes: input.notes ?? null,
       paid: input.paid !== false, sourceRef: input.sourceRef ?? null, recurringTransactionId: input.recurringTransactionId ?? null,
+      competenceMonth: input.competenceMonth ?? null,
     });
     if (collides('transaction', row, store.transaction!)) throw prismaError('P2002', 'Unique constraint failed');
     const saved = snapshot();

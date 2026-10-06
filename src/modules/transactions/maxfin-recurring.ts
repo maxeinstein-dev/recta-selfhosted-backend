@@ -33,6 +33,8 @@ export type RecurringMatch =
       /** Day of month the recurrence is anchored to (its startDate day). */
       anchorDay: number;
       amount: number;
+      /** Months between the occurrence date and the month it refers to (null = same month). */
+      competenceOffsetMonths?: number | null;
     };
 
 /** Rows that can be taken over by a recurrence: plain expenses, not installments, not the income block. */
@@ -92,7 +94,7 @@ export async function loadRecurringMatcher(
 
   const recurrences = await prisma.recurringTransaction.findMany({
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
-    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true },
+    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true },
   });
   // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
   // followLastAmountInTx): a sheet of a far future month must not consume it.
@@ -147,6 +149,7 @@ export async function loadRecurringMatcher(
         endDate,
         anchorDay: anchorDayOf(r.startDate),
         amount: r.amount.toNumber(),
+        competenceOffsetMonths: r.competenceOffsetMonths ?? null,
       });
     });
 

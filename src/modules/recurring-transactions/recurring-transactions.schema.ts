@@ -9,7 +9,8 @@ import { categoryNameSchema } from '../categories/categories.schema.js';
 export const recurrenceFrequencyEnum = z.nativeEnum(RecurrenceFrequency);
 
 /** 0..12 months between an occurrence's date and its reference month. */
-export const competenceOffsetSchema = z.number().int().min(0).max(12);
+/** 0..12 months; 0 ("same month") is stored as null, like the UI sends it, so there is one way to say it. */
+export const competenceOffsetSchema = z.number().int().min(0).max(12).transform((n) => (n === 0 ? null : n));
 
 /**
  * Create recurring transaction request

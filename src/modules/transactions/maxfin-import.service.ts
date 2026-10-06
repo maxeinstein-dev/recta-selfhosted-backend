@@ -64,6 +64,7 @@ import type {
   MaxFinWorkbookPreviewResponse,
   MaxFinWorkbookSheet,
 } from './maxfin-import.types.js';
+import { addMonths as addMonthsKey, monthOfDate } from '../../shared/utils/competence.js';
 import { createTransaction, deleteTransaction, payCreditCardInvoice, updateTransaction } from './transactions.service.js';
 import { addMonthsClamped, localDate } from '../recurring-transactions/recurring-dates.js';
 import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
@@ -1096,7 +1097,7 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   // Re-check what is already stored at write time (the preview is not trusted).
   const existingRows = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: rows.map((r) => r.sourceRef) } },
-    select: { id: true, sourceRef: true, recurringTransactionId: true },
+    select: { id: true, sourceRef: true, recurringTransactionId: true, competenceMonth: true },
   });
   const existingByRef = new Map(existingRows.map((t) => [t.sourceRef as string, t.id]));
   const links = await loadMergeLinks(
@@ -1107,6 +1108,11 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   // A row the sheet already took over keeps its link to the recurrence when it is replaced.
   const recurrenceOfExisting = new Map(
     existingRows.filter((t) => t.recurringTransactionId).map((t) => [t.sourceRef as string, t.recurringTransactionId as string]),
+  );
+
+  // Replacing deletes and recreates a row: a reference month the user set on it must survive.
+  const competenceOfExisting = new Map(
+    existingRows.filter((t) => t.competenceMonth).map((t) => [t.sourceRef as string, t.competenceMonth as string]),
   );
 
   // Recurrences that already cover the month, loaded only when a row could take one over.
@@ -1232,6 +1238,7 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
           isSplit: false,
           sourceRef: row.sourceRef,
           ...(recurrenceOfExisting.has(row.sourceRef) ? { recurringTransactionId: recurrenceOfExisting.get(row.sourceRef)! } : {}),
+          ...(competenceOfExisting.has(row.sourceRef) ? { competenceMonth: competenceOfExisting.get(row.sourceRef)! } : {}),
           ...installmentFields(row.installment),
         },
         userId,
@@ -1407,6 +1414,8 @@ async function assumeRecurrence(match: RecurringMatch, ctx: AssumeContext): Prom
       isSplit: false,
       sourceRef: row.sourceRef,
       recurringTransactionId: match.recurringId,
+      // Same stamp the recurrence gives its own occurrences (date month + offset)
+      ...(match.competenceOffsetMonths != null ? { competenceMonth: addMonthsKey(monthOfDate(date), match.competenceOffsetMonths) } : {}),
     },
     userId,
     {
