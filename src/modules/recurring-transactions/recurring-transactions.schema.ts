@@ -8,6 +8,9 @@ import { categoryNameSchema } from '../categories/categories.schema.js';
  */
 export const recurrenceFrequencyEnum = z.nativeEnum(RecurrenceFrequency);
 
+/** 0..12 months between an occurrence's date and its reference month. */
+export const competenceOffsetSchema = z.number().int().min(0).max(12);
+
 /**
  * Create recurring transaction request
  */
@@ -24,6 +27,8 @@ export const createRecurringTransactionSchema = z.object({
   isActive: z.boolean().default(true),
   // When true, editing the most recent occurrence updates the recurrence amount (predicts the next value)
   followLastAmount: z.boolean().default(false),
+  // Months between the occurrence date and the month it refers to (1 = the following month); null/omitted = same month
+  competenceOffsetMonths: competenceOffsetSchema.nullish(),
 });
 
 export type CreateRecurringTransactionInput = z.infer<
@@ -44,6 +49,7 @@ export const updateRecurringTransactionSchema = z.object({
   nextRunAt: localDateSchema.optional(),
   isActive: z.boolean().optional(),
   followLastAmount: z.boolean().optional(),
+  competenceOffsetMonths: competenceOffsetSchema.nullable().optional(), // null clears (back to the same month)
 });
 
 export type UpdateRecurringTransactionInput = z.infer<

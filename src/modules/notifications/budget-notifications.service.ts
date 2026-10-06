@@ -1,6 +1,7 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { NotificationType } from './notifications.schema.js';
 import { createNotification } from './notifications.service.js';
+import { effectiveMonthWhere, monthOfDate } from '../../shared/utils/competence.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { CategoryName, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
@@ -14,7 +15,8 @@ export async function checkBudgetThresholds(
   categoryName: string,
   transactionDate: Date,
   transactionAmount: number,
-  transactionType: 'INCOME' | 'EXPENSE'
+  transactionType: 'INCOME' | 'EXPENSE',
+  competenceMonth?: string | null
 ) {
   // Only check expenses (budgets are for expenses)
   if (transactionType !== 'EXPENSE') {
@@ -26,11 +28,15 @@ export async function checkBudgetThresholds(
   monthStart.setDate(1);
   monthStart.setHours(0, 0, 0, 0);
 
+  // The budget month is the planning month: the reference month when set, else the month of the date.
+  const budgetMonth = competenceMonth ?? monthOfDate(transactionDate);
+  const budgetMonthStart = new Date(Number(budgetMonth.slice(0, 4)), Number(budgetMonth.slice(5, 7)) - 1, 1);
+
   const budget = await prisma.budget.findFirst({
     where: {
       householdId,
       categoryName,
-      month: monthStart,
+      month: budgetMonthStart,
       type: 'EXPENSE',
     },
   });
@@ -50,10 +56,7 @@ export async function checkBudgetThresholds(
       householdId,
       categoryName,
       type: 'EXPENSE',
-      date: {
-        gte: monthStart,
-        lte: monthEnd,
-      },
+      AND: [effectiveMonthWhere(budgetMonth)],
     },
     select: { amount: true },
   });

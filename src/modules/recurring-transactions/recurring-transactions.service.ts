@@ -5,6 +5,7 @@ import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, Trans
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
+import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
 import type {
@@ -95,6 +96,7 @@ export async function createRecurringTransaction(
     nextRunAt,
     isActive,
     followLastAmount,
+    competenceOffsetMonths,
   } = input;
 
   // Verify account belongs to household
@@ -128,6 +130,7 @@ export async function createRecurringTransaction(
       nextRunAt,
       isActive,
       followLastAmount,
+      competenceOffsetMonths: competenceOffsetMonths ?? null,
     },
     include: {
       account: {
@@ -324,6 +327,7 @@ export async function updateRecurringTransaction(
       ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
       ...(input.isActive !== undefined && { isActive: input.isActive }),
       ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
+      ...(input.competenceOffsetMonths !== undefined && { competenceOffsetMonths: input.competenceOffsetMonths }),
     },
     include: {
       account: {
@@ -522,6 +526,10 @@ export async function executeRecurringTransaction(
         notes: `Auto-generated from recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
         paid: isPaid,
         recurringTransactionId: recurring.id,
+        // Reference month of the occurrence (a voucher paid on 25 Sep that refers to October): date month + offset
+        ...(recurring.competenceOffsetMonths != null && {
+          competenceMonth: addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths),
+        }),
       },
       include: {
         account: {

@@ -15,12 +15,12 @@ const SPECS: Record<string, { unique: string[][]; defaults: () => Record<string,
     unique: [['householdId', 'sourceRef']],
     defaults: () => ({
       description: null, notes: null, sourceRef: null, paid: true, accountId: null, recurringTransactionId: null,
-      installmentId: null, installmentNumber: null, totalInstallments: null, attachmentUrl: null, type: 'EXPENSE',
+      installmentId: null, installmentNumber: null, totalInstallments: null, attachmentUrl: null, type: 'EXPENSE', competenceMonth: null,
     }),
   },
   recurringTransaction: {
     unique: [],
-    defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY' }),
+    defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY', competenceOffsetMonths: null }),
   },
   account: { unique: [], defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING', name: 'Conta' }) },
   category: { unique: [], defaults: () => ({}) },
@@ -298,6 +298,7 @@ export interface SeedTx {
   installmentNumber?: number | null;
   totalInstallments?: number | null;
   attachmentUrl?: string | null;
+  competenceMonth?: string | null;
 }
 
 export function seedTransaction(data: SeedTx): Row {
@@ -320,6 +321,7 @@ export interface SeedRecurrence {
   isActive?: boolean;
   followLastAmount?: boolean;
   endDate?: string | null;
+  competenceOffsetMonths?: number | null;
 }
 
 export function seedRecurrence(data: SeedRecurrence): Row {

@@ -1,7 +1,7 @@
+import { monthOrRangeWhere } from '../../shared/utils/competence.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
-import { parseMonthFilter } from '../../shared/utils/pagination.js';
 import { CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
@@ -177,16 +177,8 @@ export async function deleteBudget(budgetId: string) {
 export async function getBudgetSummary(query: BudgetSummaryQuery) {
   const { householdId, month, startDate, endDate } = query;
 
-  // Build date filter
-  let dateFilter: { gte?: Date; lte?: Date } | undefined;
-  if (month) {
-    const { start, end } = parseMonthFilter(month);
-    dateFilter = { gte: start, lte: end };
-  } else if (startDate || endDate) {
-    dateFilter = {};
-    if (startDate) dateFilter.gte = startDate;
-    if (endDate) dateFilter.lte = endDate;
-  }
+  // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
+  const periodWhere = monthOrRangeWhere({ month, startDate, endDate });
 
   // Get all budgets for the household
   const budgets = await prisma.budget.findMany({
@@ -219,7 +211,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
         const totalWhere: Prisma.TransactionWhereInput = {
           householdId,
           type: budget.type as CategoryType,
-          ...(dateFilter && { date: dateFilter }),
+          ...periodWhere,
         };
         const totalTransactions = await prisma.transaction.findMany({
           where: totalWhere,
@@ -232,7 +224,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
         const where: Prisma.TransactionWhereInput = {
           householdId,
           categoryName: budget.categoryName,
-          ...(dateFilter && { date: dateFilter }),
+          ...periodWhere,
         };
 
         const transactions = await prisma.transaction.findMany({
