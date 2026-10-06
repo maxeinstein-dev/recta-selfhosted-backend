@@ -135,7 +135,7 @@ export async function categoryRoutes(app: FastifyInstance) {
       tags: ['Categories'],
       security: [{ bearerAuth: [] }],
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const { id } = request.params;
@@ -195,7 +195,7 @@ export async function categoryRoutes(app: FastifyInstance) {
         },
         required: ['name', 'type'],
       },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const body = createCategorySchema.parse(request.body);
@@ -227,7 +227,7 @@ export async function categoryRoutes(app: FastifyInstance) {
       security: [{ bearerAuth: [] }],
       params: { type: 'object', required: ['categoryId'], properties: { categoryId: { type: 'string', format: 'uuid' } } },
       body: { type: 'object', properties: { name: { type: 'string' }, icon: { type: 'string', nullable: true }, color: { type: 'string', nullable: true } } },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const { categoryId } = categoryIdParamSchema.parse(request.params);
