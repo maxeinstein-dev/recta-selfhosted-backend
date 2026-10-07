@@ -1,13 +1,12 @@
 /**
  * Tiny evaluator of the Prisma `where` shapes the month filters build (AND / OR / NOT, equality, null, in, gte / lte,
- * contains), over rows whose `date` is a 'YYYY-MM-DD' string. Date bounds are read by their local calendar day, the
- * way the services build them (local midnight to local 23:59:59.999), so the tests do not depend on the time zone.
+ * contains), over rows whose `date` is a 'YYYY-MM-DD' string. A Date bound is read by its UTC calendar day, which is
+ * what the driver does with a bound on a `@db.Date` column (it sends the UTC date part), so a bound that is not built
+ * as a UTC-midnight day is judged here exactly as the database judges it, in every time zone.
  */
 export type Row = Record<string, unknown>;
 
-const pad = (n: number) => String(n).padStart(2, '0');
-const localDay = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const asDay = (v: unknown) => (v instanceof Date ? localDay(v) : String(v));
+const asDay = (v: unknown) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v));
 
 export function matchesWhere(row: Row, where: Record<string, unknown> | undefined): boolean {
   if (!where) return true;

@@ -12,6 +12,16 @@ import type {
   BudgetSummaryQuery,
 } from './budgets.schema.js';
 
+
+/**
+ * First day of the month of `day` (a local-midnight Date from `localDateSchema`) as the UTC-midnight Date a `@db.Date`
+ * column holds. Built from the local calendar day, so the month is the one the user picked, and from UTC midnight,
+ * so it is the same value the month filters and the budget lookups compare with in any time zone.
+ */
+export function budgetMonthStart(day: Date): Date {
+  return new Date(Date.UTC(day.getFullYear(), day.getMonth(), 1));
+}
+
 /**
  * Create a new budget
  */
@@ -41,9 +51,7 @@ export async function createBudget(input: CreateBudgetInput) {
   }
 
   // Normalize month to start of month
-  const monthStart = new Date(month);
-  monthStart.setDate(1);
-  monthStart.setHours(0, 0, 0, 0);
+  const monthStart = budgetMonthStart(month);
 
   // Check if budget already exists for this category, month and type.
   // Including type lets a household keep both a general INCOME and a general
@@ -134,10 +142,7 @@ export async function updateBudget(budgetId: string, input: UpdateBudgetInput) {
 
   // Normalize month to start of month if provided
   if (input.month) {
-    const monthStart = new Date(input.month);
-    monthStart.setDate(1);
-    monthStart.setHours(0, 0, 0, 0);
-    updateData.month = monthStart;
+    updateData.month = budgetMonthStart(input.month);
   }
 
   const budget = await prisma.budget.update({

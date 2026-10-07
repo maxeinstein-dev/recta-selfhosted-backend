@@ -23,7 +23,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
     budget: {
       findMany: vi.fn(async () => store.budgets.map((b) => ({ ...b, monthlyLimit: decimal(b.monthlyLimit as number) }))),
       findFirst: vi.fn(async (args: { where: { month: Date } }) => {
-        const wanted = `${args.where.month.getFullYear()}-${String(args.where.month.getMonth() + 1).padStart(2, '0')}`;
+        const wanted = args.where.month.toISOString().slice(0, 7); // a budget month is a UTC-midnight @db.Date value
         const b = store.budgets.find((x) => x.monthKey === wanted);
         return b ? { ...b, monthlyLimit: decimal(b.monthlyLimit as number) } : null;
       }),
@@ -130,7 +130,7 @@ describe('budget alerts', () => {
     await checkBudgetThresholds(HH, 'GROCERIES', new Date(2026, 8, 29), 80, 'EXPENSE', '2026-10');
     expect(prisma.budget.findFirst).toHaveBeenCalledTimes(1);
     const call = (prisma.budget.findFirst as unknown as { mock: { calls: Array<[{ where: { month: Date } }]> } }).mock.calls[0]![0];
-    expect(call.where.month.getMonth()).toBe(9);
+    expect(call.where.month.getUTCMonth()).toBe(9);
     // it counted the 80 of the referenced row: 80% is over the 75% threshold, so the member is notified
     expect(createNotification).toHaveBeenCalledTimes(1);
   });
@@ -140,7 +140,7 @@ describe('budget alerts', () => {
     tx({ date: '2026-09-29', amount: -80 });
     await checkBudgetThresholds(HH, 'GROCERIES', new Date(2026, 8, 29), 80, 'EXPENSE');
     const call = (prisma.budget.findFirst as unknown as { mock: { calls: Array<[{ where: { month: Date } }]> } }).mock.calls[0]![0];
-    expect(call.where.month.getMonth()).toBe(8);
+    expect(call.where.month.getUTCMonth()).toBe(8);
     expect(createNotification).toHaveBeenCalledTimes(1);
   });
 });

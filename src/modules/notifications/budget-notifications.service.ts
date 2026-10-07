@@ -23,14 +23,10 @@ export async function checkBudgetThresholds(
     return;
   }
 
-  // Get budget for this category and month
-  const monthStart = new Date(transactionDate);
-  monthStart.setDate(1);
-  monthStart.setHours(0, 0, 0, 0);
-
   // The budget month is the planning month: the reference month when set, else the month of the date.
   const budgetMonth = competenceMonth ?? monthOfDate(transactionDate);
-  const budgetMonthStart = new Date(Number(budgetMonth.slice(0, 4)), Number(budgetMonth.slice(5, 7)) - 1, 1);
+  // A budget month is stored as the first day, a UTC-midnight date like every @db.Date value
+  const budgetMonthStart = new Date(Date.UTC(Number(budgetMonth.slice(0, 4)), Number(budgetMonth.slice(5, 7)) - 1, 1));
 
   const budget = await prisma.budget.findFirst({
     where: {
@@ -46,11 +42,6 @@ export async function checkBudgetThresholds(
   }
 
   // Calculate spending for this category in this month
-  const monthEnd = new Date(monthStart);
-  monthEnd.setMonth(monthEnd.getMonth() + 1);
-  monthEnd.setDate(0); // Last day of month
-  monthEnd.setHours(23, 59, 59, 999);
-
   const transactions = await prisma.transaction.findMany({
     where: {
       householdId,
@@ -81,7 +72,13 @@ export async function checkBudgetThresholds(
 
   // Check if we've already sent notifications for this threshold
   // We only want to send once per threshold per month
-  // Query all BUDGET_ALERT notifications for this household in this month
+  // Query all BUDGET_ALERT notifications for this household in this month. `createdAt` is an instant (not a
+  // @db.Date), so the month of the transaction date is bounded by local-time instants. The month comes from
+  // monthOfDate, which reads a date from a @db.Date column (UTC midnight) as its own day: a local getter read the
+  // day before when the transaction is the first of a month.
+  const dateMonth = monthOfDate(transactionDate);
+  const notificationsStart = new Date(Number(dateMonth.slice(0, 4)), Number(dateMonth.slice(5, 7)) - 1, 1);
+  const notificationsEnd = new Date(Number(dateMonth.slice(0, 4)), Number(dateMonth.slice(5, 7)), 0, 23, 59, 59, 999);
   const existingNotifications = await prisma.notification.findMany({
     where: {
       type: NotificationType.BUDGET_ALERT,
@@ -89,8 +86,8 @@ export async function checkBudgetThresholds(
         in: members.map((m) => m.userId),
       },
       createdAt: {
-        gte: monthStart,
-        lte: monthEnd,
+        gte: notificationsStart,
+        lte: notificationsEnd,
       },
     },
   });
@@ -155,7 +152,7 @@ export async function checkBudgetThresholds(
               percentage: roundedPercentage,
               spending,
               limit,
-              month: monthStart.toISOString(),
+              month: notificationsStart.toISOString(),
             },
             deepLink,
           });
@@ -190,7 +187,7 @@ export async function checkBudgetThresholds(
               spending,
               limit,
               overBudget: overBudgetAmount,
-              month: monthStart.toISOString(),
+              month: notificationsStart.toISOString(),
             },
             deepLink,
           });

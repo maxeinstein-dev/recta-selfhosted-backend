@@ -31,16 +31,14 @@ export interface ConfirmImportResult {
 const AMOUNT_TOLERANCE = 0.005;
 
 /**
- * Pure helper: calendar-day window for a parsed row.
- * Transaction.date is @db.Date (day precision), so dedup must ignore
- * the time component that OFX/CSV parsers may include.
+ * Pure helper: day window for a parsed row, both bounds the UTC-midnight Date of the day the row is stored on.
+ * Transaction.date is @db.Date (day precision) and the driver stores the UTC date part of the instant, so dedup must
+ * ignore the time component that OFX/CSV parsers may include and compare that same day. A 23:59:59.999 end bound
+ * would be the next day in UTC in time zones behind it, and a purchase would match a duplicate from the next day.
  */
 export function getDayRange(date: Date): { start: Date; end: Date } {
-  const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(date);
-  end.setHours(23, 59, 59, 999);
-  return { start, end };
+  const day = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  return { start: day, end: new Date(day) };
 }
 
 /**

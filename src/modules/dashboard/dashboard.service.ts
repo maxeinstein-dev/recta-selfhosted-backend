@@ -1,5 +1,5 @@
 import { prisma } from '../../shared/db/prisma.js';
-import { parseMonthFilter } from '../../shared/utils/pagination.js';
+import { parseMonthFilter, utcDayString } from '../../shared/utils/pagination.js';
 import { addMonths, effectiveMonthWhere } from '../../shared/utils/competence.js';
 import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
 import { AccountType, TransactionType, CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
@@ -575,10 +575,9 @@ async function getHeatmapData(
   month: string,
   creditCardIds: Set<string>
 ): Promise<{ month: string; data: DashboardHeatmapDay[]; total: number; daysInMonth: number }> {
-  const [year, monthNum] = month.split('-').map(Number);
-  const monthStart = new Date(year, monthNum - 1, 1);
-  const monthEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
-  const daysInMonth = new Date(year, monthNum, 0).getDate();
+  // First and last day as 'YYYY-MM-DD' text, so the comparison is by calendar day in any time zone
+  const { start: monthStart, end: monthEnd } = parseMonthFilter(month);
+  const daysInMonth = monthEnd.getUTCDate();
 
   const creditCardIdsArray = Array.from(creditCardIds);
 
@@ -589,8 +588,8 @@ async function getHeatmapData(
       SUM(ABS(amount))::text as amount
     FROM "transactions"
     WHERE "household_id" = ${householdId}::uuid
-      AND date >= ${monthStart}
-      AND date <= ${monthEnd}
+      AND date >= ${utcDayString(monthStart)}::date
+      AND date <= ${utcDayString(monthEnd)}::date
       AND type = 'EXPENSE'
       AND (
         "account_id" IS NULL 
