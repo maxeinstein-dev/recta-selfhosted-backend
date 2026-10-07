@@ -181,7 +181,19 @@ The answer has the invoice month (`month`, `monthKey`, and `monthSource`: `state
 
 **Payment of the previous invoice.** The `Pagamento recebido` lines pay the month before the invoice's. `payment` sets them against the payments the app already counts for that invoice (tagged `invoice_pay:<card>:<year>-<month0>` and dated up to today, as in the invoice view): `state` is `matches`, `differs`, `missing`, or `undetermined` when the file has several payment lines (some may be advances). Memos such as `Parcela N/M`, `NuPay`, `Desconto Antecipação` and `Pagamento recebido` are Nubank's; any other bank's invoice still parses, as plain purchases and credits.
 
-This endpoint only previews: it says which lines the app already holds, by reference, and nothing is written.
+The preview saves nothing; it says which lines the app already holds, by reference.
+
+Each new line also carries `possibleDuplicate` when a transaction typed by hand on the same card (no source reference, not yet linked to a line) has the same direction, the same amount in cents and a date within 3 days; a transaction is offered to one line only (lines in order, closest date first). `categorySuggestions` lists the category the household last gave each merchant of the new lines (never "other", never a deleted custom category), and the warning `possible-duplicates` appears when any line is flagged.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/card-ofx/confirm` | JSON: `{ accountId, lines, selectedRefs, createDespiteDuplicate?, links?, categoryMap? }` | Creates the selected lines as transactions on the card (paid, with the line's memo as description and its `ofx:` ref as `source_ref`; an installment line also gets its plan id, number and total). Requires EDITOR+ on the card household. |
+
+**Idempotent, and the client is not trusted.** `lines` are the preview lines in order, echoed back; each is checked against its own content (its ref must be the one derived from its fitid, memo, amount and date, with identical lines numbered in file order; its kind, merchant and installment must follow from its memo), so a ref can only name the line it came from, and a mismatch is a 400. What is new is decided on fresh data: a line whose ref a transaction already carries or represents is skipped (`already-imported`), whoever imported it, and `source_ref` is unique per household, so parallel confirms cannot create a line twice. Confirms on one card are serialised by an advisory lock. Rows are not atomic (each is created by the regular transaction service); if one fails after others were saved the answer carries `stoppedAt` and sending the same request again continues. Payment lines are refused (a 400), and so is a category that does not fit the line's direction or a custom one that is not in the household.
+
+**Transactions typed by hand.** A selected line that still has a `possibleDuplicate` is skipped (`possible-duplicate`) unless its ref is in `createDespiteDuplicate`. `links: [{ ref, transactionId }]` records the line as represented by that transaction instead of creating one (`transaction_external_refs`): the server only accepts the transaction it offers for that line now, rechecks it under a row lock (same card, no ref, same direction and amount, not linked yet) and answers `link-refused` otherwise. A linked line shows as `reconciled` from then on. Smarter matching (amounts that differ, several rows for one purchase, other months) is not part of this step.
+
+Payment lines, future installments of a plan and adjusting the previous invoice payment are not written by this step.
 
 UTF-8, windows-1252 and UTF-16 (with a byte order mark) files are read; `CDATA` sections in memos and ids are supported.
 ## Transaction write hooks (internal)
