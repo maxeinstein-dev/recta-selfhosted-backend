@@ -57,6 +57,12 @@ git diff --check
 `npx vitest run path/to/file.test.ts` runs a single file; `npx vitest` starts watch mode. If you changed
 `prisma/schema.prisma` or added a migration, see "Migrations" below.
 
+Tests that need a real PostgreSQL (row locks, concurrent requests) are skipped unless `TEST_DATABASE_ADMIN_URL` is set to a
+server URL, for example
+`TEST_DATABASE_ADMIN_URL=postgresql://user:password@localhost:5432/postgres npm test -- recurring-concurrency.db`.
+They create a scratch database named `recta_test_<area>_<timestamp>` on that server, migrate it, run and drop it; they never
+touch another database.
+
 ## Contribution rules
 
 1. **One PR = one feature (or fix) that can be reverted on its own.** If `git revert` of the PR leaves a
