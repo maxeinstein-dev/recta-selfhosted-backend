@@ -139,6 +139,23 @@ so the schema and endpoints stay in sync.
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
 
+### Tests against a real PostgreSQL (opt-in)
+
+`npm test` never touches a database, except for the suites named `*.db.test.ts`, which are skipped unless
+`TEST_DATABASE_ADMIN_URL` points at a **throwaway** PostgreSQL server (any database of it). Each suite creates its own
+scratch database, applies the migrations, runs and drops it. Never point it at a server that holds real data.
+
+```bash
+docker run -d --name recta-test-pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:55432:5432 postgres:15
+export TEST_DATABASE_ADMIN_URL=postgresql://postgres:test@127.0.0.1:55432/postgres
+TZ=America/Sao_Paulo npx vitest run   # the production zone, where month-bound bugs show
+TZ=UTC npx vitest run
+docker rm -f recta-test-pg
+```
+
+`src/modules/transactions/transactions.month-bounds.db.test.ts` checks that each month's list, summary, by-category,
+recap, dashboard, heatmaps and budgets hold exactly the rows of that month (last and first days included).
+
 ## Recurring transactions (cron)
 
 To process recurring transactions daily, run as a cron job:
