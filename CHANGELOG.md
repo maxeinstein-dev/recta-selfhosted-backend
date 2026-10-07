@@ -16,5 +16,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Tests with [Vitest](https://vitest.dev/): `npm test` runs `src/**/*.test.ts` without touching the database, starting with tests for cursor pagination.
 - Continuous integration on GitHub Actions: `db:generate`, `typecheck`, `build` and `vitest` on every pull request and on `main`.
 
+### Fixed
+
+- Cursor-paginated transaction listings and the credit card invoice now use a total order (date, creation time, id), so pages no longer overlap or skip rows that share a date.
+
 <!-- Reference entries to their PR like this (see CONTRIBUTING.md): `... ([#123]).` and, at the bottom of this file,
      `[#123]: https://github.com/lucianodiisouza/recta-selfhosted-backend/pull/123`. -->
