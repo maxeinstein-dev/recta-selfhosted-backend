@@ -54,6 +54,11 @@ npm test               # vitest run
 git diff --check
 ```
 
+The statement import also has a test against a real Postgres (`src/modules/transactions/import.integration.test.ts`). It is skipped
+unless `IMPORT_DB_TEST_URL` points at a scratch database that already has the migrations: create it, run
+`DATABASE_URL=<url> npx prisma migrate deploy`, then `IMPORT_DB_TEST_URL=<url> npx vitest run src/modules/transactions/import.integration.test.ts`.
+CI runs it in the `integration` job against a Postgres service. Never point it at a database that holds real data.
+
 `npx vitest run path/to/file.test.ts` runs a single file; `npx vitest` starts watch mode. If you changed
 `prisma/schema.prisma` or added a migration, see "Migrations" below.
 

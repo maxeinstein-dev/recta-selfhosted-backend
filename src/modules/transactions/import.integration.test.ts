@@ -23,6 +23,10 @@ const ofx = (entries: Array<[string, string, string, string]>) =>
       `</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>\n`,
   );
 
+/** What the frontend sends on confirm: every row of the preview (duplicates included), minus the preview-only fields. */
+const confirmPayload = (preview: Awaited<ReturnType<typeof buildImportPreview>>) =>
+  preview.rows.map(({ date, description, amount, type }) => ({ date, description, amount, type }));
+
 describe.skipIf(!enabled)('statement import on Postgres', () => {
   let householdId: string;
   const newAccount = async (name: string) =>
@@ -54,6 +58,57 @@ describe.skipIf(!enabled)('statement import on Postgres', () => {
     expect(await buildImportPreview(accountId, householdId, parsed)).toMatchObject({ newCount: 0, duplicateCount: 2 });
     expect(await confirmImport(accountId, householdId, parsed.rows)).toMatchObject({ imported: 0, skipped: 2 });
     expect(await countRows(accountId)).toBe(2);
+  });
+
+  describe('preview then confirm with the payload the frontend builds', () => {
+    const threeCoffees = () =>
+      parseImportBuffer(
+        'a.ofx',
+        ofx([['c1', '20261105', '-10.00', 'Coffee'], ['c2', '20261105', '-10.00', 'Coffee'], ['c3', '20261105', '-10.00', 'Coffee']]),
+      );
+
+    it('3 identical rows in the file and 1 on the account: preview says 2 new and confirm adds exactly 2', async () => {
+      const accountId = await newAccount('Three vs one');
+      const parsed = threeCoffees();
+      await confirmImport(accountId, householdId, parsed.rows.slice(0, 1));
+      expect(await countRows(accountId)).toBe(1);
+
+      const preview = await buildImportPreview(accountId, householdId, parsed);
+      expect(preview).toMatchObject({ newCount: 2, duplicateCount: 1 });
+
+      const result = await confirmImport(accountId, householdId, confirmPayload(preview));
+      expect(result).toMatchObject({ imported: 2, skipped: 1 });
+      expect(await countRows(accountId)).toBe(3);
+    });
+
+    it('deleting one of two imported coffees and importing the file again brings back exactly one', async () => {
+      const accountId = await newAccount('Deleted one');
+      const parsed = parseImportBuffer('a.ofx', ofx([['d1', '20261105', '-10.00', 'Coffee'], ['d2', '20261105', '-10.00', 'Coffee']]));
+      await confirmImport(accountId, householdId, parsed.rows);
+      const [first] = await prisma.transaction.findMany({ where: { accountId } });
+      await prisma.transaction.delete({ where: { id: first!.id } });
+
+      const preview = await buildImportPreview(accountId, householdId, parsed);
+      expect(preview).toMatchObject({ newCount: 1, duplicateCount: 1 });
+
+      expect(await confirmImport(accountId, householdId, confirmPayload(preview))).toMatchObject({ imported: 1, skipped: 1 });
+      expect(await countRows(accountId)).toBe(2);
+    });
+
+    it('running the whole file again after an import stopped half way adds only the rows that are missing', async () => {
+      const accountId = await newAccount('Resume');
+      const parsed = threeCoffees();
+      // Same state a failure at row 2 leaves behind: the first row is saved, the rest are not.
+      await confirmImport(accountId, householdId, parsed.rows.slice(0, 1));
+
+      const preview = await buildImportPreview(accountId, householdId, parsed);
+      expect(await confirmImport(accountId, householdId, confirmPayload(preview))).toMatchObject({ imported: 2, skipped: 1 });
+      expect(await countRows(accountId)).toBe(3);
+
+      const again = await buildImportPreview(accountId, householdId, parsed);
+      expect(again).toMatchObject({ newCount: 0, duplicateCount: 3 });
+      expect(await confirmImport(accountId, householdId, confirmPayload(again))).toMatchObject({ imported: 0, skipped: 3 });
+    });
   });
 
   it('stores the day the bank printed, whatever the time and the server zone', async () => {
