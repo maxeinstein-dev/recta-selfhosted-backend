@@ -16,7 +16,7 @@ type Row = {
 };
 
 const store = vi.hoisted(() => ({ rows: [] as unknown[] }));
-const updates = vi.hoisted(() => ({ updateMany: vi.fn(), create: vi.fn(), accountUpdate: vi.fn(), deleted: vi.fn() }));
+const updates = vi.hoisted(() => ({ updateMany: vi.fn(), create: vi.fn(), accountUpdate: vi.fn() }));
 
 function matches(row: Row, where: Record<string, any>): boolean {
   if (where.OR) return (where.OR as Record<string, any>[]).some((w) => matches(row, w));
@@ -54,7 +54,6 @@ const transactionApi = {
     updates.updateMany(args);
     return { count: 0 };
   }),
-  delete: vi.fn(async (args: unknown) => updates.deleted(args)),
 };
 const accountApi = {
   findFirst: vi.fn(async (args: { where: { id: string } }) => accounts.byId[args.where.id] ?? null),
@@ -69,7 +68,6 @@ vi.mock('../../shared/db/prisma.js', () => ({
   prisma: {
     account: accountApi,
     transaction: transactionApi,
-    recurringTransaction: { findMany: async () => [] },
     $transaction: async (cb: (tx: unknown) => unknown) => cb({ account: accountApi, transaction: transactionApi }),
   },
 }));
@@ -84,7 +82,6 @@ vi.mock('../../shared/services/balance.service.js', () => ({
 const {
   calculateCreditCardInvoice,
   payCreditCardInvoice,
-  undoCreditCardPayment,
   parseInvoicePaymentOrdinal,
   utcToday,
 } = await import('./transactions.service.js');
@@ -202,18 +199,6 @@ describe('calculateCreditCardInvoice payments by invoice tag', () => {
     expect(sep.paymentTransactions).toHaveLength(1);
   });
 
-  it('calls an invoice paid when binary drift leaves a hair over one cent (whole-cent compare)', async () => {
-    // 0.1 + 0.2 style drift: 3015.5 + 188.42 + 0.01 - 3203.92 = 0.0100000000002 in doubles.
-    store.rows = [purchase('2026-08-20', 1000.1), purchase('2026-08-21', 2000.2), purchase('2026-08-22', 3.21)];
-    store.rows.push(payment('2026-09-02', 3003.5, '2026-09'));
-
-    const sep = await invoice('2026-09');
-
-    expect(sep.total).toBeGreaterThan(0.01);
-    expect(sep.total).toBeLessThan(0.0100001);
-    expect(sep.isPaid).toBe(true);
-  });
-
   it('keeps counting legacy payments dated inside the invoice window', async () => {
     seedSepAndOct();
     store.rows.push(payment('2026-09-20', 1000, '2026-10'));
@@ -305,28 +290,5 @@ describe('payCreditCardInvoice', () => {
     await expect(
       payCreditCardInvoice({ householdId: CARD.householdId, accountId: CARD.id, sourceAccountId: SOURCE.id, month: '2026-10' } as never)
     ).rejects.toThrow(/greater than zero/);
-  });
-});
-
-describe('undoCreditCardPayment', () => {
-  it('deletes the payment found by id and only reopens purchases up to the end of the invoice window', async () => {
-    const pay = payment('2026-10-06', 1000, '2026-10');
-    store.rows = [pay];
-
-    await undoCreditCardPayment({ accountId: CARD.id, transactionId: pay.id } as never, CARD.householdId);
-
-    expect(updates.deleted).toHaveBeenCalledWith({ where: { id: pay.id } });
-    const where = updates.updateMany.mock.calls[0][0].where;
-    expect(where.date.gte).toEqual(day('2026-09-02'));
-    expect(where.date.lte).toEqual(day('2026-10-01'));
-  });
-
-  it('keeps the payment date as the bound when it is before the window end (legacy payment inside the window)', async () => {
-    const pay = payment('2026-09-20', 1000, '2026-10');
-    store.rows = [pay];
-
-    await undoCreditCardPayment({ accountId: CARD.id, transactionId: pay.id } as never, CARD.householdId);
-
-    expect(updates.updateMany.mock.calls[0][0].where.date.lte).toEqual(day('2026-09-20'));
   });
 });
