@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Continuous integration on GitHub Actions: `db:generate`, `typecheck`, `build` and `vitest` on every pull request and on `main`.
 - Bank statement import: `POST /transactions/import/preview` parses an OFX or CSV file (up to 5 MB and 1500 rows) and flags the rows the account already holds, comparing by occurrence so identical rows in one file are all kept; it also lists the lines it could not read. `POST /transactions/import/confirm` creates the rows the user kept, one import at a time per account (a second one answers 409), and reports where it stopped if a row fails. Adds the `@fastify/multipart` dependency.
 - Statement import decodes files as UTF-8 first and falls back to Windows-1252 whatever `CHARSET` they declare, and leaves unknown or inherited entity names such as `&constructor;` untouched in memos.
+- Card invoice OFX preview: `POST /transactions/import/card-ofx/preview` reads a credit card invoice (an OFX with a `CCSTMTRS` block) and, without saving anything, returns the invoice month (derived from the closing date and the card's due and closing days, or overridden), the lines with their kind, installment and status (new, payment), the lines it could not read, how the invoice's payment lines compare with the payments already recorded for the previous invoice, and warning codes.
 
 ### Changed
 

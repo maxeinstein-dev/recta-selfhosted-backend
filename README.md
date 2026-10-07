@@ -167,6 +167,24 @@ Two endpoints under `/transactions/import` import a bank statement in two steps.
 
 **CSV.** The header is optional. With a header, the date, description and amount columns are found by name (`date`/`data`, `description`/`descricao`/`historico`, `amount`/`valor`...) in any order and extra columns are ignored. Without a header (or with a three-column header that has other names) the columns are date, description and amount and a line with any other number of columns is skipped. The delimiter is `;` if the first line has one, otherwise `,`; double quotes are honoured. Dates are `dd/MM/yyyy`, `dd-MM-yyyy` or `yyyy-MM-dd`, with an optional time that is ignored. Amounts: `1.234,56` and `1,234.56` are read by the last separator; a single separator followed by one or two digits is the decimal mark; one followed by exactly three digits (`1.234`) is ambiguous and the line is skipped (`ambiguous-amount`) rather than guessed. Negative amounts (`-`, trailing `-` or parentheses) become expenses; more than two decimals are rounded to cents.
 
+## Card invoice (OFX)
+
+A credit card invoice (an OFX file with a `CCSTMTRS` block, as most banks export) is read by its own endpoint, because it differs from a bank statement: the same `FITID` repeats across the installments of one purchase and its discount, and the invoice month is the card's due month, not the month of the dates.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/card-ofx/preview` | multipart: `accountId` (a credit card), `file` (.ofx, up to 5 MB and 1000 lines), `options` (optional JSON `{ "monthOverride": { "year": 2026, "month": 12 } }`) | Reads the invoice and saves nothing. Requires EDITOR+ on the card's household. |
+
+The answer has the invoice month (`month`, `monthKey`, and `monthSource`: `statement` or `override`), the statement `period`, `ofxTotal` (purchases minus refunds and discounts, payments left out), `ledgerBalance` (the debt the file states, positive), and every `lines` entry with its `kind` (`purchase`, `refund`, `discount`, `payment`), `merchant`, `installment` (`Parcela N/M` in the memo) and `status` (`new`, or `payment` for a "payment received" line). Lines that could not be read are listed in `skipped` (`position`, `reason`; the first 100, `totals.skipped` has the count) and everything the client has to word is a code: `warnings` can hold `multiple-statements`, `period-end-missing`, `card-without-due-day`, `card-without-closing-day` and `balance-mismatch`.
+
+**Invoice month.** The statement closes on `DTEND`; it is due in the same month when the card's due day comes after its closing day (the explicit one, or due day - 7), otherwise in the next month. A card without a due day takes the closing month (`card-without-due-day`). `monthOverride` replaces the guess.
+
+**Payment of the previous invoice.** The `Pagamento recebido` lines pay the month before the invoice's. `payment` sets them against the payments the app already counts for that invoice (tagged `invoice_pay:<card>:<year>-<month0>` and dated up to today, as in the invoice view): `state` is `matches`, `differs`, `missing`, or `undetermined` when the file has several payment lines (some may be advances). Memos such as `Parcela N/M`, `NuPay`, `Desconto Antecipação` and `Pagamento recebido` are Nubank's; any other bank's invoice still parses, as plain purchases and credits.
+
+This endpoint only previews: it reads no transaction of the card, so it cannot say which lines were imported before, and nothing is written.
+
+UTF-8, windows-1252 and UTF-16 (with a byte order mark) files are read; `CDATA` sections in memos and ids are supported.
+
 ## Project structure
 
 ```
