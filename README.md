@@ -148,6 +148,23 @@ npm run cron:process-recurrences
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
 
+## Importing bank statements
+
+Two endpoints under `/transactions/import` import a bank statement in two steps. Both require authentication and EDITOR+ on the household that owns the destination account (which must be active), accept files up to 5 MB (JSON bodies up to 1 MB) and at most 5000 rows. Requests over the limits answer 413.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /transactions/import/preview` | multipart: `accountId`, `file` (.ofx or .csv) | Parses the file without persisting anything. Each row is flagged `duplicate` when the account already holds it. Lines that could not be read are listed in `skipped` (`line`, `reason`; `skippedCount` has the total) so nothing disappears silently. |
+| `POST /transactions/import/confirm` | JSON: `{ accountId, rows: [{ date, description, amount, type }] }` | Creates the rows through the regular transaction service (balances are updated); rows already on the account are skipped. |
+
+**Duplicates are counted, not just detected.** A row is the same transaction when type, day, amount and description match, and the file is compared to the account by occurrence: if the file has two identical coffees and the account has one, the first is a duplicate and the second is new. Identical rows with different `FITID`s in an OFX are both kept; a `FITID` repeated inside one file is skipped (`repeated-id`). Preview and confirm use the same rule, so importing the same file twice is safe. No identifier is stored with the transaction, so there is no migration; the match is on the transaction's own fields.
+
+**Confirm is not atomic.** Confirms on the same account run one at a time (a per-account advisory lock), so two parallel requests cannot import the same file twice. Each row is saved by the regular transaction service, which has its own database transaction, so a failure in the middle keeps the rows already saved: the answer then carries `stoppedAt` (index of the failing row) and `error`. Sending the same rows again continues from there, because the saved ones now count as duplicates.
+
+**OFX.** `CHARSET:1252` (or any non-UTF-8 file) is decoded as Windows-1252, XML entities in memos are decoded, and only the calendar day of `DTPOSTED` is used (the time and zone are dropped), stored as that day. A credit card invoice (`CCSTMTRS`) is read like any other file but the preview answers with the `card-statement` warning: invoices have their own flow and should not be imported as a plain statement.
+
+**CSV.** The header is optional. With a header, the date, description and amount columns are found by name (`date`/`data`, `description`/`descricao`/`historico`, `amount`/`valor`...) in any order and extra columns are ignored. Without a header (or with a three-column header that has other names) the columns are date, description and amount and a line with any other number of columns is skipped. The delimiter is `;` if the first line has one, otherwise `,`; double quotes are honoured. Dates are `dd/MM/yyyy`, `dd-MM-yyyy` or `yyyy-MM-dd`, with an optional time that is ignored. Amounts: `1.234,56` and `1,234.56` are read by the last separator; a single separator followed by one or two digits is the decimal mark; one followed by exactly three digits (`1.234`) is ambiguous and the line is skipped (`ambiguous-amount`) rather than guessed. Negative amounts (`-`, trailing `-` or parentheses) become expenses; more than two decimals are rounded to cents.
+
 ## Project structure
 
 ```
