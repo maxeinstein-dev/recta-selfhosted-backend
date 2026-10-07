@@ -49,7 +49,15 @@ export function buildUtcDate(year: number, month: number, day: number): Date | n
   return date;
 }
 
-const NAMED_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+// A Map, not an object literal: a memo containing `&constructor;` or `&__proto__;` would otherwise resolve to
+// Object.prototype members and replace the text with a function's source.
+const NAMED_ENTITIES = new Map([
+  ['amp', '&'],
+  ['lt', '<'],
+  ['gt', '>'],
+  ['quot', '"'],
+  ['apos', "'"],
+]);
 
 /** OFX 2.x is XML: memos arrive as `AT&amp;T`. */
 export function decodeEntities(text: string): string {
@@ -58,7 +66,7 @@ export function decodeEntities(text: string): string {
       const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
       return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
     }
-    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
+    return NAMED_ENTITIES.get(body.toLowerCase()) ?? whole;
   });
 }
 
@@ -68,25 +76,18 @@ export function cleanDescription(raw: string | null | undefined): string {
 }
 
 /**
- * Bank files are rarely UTF-8: Brazilian OFX usually declares `CHARSET:1252`. Honour the declaration, otherwise accept
- * valid UTF-8 and fall back to Windows-1252 (which also covers ISO-8859-1 text) instead of producing U+FFFD.
+ * Brazilian OFX files often declare `CHARSET:1252` and some banks declare it while writing UTF-8, so the declaration
+ * is not trusted: try strict UTF-8 first (invalid bytes throw) and fall back to Windows-1252, which also covers
+ * ISO-8859-1 text, instead of producing U+FFFD.
  */
 export function decodeStatement(buffer: Buffer): string {
-  const head = buffer.subarray(0, 1024).toString('latin1');
-  const declared = /CHARSET:\s*([\w-]+)/i.exec(head)?.[1]?.toLowerCase();
-  const text =
-    declared === '1252' || declared === 'windows-1252' || declared === 'iso-8859-1' || declared === 'latin1'
-      ? new TextDecoder('windows-1252').decode(buffer)
-      : decodeUtf8OrWindows1252(buffer);
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-}
-
-function decodeUtf8OrWindows1252(buffer: Buffer): string {
+  let text: string;
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    text = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
   } catch {
-    return new TextDecoder('windows-1252').decode(buffer);
+    text = new TextDecoder('windows-1252').decode(buffer);
   }
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 export type AmountResult = { cents: number; negative: boolean } | { error: 'invalid-amount' | 'ambiguous-amount' };

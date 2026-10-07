@@ -80,6 +80,12 @@ describe('text helpers', () => {
     expect(cleanDescription('  Caf&eacute;   &amp;  Cia ')).toBe('Caf&eacute; & Cia');
   });
 
+  it('leaves names that exist on Object.prototype literal', () => {
+    for (const name of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      expect(decodeEntities(`a &${name}; b`)).toBe(`a &${name}; b`);
+    }
+  });
+
   it('truncates long descriptions and falls back for empty ones', () => {
     expect(cleanDescription('x'.repeat(400))).toHaveLength(255);
     expect(cleanDescription('   ')).toBe('Imported transaction');
@@ -88,6 +94,12 @@ describe('text helpers', () => {
 
   it('decodes a CHARSET:1252 file as Windows-1252', () => {
     const buffer = Buffer.concat([Buffer.from('CHARSET:1252\n<MEMO>Caf', 'latin1'), Buffer.from([0xe9])]);
+
+    expect(decodeStatement(buffer)).toContain('Café');
+  });
+
+  it('reads UTF-8 even when the file declares CHARSET:1252', () => {
+    const buffer = Buffer.from('CHARSET:1252\n<MEMO>Café', 'utf-8');
 
     expect(decodeStatement(buffer)).toContain('Café');
   });
