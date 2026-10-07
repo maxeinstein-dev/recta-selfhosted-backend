@@ -66,3 +66,13 @@ export interface SharePreviewResponse {
   shares: Array<{ personId: string; amount: number }>;
   myPart: number;
 }
+
+export interface SettlementDto {
+  id: string;
+  personId: string;
+  direction: SettlementDirection;
+  amount: number;
+  date: string;
+  transactionId: string | null;
+  note: string | null;
+}

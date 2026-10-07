@@ -178,7 +178,7 @@ const SHARES_LOCK_NAMESPACE = 17;
  * update of the route both go through it, which is what makes "check the shares, then change the amount" one step:
  * neither can start while the other is between its check and its write.
  */
-function withSharesLock<T>(transactionId: string, work: () => Promise<T>): Promise<T> {
+export function withSharesLock<T>(transactionId: string, work: () => Promise<T>): Promise<T> {
   return withAdvisoryLock(SHARES_LOCK_NAMESPACE, transactionId, work);
 }
 
@@ -190,10 +190,11 @@ function formatReais(cents: number): string {
  * Guard for the user-facing transaction update (called by the route, never by transactions.service, so internal flows
  * such as the card OFX import or installment generation are not affected). A transaction that has shares cannot
  * get an amount below the sum of the shares of either direction (the SIGNED amount is compared: a negative amount
- * is below any share), nor turn from an expense into an income.
+ * is below any share), nor turn from an expense into an income; one linked to a settlement keeps the type the
+ * settlement needs (RECEIVED an income, PAID an expense).
  *
  * Call it through `updateKeepingShares`, which holds the lock that makes the check and the update one step.
- * @throws BadRequestError telling to reduce or remove the shares first.
+ * @throws BadRequestError telling to reduce or remove the shares, or to delete the settlement, first.
  */
 export async function assertUpdateKeepsShares(
   householdId: string,
@@ -204,6 +205,21 @@ export async function assertUpdateKeepsShares(
   const amountChanges = change.amount !== undefined;
   const typeChanges = change.type !== undefined && change.type !== current.type;
   if (!amountChanges && !typeChanges) return;
+
+  if (typeChanges) {
+    const settlement = await prisma.settlement.findFirst({
+      where: { householdId, transactionId },
+      select: { direction: true },
+    });
+    if (settlement) {
+      const needed = settlement.direction === 'RECEIVED' ? 'INCOME' : 'EXPENSE';
+      if (change.type !== needed) {
+        throw new BadRequestError(
+          `This transaction is linked to a settlement you ${settlement.direction === 'RECEIVED' ? 'received' : 'paid'}, so it must stay an ${needed.toLowerCase()}. Delete the settlement first.`,
+        );
+      }
+    }
+  }
 
   const shares = await prisma.transactionShare.findMany({
     where: { householdId, transactionId },

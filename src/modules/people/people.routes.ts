@@ -6,6 +6,7 @@ import { requireEditor, requireHouseholdMember } from '../../shared/middleware/a
 import { NotFoundError } from '../../shared/errors/app-error.js';
 import {
   createPersonSchema,
+  createSettlementSchema,
   householdHintQuerySchema,
   householdQuerySchema,
   idParamSchema,
@@ -23,6 +24,7 @@ import {
   listPeople,
   updatePerson,
 } from './people.service.js';
+import { createSettlement, deleteSettlement, findSettlementHousehold, listSettlements } from './settlements.service.js';
 import {
   findTransactionHousehold,
   getTransactionShares,
@@ -84,7 +86,7 @@ const docs = (description: string) => ({
   security: [{ bearerAuth: [] }],
 });
 
-/** /people: people, balances and ledgers. */
+/** /people: people, balances, ledgers and settlements. */
 export async function peopleRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authMiddleware());
 
@@ -134,6 +136,21 @@ export async function peopleRoutes(app: FastifyInstance) {
     const page = await getLedger(query.householdId, id, { limit: query.limit, cursor: query.cursor, order: query.order });
     return reply.send({ success: true, data: page.data, pagination: page.pagination });
   });
+  app.get('/:id/settlements', { schema: docs('Settlements of a person, newest first (read: member)') }, async (request, reply) => {
+    const { id } = idParamSchema.parse(request.params);
+    const query = householdQuerySchema.parse(request.query);
+    await requireHouseholdMember(request, query.householdId);
+    const data = await listSettlements(query.householdId, id);
+    return reply.send({ success: true, data });
+  });
+
+  app.post('/:id/settlements', { schema: docs('Register a settlement, linking a transaction or creating it on an account (EDITOR+)') }, async (request, reply) => {
+    const { id } = idParamSchema.parse(request.params);
+    const input = createSettlementSchema.parse(request.body);
+    await requireEditor(request, input.householdId);
+    const data = await createSettlement(input.householdId, id, input);
+    return reply.status(201).send({ success: true, data });
+  });
 }
 
 /** /transactions/:transactionId/shares: the people's parts of a transaction. */
@@ -164,5 +181,18 @@ export async function transactionSharesRoutes(app: FastifyInstance) {
     const householdId = await transactionHousehold(request, transactionId, hint, 'member');
     const data = await previewTransactionShares(householdId, transactionId, input);
     return reply.send({ success: true, data });
+  });
+}
+
+/** /settlements/:id */
+export async function settlementRoutes(app: FastifyInstance) {
+  app.addHook('preHandler', authMiddleware());
+
+  app.delete('/:id', { schema: docs('Delete a settlement; the transaction it is linked to is kept (EDITOR+)') }, async (request, reply) => {
+    const { id } = idParamSchema.parse(request.params);
+    const { householdId: hint } = householdHintQuerySchema.parse(request.query);
+    const householdId = await resolveHousehold(request, hint, () => findSettlementHousehold(id), 'editor', 'Settlement');
+    await deleteSettlement(householdId, id);
+    return reply.status(204).send();
   });
 }

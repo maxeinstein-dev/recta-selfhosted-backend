@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { categoryNameSchema } from '../categories/categories.schema.js';
+import { parseLocalDateString } from '../../shared/utils/local-date.js';
 import { MAX_ALIASES } from './people.common.js';
 import { MAX_AMOUNT } from './money.js';
 import { MAX_SHARES, MAX_SPLIT_ENTRIES, SPLIT_STRATEGIES } from './split-strategies.js';
@@ -12,6 +14,19 @@ export const aliasList = z.array(personName).max(MAX_ALIASES, `At most ${MAX_ALI
 const noteText = z.string().trim().max(500);
 export const amount = z.number().positive().max(MAX_AMOUNT);
 
+/** 'YYYY-MM-DD' that is a real calendar day. */
+export const dayString = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD')
+  .refine((value) => {
+    try {
+      parseLocalDateString(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }, 'Not a real calendar day');
+
 const queryBoolean = z.preprocess((value) => {
   if (value === 'true' || value === '1' || value === true) return true;
   if (value === 'false' || value === '0' || value === false) return false;
@@ -19,6 +34,7 @@ const queryBoolean = z.preprocess((value) => {
 }, z.boolean().optional());
 
 export const shareDirectionSchema = z.enum(['THEY_OWE_ME', 'I_OWE_THEM']);
+export const settlementDirectionSchema = z.enum(['RECEIVED', 'PAID']);
 
 export const idParamSchema = z.object({ id: uuid });
 /** Routes keyed by an id alone accept the household as a hint: it is authorized first and scopes the lookup. */
@@ -66,3 +82,25 @@ export const putSharesSchema = z.object({
   myShares: z.number().int().min(0).max(MAX_SHARES).optional(),
 });
 export type PutSharesInput = z.infer<typeof putSharesSchema>;
+
+export const createSettlementSchema = z
+  .object({
+    householdId: uuid,
+    direction: settlementDirectionSchema,
+    amount,
+    date: dayString,
+    note: noteText.optional(),
+    transactionId: uuid.optional(),
+    createTransaction: z
+      .object({
+        accountId: uuid,
+        description: z.string().trim().min(1).max(255).optional(),
+        categoryName: categoryNameSchema.optional(),
+      })
+      .optional(),
+  })
+  .refine((value) => !(value.transactionId && value.createTransaction), {
+    message: 'Send either transactionId or createTransaction, not both',
+    path: ['createTransaction'],
+  });
+export type CreateSettlementInput = z.infer<typeof createSettlementSchema>;
