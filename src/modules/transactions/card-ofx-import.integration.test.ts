@@ -2,9 +2,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { prisma } from '../../shared/db/prisma.js';
 import { buildCardOfxPreview, resolveCardAccount } from './card-ofx-import.service.js';
+import { cardOfxRef } from './parsers/ofx-card.parser.js';
 
 /**
- * The card invoice preview against a real Postgres: what it reads of the stored invoice payments. Skipped unless
+ * The card invoice preview against a real Postgres: what it reads of the stored references and invoice payments. Skipped unless
  * IMPORT_DB_TEST_URL points at a SCRATCH database that already has the migrations applied (vitest.config.ts hands that
  * URL to the app's Prisma client):
  *
@@ -25,6 +26,9 @@ const FILE = Buffer.from(
     '</BANKTRANLIST></CCSTMTRS></CCSTMTTRNRS></CREDITCARDMSGSRSV1></OFX>',
   ].join('\n'),
 );
+
+const MARKET_REF = cardOfxRef('fit-market', 'Corner market', -60, '2025-11-10');
+const SHOES_REF = cardOfxRef('fit-shoes', 'Shoe store', -40, '2025-11-15');
 
 // Dates are in 2025 so that every payment is already in the past whenever the test runs.
 describe.skipIf(!enabled)('card invoice preview on Postgres', { timeout: 30_000 }, () => {
@@ -48,6 +52,29 @@ describe.skipIf(!enabled)('card invoice preview on Postgres', { timeout: 30_000 
 
   beforeAll(() => {
     expect(process.env.DATABASE_URL).toBe(process.env.IMPORT_DB_TEST_URL);
+  });
+
+  const expense = (householdId: string, accountId: string, data: Record<string, unknown> = {}) =>
+    prisma.transaction.create({
+      data: { householdId, accountId, type: 'EXPENSE', categoryName: 'OTHER_EXPENSES', amount: 10, date: new Date('2025-11-10T00:00:00Z'), ...data },
+    });
+
+  it('flags the lines a transaction carries by ref or represents, within the household only', async () => {
+    const householdId = await newHousehold();
+    const cardId = await newCard(householdId);
+    const first = await expense(householdId, cardId, { sourceRef: MARKET_REF });
+    await prisma.transactionExternalRef.create({ data: { householdId, transactionId: first.id, ref: SHOES_REF } });
+    const theirs = await newHousehold();
+    await expense(theirs, await newCard(theirs), { sourceRef: cardOfxRef('fit-pay', 'Pagamento recebido', 85, '2025-11-03') });
+
+    const preview = await buildCardOfxPreview({ account: await resolveCardAccount(cardId), buffer: FILE });
+
+    expect(preview.lines.map((l) => [l.memo, l.status])).toEqual([
+      ['Corner market', 'reconciled'],
+      ['Shoe store', 'reconciled'],
+      ['Pagamento recebido', 'payment'],
+    ]);
+    expect(preview.totals).toMatchObject({ new: 0, reconciled: 2, payments: 1 });
   });
 
   it('counts the previous invoice payment by its tag, not by its date, and reads nothing else', async () => {

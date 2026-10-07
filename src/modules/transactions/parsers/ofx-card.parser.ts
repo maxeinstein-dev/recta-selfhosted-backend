@@ -106,8 +106,8 @@ function signedAmountText(signedAmount: number): string {
  * The FITID repeats across the installments of one purchase (and its discount), the hash tells them apart. Two
  * lines identical in all four fields get `|#2`, `|#3`... appended to the hashed text, in file order.
  *
- * The layout is a contract with whatever stores refs (the importer that confirms an invoice): changing how a ref is
- * built would make every earlier import look new.
+ * The `ofx:` prefix and this layout are a public contract: refs are stored in `transactions.source_ref` and
+ * `transaction_external_refs.ref`, so changing how a ref is built would make every earlier import look new.
  */
 export function cardOfxRef(fitid: string, memo: string, signedAmount: number, date: string, occurrence = 1): string {
   const suffix = occurrence > 1 ? `|#${occurrence}` : '';

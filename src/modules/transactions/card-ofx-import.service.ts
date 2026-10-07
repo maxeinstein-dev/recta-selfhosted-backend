@@ -1,7 +1,9 @@
 /**
- * Card invoice OFX importer: preview. Reads the invoice, works out which month it is, lists its lines and sets its
- * payment lines against the payments the app already counts for the previous invoice. Nothing is written, and the
- * only stored data it reads are the card and its invoice payments.
+ * Card invoice OFX importer: preview. Reads the invoice, works out which month it is and tells, line by line,
+ * whether the app already holds it. Nothing is written.
+ *
+ * "Already holds" means a transaction carries the line's ref (`transactions.source_ref`) or the line is recorded as
+ * represented by one (`transaction_external_refs`).
  */
 import { prisma } from '../../shared/db/prisma.js';
 import { AccountType } from '../../shared/enums/index.js';
@@ -82,6 +84,18 @@ function netCents(lines: Array<Pick<CardOfxStatementLine, 'type' | 'amount'>>): 
   return lines.reduce((total, l) => total + (l.type === 'EXPENSE' ? toCents(l.amount) : -toCents(l.amount)), 0);
 }
 
+/** The refs among `refs` that a transaction already carries, as its own ref or as one it represents. */
+export async function loadKnownRefs(householdId: string, refs: string[]): Promise<Set<string>> {
+  const [created, represented] = await Promise.all([
+    prisma.transaction.findMany({ where: { householdId, sourceRef: { in: refs } }, select: { sourceRef: true } }),
+    prisma.transactionExternalRef.findMany({ where: { householdId, ref: { in: refs } }, select: { ref: true } }),
+  ]);
+  const known = new Set<string>();
+  for (const t of created) if (t.sourceRef) known.add(t.sourceRef);
+  for (const r of represented) known.add(r.ref);
+  return known;
+}
+
 async function describePayment(
   account: ResolvedCardAccount,
   month: YearMonth,
@@ -160,7 +174,11 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     warnings.push('balance-mismatch');
   }
 
-  const lines = statement.lines.map((l) => ({ ...l, status: l.kind === 'payment' ? ('payment' as const) : ('new' as const) }));
+  const known = await loadKnownRefs(account.householdId, statement.lines.map((l) => l.ref));
+  const lines = statement.lines.map((l) => ({
+    ...l,
+    status: l.kind === 'payment' ? ('payment' as const) : known.has(l.ref) ? ('reconciled' as const) : ('new' as const),
+  }));
   const count = (status: (typeof lines)[number]['status']) => lines.filter((l) => l.status === status).length;
 
   return {
@@ -178,6 +196,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     totals: {
       lines: lines.length,
       new: count('new'),
+      reconciled: count('reconciled'),
       payments: count('payment'),
       skipped: statement.skipped.length,
     },

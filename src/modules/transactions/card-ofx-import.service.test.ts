@@ -5,6 +5,11 @@ import { AccountType } from '../../shared/enums/index.js';
 // Invented data only: stores, amounts and ids below are fictitious.
 
 type Where = Record<string, unknown>;
+interface ExternalRow {
+  householdId: string;
+  ref: string;
+  transactionId: string;
+}
 interface TxRow {
   id: string;
   householdId: string;
@@ -16,6 +21,7 @@ interface TxRow {
 const db = vi.hoisted(() => ({
   account: null as Record<string, unknown> | null,
   transactions: [] as unknown[],
+  externalRefs: [] as unknown[],
   calls: [] as Array<{ model: string; where: Where }>,
 }));
 
@@ -24,6 +30,8 @@ const decimal = (value: number) => ({ toNumber: () => value });
 /** The few `where` shapes the preview uses against the stored rows. */
 function matchesTx(row: TxRow, where: Where): boolean {
   if (where.householdId !== undefined && row.householdId !== where.householdId) return false;
+  const ref = where.sourceRef as { in?: string[] } | undefined;
+  if (ref?.in && !(row.sourceRef !== null && ref.in.includes(row.sourceRef))) return false;
   const url = where.attachmentUrl as { startsWith?: string } | undefined;
   if (url?.startsWith && !row.attachmentUrl?.startsWith(url.startsWith)) return false;
   const date = where.date as { lte?: Date } | undefined;
@@ -43,6 +51,12 @@ vi.mock('../../shared/db/prisma.js', () => ({
           .map((row) => ({ ...row, amount: decimal(row.amount) }));
       }),
     },
+    transactionExternalRef: {
+      findMany: vi.fn(async ({ where }: { where: { householdId: string; ref: { in: string[] } } }) => {
+        db.calls.push({ model: 'transactionExternalRef', where });
+        return (db.externalRefs as ExternalRow[]).filter((r) => r.householdId === where.householdId && where.ref.in.includes(r.ref));
+      }),
+    },
   },
 }));
 
@@ -55,6 +69,9 @@ const HOUSEHOLD = 'house-1';
 const CARD_ID = 'card-1';
 // Due day 9, closing day 2 (the explicit one): the statement closing on 2026-12-02 is due 2026-12-09.
 const CARD = { id: CARD_ID, name: 'Card', householdId: HOUSEHOLD, dueDay: 9, closingDay: 2 };
+
+const refOf = (t: Trn) =>
+  cardOfxRef(t.fitid, t.memo, Number(t.amount), `${t.date.slice(0, 4)}-${t.date.slice(4, 6)}-${t.date.slice(6, 8)}`);
 
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
 
@@ -95,6 +112,7 @@ const preview = (buffer: Buffer, options?: Parameters<typeof buildCardOfxPreview
 beforeEach(() => {
   db.account = { ...CARD, type: AccountType.CREDIT };
   db.transactions = [];
+  db.externalRefs = [];
   db.calls = [];
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-12-05T12:00:00Z'));
@@ -159,7 +177,7 @@ describe('buildCardOfxPreview', () => {
       period: { start: '2026-11-02', end: '2026-12-02' },
       ofxTotal: 90,
       ledgerBalance: 90,
-      totals: { lines: 4, new: 3, payments: 1, skipped: 0 },
+      totals: { lines: 4, new: 3, reconciled: 0, payments: 1, skipped: 0 },
       warnings: [],
     });
     expect(result.lines.map((l) => [l.kind, l.status, l.amount])).toEqual([
@@ -171,16 +189,22 @@ describe('buildCardOfxPreview', () => {
     expect(result.lines[1]).toMatchObject({ merchant: 'Shoe store', installment: { number: 2, total: 3 } });
   });
 
-  it('reads no transaction but the invoice payments of the card, within its household', async () => {
+  it('marks a line reconciled when a transaction carries its ref or represents it, within the household only', async () => {
     db.transactions = [
-      { id: 't1', householdId: HOUSEHOLD, sourceRef: null, attachmentUrl: null, date: day('2026-11-10'), amount: 60 },
+      { id: 't1', householdId: HOUSEHOLD, sourceRef: refOf(MARKET), attachmentUrl: null, date: day('2026-11-10'), amount: 60 },
+      // Same ref in another household: not ours.
+      { id: 't2', householdId: 'house-2', sourceRef: refOf(SHOES), attachmentUrl: null, date: day('2026-11-15'), amount: 40 },
+    ];
+    db.externalRefs = [
+      { householdId: HOUSEHOLD, ref: refOf(REFUND), transactionId: 't1' },
+      { householdId: 'house-2', ref: refOf(SHOES), transactionId: 't2' },
     ];
 
-    const result = await preview(ofx([MARKET, SHOES, REFUND, PAYMENT]));
+    const result = await preview(ofx([MARKET, SHOES, REFUND]));
 
-    expect(result.lines.map((l) => l.status)).toEqual(['new', 'new', 'new', 'payment']);
-    expect(db.calls.length).toBeGreaterThan(0);
-    expect(db.calls.every((c) => c.where.householdId === HOUSEHOLD && JSON.stringify(c.where.attachmentUrl).includes('invoice_pay:'))).toBe(true);
+    expect(result.lines.map((l) => l.status)).toEqual(['reconciled', 'new', 'reconciled']);
+    expect(result.totals).toMatchObject({ new: 1, reconciled: 2 });
+    expect(db.calls.every((c) => c.where.householdId === HOUSEHOLD)).toBe(true);
   });
 
   it('uses the month the caller overrides, and says so', async () => {

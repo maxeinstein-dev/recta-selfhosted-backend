@@ -12,11 +12,14 @@ export interface CardOfxOptionsInput {
   monthOverride?: { year: number; month: number };
 }
 
-/** new: a line to import; payment: a "Pagamento recebido" line, reported apart (see CardOfxPayment). */
-export type CardOfxStatus = 'new' | 'payment';
+/**
+ * new: no transaction holds this line yet; reconciled: a transaction already carries its ref (an earlier import);
+ * payment: a "Pagamento recebido" line, reported apart (see CardOfxPayment).
+ */
+export type CardOfxStatus = 'new' | 'reconciled' | 'payment';
 
 export interface CardOfxLine {
-  /** ofx:<FITID>:<8 hex>: the stable identity of the line, the same on every parse of the same statement. */
+  /** ofx:<FITID>:<8 hex>, see the README "Source references". */
   ref: string;
   fitid: string;
   /** YYYY-MM-DD */
@@ -76,6 +79,6 @@ export interface CardOfxPreviewResponse {
   /** The first 100 transactions of the file that could not be read (1-based position and why); `totals.skipped` has the count. */
   skipped: Array<{ position: number; reason: CardOfxSkipReason }>;
   payment: CardOfxPayment | null;
-  totals: { lines: number; new: number; payments: number; skipped: number };
+  totals: { lines: number; new: number; reconciled: number; payments: number; skipped: number };
   warnings: CardOfxWarning[];
 }
