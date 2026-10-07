@@ -7,6 +7,8 @@ import { defineConfig } from 'vitest/config';
 // that validation.
 export default defineConfig({
   test: {
+    // Fixes the time zone to one behind UTC, see src/test/global-setup.ts.
+    globalSetup: ['./src/test/global-setup.ts'],
     env: {
       DATABASE_URL:
         process.env.DATABASE_URL ?? 'postgresql://vitest:vitest@localhost:5432/vitest',
