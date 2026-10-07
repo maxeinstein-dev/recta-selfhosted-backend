@@ -14,7 +14,7 @@ import {
   confirmImport,
   MAX_IMPORT_ROWS,
 } from './import.service.js';
-import { MAX_DESCRIPTION_LENGTH, buildUtcDate } from './parsers/statement.common.js';
+import { MAX_CENTS, MAX_DESCRIPTION_LENGTH, buildUtcDate } from './parsers/statement.common.js';
 
 /** Multipart limits for the statement upload; the app registers the plugin with them. */
 export const IMPORT_MULTIPART_LIMITS = {
@@ -77,8 +77,10 @@ const confirmImportBodySchema = z.object({
         amount: z
           .number()
           .positive()
-          .max(999_999_999_999)
-          .refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6, 'At most 2 decimal places'),
+          .max(MAX_CENTS / 100)
+          // toFixed rounds the shortest decimal form of the double, so this holds for large values too, where
+          // value * 100 is no longer exact.
+          .refine((value) => Number(value.toFixed(2)) === value, 'At most 2 decimal places'),
         type: z.enum(['INCOME', 'EXPENSE']),
       }),
     )
@@ -121,7 +123,7 @@ export async function importRoutes(app: FastifyInstance) {
   app.post('/import/preview', {
     schema: {
       description:
-        'Preview a bank statement import (multipart/form-data only: text field `accountId` + file field `file` with a .ofx or .csv file, max 5MB, up to 5000 rows). Returns parsed rows flagged as duplicate/new, the lines that could not be read (`skipped`) and a `card-statement` warning for credit card invoices. Requires EDITOR+ on the account household.',
+        'Preview a bank statement import (multipart/form-data only: text field `accountId` + file field `file` with a .ofx or .csv file, max 5MB, up to 1500 rows). Returns parsed rows flagged as duplicate/new, the lines that could not be read (`skipped`) and a `card-statement` warning for credit card invoices. Requires EDITOR+ on the account household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       consumes: ['multipart/form-data'],
@@ -196,7 +198,7 @@ export async function importRoutes(app: FastifyInstance) {
   app.post('/import/confirm', {
     schema: {
       description:
-        'Confirm a bank statement import (application/json only: { accountId, rows: [{ date, description, amount, type }] }). Re-validates duplicates at write time; duplicates are skipped. If a row fails after others were saved the answer carries `stoppedAt` and `error`; sending the same rows again continues. Requires EDITOR+ on the account household.',
+        'Confirm a bank statement import (application/json only: { accountId, rows: [{ date, description, amount, type }] }). Re-validates duplicates at write time; duplicates are skipped. A second confirm on the same account while one runs answers 409. If a row fails after others were saved the answer carries `stoppedAt` and `error`; sending the same rows again continues. Requires EDITOR+ on the account household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       body: {

@@ -1,6 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { BadRequestError } from '../../shared/errors/app-error.js';
+import { BadRequestError, ConflictError } from '../../shared/errors/app-error.js';
 import { CategoryName, TransactionType } from '../../shared/enums/index.js';
 import { parseCsv } from './parsers/csv.parser.js';
 import { parseOfx } from './parsers/ofx.parser.js';
@@ -15,8 +15,12 @@ import { createTransaction } from './transactions.service.js';
 
 export type { ParsedRow };
 
-/** One import never carries more rows than this: it bounds the dedup query, the preview and the confirm body. */
-export const MAX_IMPORT_ROWS = 5000;
+/**
+ * One import never carries more rows than this. Each row is saved by createTransaction (about 25 ms: its own database
+ * transaction and balance update), so 1500 rows is about 40 s of work in one request, and the confirm body of
+ * 1500 rows with 255-character descriptions stays under the 1 MB body limit. Bigger statements are imported in parts.
+ */
+export const MAX_IMPORT_ROWS = 1500;
 /** The preview lists at most this many skipped lines; `skippedCount` always has the real total. */
 const MAX_LISTED_SKIPPED = 100;
 
@@ -146,7 +150,9 @@ export async function buildImportPreview(
  *
  * - A per-account advisory lock serialises confirms: two parallel requests with the same file cannot both see "not
  *   there yet" and import it twice. The lock lives in a transaction that does nothing else, because createTransaction
- *   owns its own database transaction (and balance update) on another connection and cannot join this one.
+ *   owns its own database transaction (and balance update) on another connection and cannot join this one. The lock
+ *   is only tried, never waited for: a waiting request would hold a pool connection for the whole import ahead of it
+ *   and enough of them would starve the pool. A second confirm on the same account gets 409 right away instead.
  * - That also means the rows are not atomic. If one fails, the rows before it stay saved and the result says where it
  *   stopped (`stoppedAt`, `error`); running the same file again continues from there because saved rows now count as
  *   duplicates. When the very first row fails the error is thrown as usual.
@@ -159,7 +165,8 @@ export async function confirmImport(
 ): Promise<ConfirmImportResult> {
   return prisma.$transaction(
     async (lock) => {
-      await lock.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${accountId}))`;
+      const [{ locked }] = await lock.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(hashtext(${accountId})) AS locked`;
+      if (!locked) throw new ConflictError('An import is already running for this account.');
 
       const flags = await flagDuplicates(accountId, householdId, rows);
       const ids: string[] = [];

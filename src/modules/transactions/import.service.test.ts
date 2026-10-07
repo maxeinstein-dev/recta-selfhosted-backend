@@ -11,7 +11,7 @@ import {
 import type { ParsedRow } from './parsers/statement.common.js';
 import { createTransaction } from './transactions.service.js';
 
-const lock = { $executeRaw: vi.fn(async () => 1) };
+const lock = { $queryRaw: vi.fn(async () => [{ locked: true }]) };
 vi.mock('../../shared/db/prisma.js', () => ({
   prisma: {
     transaction: { findMany: vi.fn() },
@@ -148,8 +148,8 @@ describe('confirmImport', () => {
     await confirmImport('acc', 'hh', [row('Coffee')], 'user-1');
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(lock.$executeRaw).toHaveBeenCalledTimes(1);
-    expect(lock.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(findMany.mock.invocationCallOrder[0] as number);
+    expect(lock.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(lock.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(findMany.mock.invocationCallOrder[0] as number);
     expect(findMany.mock.invocationCallOrder[0]).toBeLessThan(create.mock.invocationCallOrder[0] as number);
   });
 
@@ -179,6 +179,14 @@ describe('confirmImport', () => {
 
     expect(result).toEqual({ imported: 1, skipped: 0, ids: ['tx-1'], stoppedAt: 1, error: 'database went away' });
     expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers 409 and touches nothing when another import of the account holds the lock', async () => {
+    lock.$queryRaw.mockResolvedValueOnce([{ locked: false }]);
+
+    await expect(confirmImport('acc', 'hh', [row('Coffee')])).rejects.toMatchObject({ statusCode: 409 });
+    expect(findMany).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('throws when the very first row fails, since nothing was saved', async () => {

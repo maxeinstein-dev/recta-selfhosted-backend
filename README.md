@@ -150,7 +150,7 @@ Schedule this once per day (cron, systemd, or your host’s scheduler).
 
 ## Importing bank statements
 
-Two endpoints under `/transactions/import` import a bank statement in two steps. Both require authentication and EDITOR+ on the household that owns the destination account (which must be active), accept files up to 5 MB (JSON bodies up to 1 MB) and at most 5000 rows. Requests over the limits answer 413.
+Two endpoints under `/transactions/import` import a bank statement in two steps. Both require authentication and EDITOR+ on the household that owns the destination account (which must be active), accept files up to 5 MB (JSON bodies up to 1 MB) and at most 1500 rows (about 25 ms of work per row, so a full import takes around 40 s; split bigger statements). Requests over the size limits answer 413.
 
 | Endpoint | Body | Notes |
 |---|---|---|
@@ -161,7 +161,7 @@ Two endpoints under `/transactions/import` import a bank statement in two steps.
 
 **Known limitation: no stored import id.** Because the match is on the transaction's own fields, a legitimate purchase that has the same type, day, amount and description as one already on the account (for example, two overlapping statements that both contain a "Coffee 10.00" on the same day, where the second one is a different purchase) shows up as a duplicate and the preview offers no override. The user can add that transaction manually. A future import reference stored with each transaction (an additive migration) would tell the two apart. The frontend sends the whole file on confirm and the server applies the same rule as the preview, so the two always agree.
 
-**Confirm is not atomic.** Confirms on the same account run one at a time (a per-account advisory lock), so two parallel requests cannot import the same file twice. Each row is saved by the regular transaction service, which has its own database transaction, so a failure in the middle keeps the rows already saved: the answer then carries `stoppedAt` (index of the failing row) and `error`. Sending the same rows again continues from there, because the saved ones now count as duplicates.
+**Confirm is not atomic.** Confirms on the same account run one at a time (a per-account advisory lock that is tried, not waited for), so two parallel requests cannot import the same file twice: the second one answers 409 immediately instead of queueing and holding a database connection. Each row is saved by the regular transaction service, which has its own database transaction, so a failure in the middle keeps the rows already saved: the answer then carries `stoppedAt` (index of the failing row) and `error`. Sending the same rows again continues from there, because the saved ones now count as duplicates.
 
 **OFX.** `CHARSET:1252` (or any non-UTF-8 file) is decoded as Windows-1252, XML entities in memos are decoded, and only the calendar day of `DTPOSTED` is used (the time and zone are dropped), stored as that day. A credit card invoice (`CCSTMTRS`) is read like any other file but the preview answers with the `card-statement` warning: invoices have their own flow and should not be imported as a plain statement.
 

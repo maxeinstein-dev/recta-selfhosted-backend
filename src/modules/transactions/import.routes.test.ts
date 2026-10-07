@@ -2,11 +2,11 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ForbiddenError } from '../../shared/errors/app-error.js';
+import { ConflictError, ForbiddenError } from '../../shared/errors/app-error.js';
 import { errorHandler } from '../../shared/errors/error-handler.js';
 import { requireEditor } from '../../shared/middleware/authorization.middleware.js';
 import { getAccount } from '../accounts/accounts.service.js';
-import { buildImportPreview, confirmImport } from './import.service.js';
+import { MAX_IMPORT_ROWS, buildImportPreview, confirmImport } from './import.service.js';
 import { IMPORT_MULTIPART_LIMITS, importRoutes } from './import.routes.js';
 
 vi.mock('../../shared/middleware/auth.middleware.js', () => ({
@@ -206,10 +206,33 @@ describe('POST /transactions/import/confirm', () => {
   });
 
   it('refuses more rows than the limit', async () => {
-    const res = await confirm({ accountId: ACCOUNT_ID, rows: Array.from({ length: 5001 }, () => ({ ...row })) });
+    const res = await confirm({ accountId: ACCOUNT_ID, rows: Array.from({ length: MAX_IMPORT_ROWS + 1 }, () => ({ ...row })) });
 
     expect(res.statusCode).toBe(400);
     expect(mockedConfirm).not.toHaveBeenCalled();
+  });
+
+  it('accepts the biggest confirm: the row limit with 255-character descriptions fits in the 1 MB body', async () => {
+    const big = { ...row, description: 'x'.repeat(255), date: '2026-11-05T00:00:00.000Z' };
+
+    const res = await confirm({ accountId: ACCOUNT_ID, rows: Array.from({ length: MAX_IMPORT_ROWS }, () => big) });
+
+    expect(res.statusCode).toBe(201);
+  });
+
+  it('refuses amounts that are not whole cents even when they are large', async () => {
+    const res = await confirm({ accountId: ACCOUNT_ID, rows: [{ ...row, amount: 1_000_000_000.123 }] });
+
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('answers 409 when an import is already running for the account', async () => {
+    mockedConfirm.mockRejectedValue(new ConflictError('An import is already running for this account.'));
+
+    const res = await confirm({ accountId: ACCOUNT_ID, rows: [row] });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'CONFLICT' } });
   });
 
   it('answers 413, not 500, for a body over 1 MB', async () => {

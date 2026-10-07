@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { MAX_IMPORT_ROWS } from './import.service.js';
 
 import { prisma } from '../../shared/db/prisma.js';
 import { buildImportPreview, confirmImport, flagDuplicates, parseImportBuffer } from './import.service.js';
@@ -13,6 +14,11 @@ import { buildImportPreview, confirmImport, flagDuplicates, parseImportBuffer } 
  * Never point it at a database you care about: it creates a household and removes it afterwards, but it does write.
  */
 const enabled = Boolean(process.env.IMPORT_DB_TEST_URL);
+
+// CI must never skip this silently because the variable went missing.
+it.runIf(process.env.CI)('is configured when running in CI', () => {
+  expect(process.env.IMPORT_DB_TEST_URL).toBeTruthy();
+});
 
 const ofx = (entries: Array<[string, string, string, string]>) =>
   Buffer.from(
@@ -121,27 +127,41 @@ describe.skipIf(!enabled)('statement import on Postgres', () => {
     expect(stored?.day).toBe('2026-11-05');
   });
 
-  it('imports a file once when two confirms run at the same time', async () => {
-    const accountId = await newAccount('Parallel');
-    const parsed = parseImportBuffer(
-      'a.ofx',
-      ofx([['p1', '20261105', '-10.00', 'Coffee'], ['p2', '20261105', '-10.00', 'Coffee'], ['p3', '20261106', '-4.50', 'Bus']]),
-    );
+  it('answers 409 to confirms that arrive while one is running, without holding a connection each', async () => {
+    const accountId = await newAccount('Busy');
+    const parsed = parseImportBuffer('a.ofx', ofx([['b1', '20261105', '-10.00', 'Coffee'], ['b2', '20261106', '-4.50', 'Bus']]));
 
-    const results = await Promise.all([
-      confirmImport(accountId, householdId, parsed.rows),
-      confirmImport(accountId, householdId, parsed.rows),
-      confirmImport(accountId, householdId, parsed.rows),
-    ]);
+    // Another import of this account is in progress: it holds the advisory lock.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let locked!: () => void;
+    const lockTaken = new Promise<void>((resolve) => (locked = resolve));
+    const holder = prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${accountId}))`;
+      locked();
+      await held;
+    });
+    await lockTaken;
 
-    expect(results.reduce((sum, r) => sum + r.imported, 0)).toBe(3);
-    expect(await countRows(accountId)).toBe(3);
-    expect(await balance(accountId)).toBe(-24.5);
+    // More waiters than the pool has connections (10): they must all fail fast instead of queueing on the lock.
+    const started = Date.now();
+    const attempts = await Promise.allSettled(Array.from({ length: 15 }, () => confirmImport(accountId, householdId, parsed.rows)));
+    expect(attempts.every((a) => a.status === 'rejected' && (a.reason as { statusCode?: number }).statusCode === 409)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(await countRows(accountId)).toBe(0);
+
+    release();
+    await holder;
+
+    // Once the lock is free the same request goes through, and a repeat is all duplicates.
+    expect(await confirmImport(accountId, householdId, parsed.rows)).toMatchObject({ imported: 2 });
+    expect(await confirmImport(accountId, householdId, parsed.rows)).toMatchObject({ imported: 0, skipped: 2 });
+    expect(await balance(accountId)).toBe(-14.5);
   });
 
-  it('flags a 5000-row file against an account that already holds it in a single pass', async () => {
+  it('flags a file of the maximum size against an account that already holds it in a single pass', async () => {
     const accountId = await newAccount('Big');
-    const rows = Array.from({ length: 5000 }, (_, i) => ({
+    const rows = Array.from({ length: MAX_IMPORT_ROWS }, (_, i) => ({
       date: new Date(Date.UTC(2026, i % 12, 1 + (i % 28))),
       description: `Row ${i}`,
       amount: 1 + (i % 50),
