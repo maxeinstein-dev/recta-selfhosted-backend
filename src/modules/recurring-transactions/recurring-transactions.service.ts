@@ -1,8 +1,9 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
+import { NotFoundError, BadRequestError, AppError } from '../../shared/errors/index.js';
 import { getCategoryColor, getCategoriesByType, CategoryType, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
 import { dayString, monthBoundsUtc } from './recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
@@ -94,25 +95,28 @@ export async function createRecurringTransaction(
     if (!cat) throw new BadRequestError('Custom category not found or does not belong to this household');
   }
 
-  const recurring = await prisma.recurringTransaction.create({
-    data: {
-      householdId,
-      accountId,
-      categoryName,
-      amount: new Prisma.Decimal(amount),
-      description,
-      frequency,
-      startDate,
-      endDate,
-      nextRunAt,
-      isActive,
-      followLastAmount,
-    },
-    include: {
-      account: {
-        select: { id: true, name: true, type: true },
+  const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    await lockCustomCategory(tx, householdId, categoryName);
+    return tx.recurringTransaction.create({
+      data: {
+        householdId,
+        accountId,
+        categoryName,
+        amount: new Prisma.Decimal(amount),
+        description,
+        frequency,
+        startDate,
+        endDate,
+        nextRunAt,
+        isActive,
+        followLastAmount,
       },
-    },
+      include: {
+        account: {
+          select: { id: true, name: true, type: true },
+        },
+      },
+    });
   });
 
   // REGRA DE NEGÓCIO: Edge case de timing
@@ -287,25 +291,28 @@ export async function updateRecurringTransaction(
     if (!cat) throw new BadRequestError('Custom category not found or does not belong to this household');
   }
 
-  const recurring = await prisma.recurringTransaction.update({
-    where: { id: recurringId },
-    data: {
-      ...(input.accountId && { accountId: input.accountId }),
-      ...(input.categoryName && { categoryName: input.categoryName }),
-      ...(input.amount !== undefined && { amount: new Prisma.Decimal(input.amount) }),
-      ...(input.description !== undefined && { description: input.description }),
-      ...(input.frequency && { frequency: input.frequency }),
-      ...(input.startDate && { startDate: input.startDate }),
-      ...(input.endDate !== undefined && { endDate: input.endDate }),
-      ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
-      ...(input.isActive !== undefined && { isActive: input.isActive }),
-      ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
-    },
-    include: {
-      account: {
-        select: { id: true, name: true, type: true },
+  const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    await lockCustomCategory(tx, householdId, input.categoryName);
+    return tx.recurringTransaction.update({
+      where: { id: recurringId },
+      data: {
+        ...(input.accountId && { accountId: input.accountId }),
+        ...(input.categoryName && { categoryName: input.categoryName }),
+        ...(input.amount !== undefined && { amount: new Prisma.Decimal(input.amount) }),
+        ...(input.description !== undefined && { description: input.description }),
+        ...(input.frequency && { frequency: input.frequency }),
+        ...(input.startDate && { startDate: input.startDate }),
+        ...(input.endDate !== undefined && { endDate: input.endDate }),
+        ...(input.nextRunAt && { nextRunAt: input.nextRunAt }),
+        ...(input.isActive !== undefined && { isActive: input.isActive }),
+        ...(input.followLastAmount !== undefined && { followLastAmount: input.followLastAmount }),
       },
-    },
+      include: {
+        account: {
+          select: { id: true, name: true, type: true },
+        },
+      },
+    });
   });
 
   // REGRA DE NEGÓCIO: Edge case de timing
@@ -437,11 +444,30 @@ export async function executeRecurringTransaction(
     return isInc ? amount : -amount;
   }
 
-  // Determine transaction type
+  // Determine transaction type. isIncome/transactionType are computed OUTSIDE the transaction from the category read above:
+  // that stays valid when a merge re-points the recurrence meanwhile because a merge requires the same type (INCOME/EXPENSE).
   const transactionType = isIncome ? TransactionType.INCOME : TransactionType.EXPENSE;
 
   // Create the actual transaction and update next run date
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // The category read above may have been merged since: lock the custom category the recurrence points at NOW (a merge
+    // holds it FOR UPDATE and re-points the recurrence), re-reading until the locked name is the stored one.
+    let categoryName = recurring.categoryName;
+    for (let attempt = 0; ; attempt++) {
+      const fresh = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { categoryName: true } });
+      if (!fresh) throw new NotFoundError('Recurring transaction');
+      categoryName = fresh.categoryName;
+      try {
+        await lockCustomCategory(tx, householdId, categoryName);
+      } catch (error) {
+        // Only "category gone" (400) is retried after a re-read; any other failure (deadlock, connection...) propagates.
+        // (AppError subclasses reset their prototype, so instanceof BadRequestError is false: the status code is the test.)
+        if (!(error instanceof AppError && error.statusCode === 400) || attempt >= 2) throw error;
+        continue;
+      }
+      const again = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { categoryName: true } });
+      if (again?.categoryName === categoryName || attempt >= 2) break;
+    }
     // Idempotency guard: a monthly recurrence has at most one occurrence per month. When the month already holds a
     // transaction of this recurrence (generated earlier, or linked to it by the detector), nothing is created and the
     // recurrence just moves on. The check runs under a per-recurrence lock, so two executions (cron, manual) cannot
@@ -469,9 +495,9 @@ export async function executeRecurringTransaction(
         householdId,
         type: transactionType,
         accountId: recurring.accountId,
-        categoryName: recurring.categoryName,
+        categoryName,
         amount: recurring.amount,
-        description: recurring.description || `Recurring: ${recurring.categoryName}`,
+        description: recurring.description || `Recurring: ${categoryName}`,
         date: transactionDate,
         notes: `Auto-generated from recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
         paid: isPaid,
