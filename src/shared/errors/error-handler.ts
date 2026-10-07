@@ -73,6 +73,15 @@ export function errorHandler(
     return;
   }
 
+  // @fastify/rate-limit throws a plain { statusCode: 429, message } object, which none of the branches above match
+  if ((error as { statusCode?: number }).statusCode === 429) {
+    reply.status(429).send({
+      success: false,
+      error: { code: 'RATE_LIMITED', message: 'Too many requests, try again later' },
+    } satisfies ErrorResponse);
+    return;
+  }
+
   // Handle Fastify validation errors (from schema validation)
   if ('validation' in error && error.validation) {
     const response: ErrorResponse = {

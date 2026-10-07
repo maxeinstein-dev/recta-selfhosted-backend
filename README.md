@@ -66,13 +66,27 @@ Choose how users sign in via `AUTH_MODE`:
 
 - **`local`** (recommended for self-host) — no third-party auth. The backend issues and verifies its
   own JWTs for email/password login. Requires `AUTH_JWT_SECRET` (min 32 chars; generate with
-  `openssl rand -base64 48`). Optional: `AUTH_TOKEN_TTL_HOURS` (default 720 = 30 days),
-  `AUTH_REQUIRE_EMAIL_VERIFICATION` (default `false`). No Firebase setup needed.
+  `openssl rand -base64 48`). Optional: `AUTH_TOKEN_TTL_HOURS` (default 720 = 30 days) and `AUTH_ALLOW_REGISTRATION` (default `true`; set it to
+  `false` to close sign-ups once your users exist). No Firebase setup needed.
 - **`firebase`** (default) — Google/Apple/Email sign-in via Firebase. Provide credentials with one of
   the two options below. Optionally set the public `AUTH_FIREBASE_WEB_API_KEY` so `GET /auth/config`
   hands the client your web config.
 
 Clients call `GET /auth/config` (public) to discover the mode before showing a login screen.
+In `local` mode, clients use `POST /auth/register` and `POST /auth/login` (both public, return
+a JWT for the `Authorization: Bearer` header). `GET /auth/me` and `POST /auth/sync` work in
+both modes. `GET /auth/config` also reports `registrationEnabled`.
+
+Local mode details worth knowing when you host it:
+
+- Emails are trimmed and lowercased before they are stored or looked up, so `Ana@Example.com` and
+  `ana@example.com` are the same account. Passwords are 8 to 72 bytes (bcrypt ignores the rest).
+- Registration answers 409 for an email that is already taken, so it reveals which emails have an
+  account. Login does not: a wrong password and an unknown email answer (and take) the same.
+- `POST /auth/register` and `POST /auth/login` are limited to 10 requests per minute per IP. The server
+  runs with `trustProxy` on, so the IP is the one in `X-Forwarded-For`: **put the app behind a reverse
+  proxy that overwrites that header** (and does not expose the app port directly), otherwise a client can
+  send a different value on every request and skip the limit.
 
 **Firebase – option A (file):**
 
