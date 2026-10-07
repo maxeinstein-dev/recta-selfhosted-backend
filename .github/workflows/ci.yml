@@ -52,3 +52,43 @@ jobs:
       - name: Whitespace errors (git diff --check)
         if: github.event_name == 'pull_request'
         run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+  # Tests that need a real database (skipped in the job above because DB_TEST_URL is not set there).
+  db-tests:
+    name: Postgres tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: recta
+          POSTGRES_PASSWORD: recta
+          POSTGRES_DB: recta_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recta -d recta_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://recta:recta@localhost:5432/recta_ci
+      DB_TEST_URL: postgresql://recta:recta@localhost:5432/recta_ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate the Prisma Client
+        run: npm run db:generate
+
+      - name: Apply the migrations
+        run: npm run db:deploy
+
+      - name: Database tests
+        run: npx vitest run integration
