@@ -146,6 +146,59 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
     });
   });
 
+  describe('an import that fails half way', () => {
+    // A trigger makes the database refuse the row whose description is "Boom store": a failure no check can foresee.
+    const failing = trn('20251118', '-25.00', 'fit-boom', 'Boom store');
+    const FILE3 = ofx(MARKET, SHOES, failing);
+
+    beforeAll(async () => {
+      await prisma.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION test_boom() RETURNS trigger AS $$ BEGIN IF NEW.description = 'Boom store' THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql`);
+      await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS test_boom_trigger ON transactions');
+    });
+    afterAll(async () => {
+      await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS test_boom_trigger ON transactions');
+      await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS test_boom()');
+    });
+
+    it('saves what came before, says where it stopped, and sending the same request again creates only the rest', async () => {
+      const { account, cardId } = await setup();
+      const p = await preview(account, FILE3);
+      const bad = p.lines.find((l) => l.memo === 'Boom store')!;
+      const request = requestFrom(p);
+      await prisma.$executeRawUnsafe('CREATE TRIGGER test_boom_trigger BEFORE INSERT ON transactions FOR EACH ROW EXECUTE FUNCTION test_boom()');
+      const balance = async () => (await prisma.account.findUniqueOrThrow({ where: { id: cardId } })).balance.toNumber();
+
+      const first = await confirm(account, request);
+
+      expect(first).toMatchObject({ created: 2, linked: 0, stoppedAt: { ref: bad.ref } });
+      expect(first.stoppedAt!.message).toContain('boom');
+      expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(2);
+      expect(await balance()).toBe(100);
+
+      await prisma.$executeRawUnsafe('DROP TRIGGER test_boom_trigger ON transactions');
+      const second = await confirm(account, request);
+      expect(second).toMatchObject({ created: 1, skipped: [{ cause: 'already-imported' }, { cause: 'already-imported' }] });
+      expect(second.stoppedAt).toBeUndefined();
+      expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+      expect(await balance()).toBe(125);
+
+      expect(await confirm(account, request)).toMatchObject({ created: 0 });
+      expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+    });
+
+    it('throws when the very first line fails, as nothing was saved', async () => {
+      const { account, cardId } = await setup();
+      const p = await preview(account, ofx(failing));
+      await prisma.$executeRawUnsafe('CREATE TRIGGER test_boom_trigger BEFORE INSERT ON transactions FOR EACH ROW EXECUTE FUNCTION test_boom()');
+      try {
+        await expect(confirm(account, requestFrom(p))).rejects.toThrow();
+        expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(0);
+      } finally {
+        await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS test_boom_trigger ON transactions');
+      }
+    });
+  });
+
   it('keeps identical lines of one file apart, each with its own ref', async () => {
     const twin = trn('20251110', '-15.00', 'fit-twin', 'Garage');
     const { account, cardId } = await setup();

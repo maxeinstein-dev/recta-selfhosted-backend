@@ -158,7 +158,7 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
   app.post('/import/card-ofx/confirm', {
     schema: {
       description:
-        'Confirm a credit card invoice OFX import (application/json: { accountId, lines (the preview lines, up to 1000, in the preview order), selectedRefs, createDespiteDuplicate?, links?: [{ ref, transactionId }], categoryMap?: [{ merchant, type, categoryName }] }). The lines are checked against their own content; what is new is decided on fresh data. Each selected line becomes a transaction on the card carrying its ref, so sending the same request again creates nothing twice; a line that still looks like a hand-typed transaction is skipped unless listed in createDespiteDuplicate, and a link records the line as represented by that transaction. Payment lines are refused. Not atomic: if a line fails after others were saved the answer carries stoppedAt and sending the same request again continues. Requires EDITOR+ on the card household.',
+        'Confirm a credit card invoice OFX import (application/json: { accountId, lines (the preview lines, up to 1000, in the preview order), selectedRefs, createDespiteDuplicate?, links?: [{ ref, transactionId }], categoryMap?: [{ merchant, type, categoryName }] }). The lines are checked against their own content; what is new is decided on fresh data. Each selected line becomes a transaction on the card carrying its ref, so sending the same request again creates nothing twice; a line that still looks like a hand-typed transaction is skipped unless listed in createDespiteDuplicate, and a link records the line as represented by that transaction. Payment lines are refused. Not atomic: if a line fails after others were saved the answer carries stoppedAt and sending the same request again continues. One confirm per card runs at a time: a second answers 409 at once. Requires EDITOR+ on the card household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       body: {
@@ -178,6 +178,7 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
         400: errorResponseSchema,
         403: errorResponseSchema,
         404: errorResponseSchema,
+        409: errorResponseSchema,
       },
     },
   }, async (request, reply) => {

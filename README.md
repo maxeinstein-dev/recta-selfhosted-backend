@@ -208,7 +208,8 @@ Code that writes transactions together with rows of its own (an importer recordi
 | `deleteTransaction(id, household, options)` | `options.guard(tx)` | after the row is locked and read again, before anything is written, for any delete except the three paid cases below (a plain income or expense, paid or not; an unpaid transfer, allocation or split expense; a paid row with no account or category) | nothing is deleted |
 
 `guard` does **not** run for a **paid** transfer, a **paid** allocation or a **paid** split expense, which have their own delete paths.
-`sourceRef` is accepted by `createTransaction` and `updateTransaction` as a server-side field (`InternalCreateTransactionInput`, `InternalUpdateTransactionInput`); it is not in the HTTP schemas, so a client cannot set it. `guard` does not run for transfers, allocations and split expenses, which have their own delete paths. `guard` does not run for a paid transfer, a paid allocation or a paid split expense, which have their own delete paths.
+
+`sourceRef` is accepted by `createTransaction` and `updateTransaction` as a server-side field (`InternalCreateTransactionInput`, `InternalUpdateTransactionInput`); it is not in the HTTP schemas, so a client cannot set it. `guard` does not run for a paid transfer, a paid allocation or a paid split expense, which have their own delete paths.
 
 **Locks, in one order.** `updateTransaction` and `deleteTransaction` both lock the transaction row first (`SELECT ... FOR UPDATE`), read it again, and only then the accounts it touches (several accounts are always locked by id). Because both take their locks in the same order, an update and a delete of the same row, or two moves that cross, wait for each other instead of deadlocking.
 
