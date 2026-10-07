@@ -91,4 +91,4 @@ jobs:
         run: npm run db:deploy
 
       - name: Integration tests
-        run: npx vitest run src/modules/transactions/import.integration.test.ts
+        run: npx vitest run integration
