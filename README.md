@@ -164,6 +164,18 @@ A monthly recurrence has at most one occurrence per month: executing it (cron, `
 
 A recurrence with `followLastAmount: true` predicts the next value as the last real one. When `PATCH /transactions/:id` changes the amount of the most recent occurrence of such an active recurrence (largest date, not beyond today + 31 days), the recurrence `amount` is updated in the same database transaction and the response carries `recurringUpdated: { id, amount }`. Editing or paying an older occurrence never changes the recurrence. `GET /recurring-transactions` items carry `lastOccurrenceDate` (latest occurrence up to today + 31 days). `followLastAmount` is accepted by `POST` and `PATCH /recurring-transactions` and returned with every recurrence.
 
+## Categories
+
+Custom categories belong to a household. Transactions, recurring transactions and budgets reference one as `CUSTOM:<category id>`, so renaming never touches them.
+
+- Names are unique per household and type, ignoring case, accents and extra spaces, and may not equal a system category of the same type. A clash is `409 CATEGORY_NAME_TAKEN` on create and on rename. `POST` and `PATCH /categories` also change colour and icon.
+- `GET /categories?includeUsage=true` adds `usage: { transactions, recurringTransactions, budgets }` to every category, system and custom.
+- `DELETE /categories/:categoryId` is refused (`400 CATEGORY_IN_USE`) while anything references the category; the check and the delete run in one database transaction holding the category row lock.
+- `POST /categories/:categoryId/merge` (EDITOR+ on the household that owns the source) moves everything of a custom category into another category of the same type and deletes the source, in one database transaction. Body: `{ targetCategoryId }` (a custom category of the same household) or `{ targetSystemName }` (a system category), exactly one. `?preview=true` runs the same validation and returns the counts without writing. Budgets of a month the target already has are added together. Refusals: `CATEGORY_MERGE_SELF`, `CATEGORY_MERGE_TYPE_MISMATCH`, `CATEGORY_MERGE_TARGET_INVALID` (400); a source or target that does not exist in the household is 404, which also makes a repeated merge a harmless no-op.
+- Name uniqueness is checked before the insert and backed by the existing unique index on the exact name only, so several simultaneous creates of names that differ only by case, accents or spaces ("Cafe Race" / "CAFÉ race") can all succeed. Merging the duplicates fixes it. To find them in a database: `SELECT household_id, type, lower(unaccent(regexp_replace(btrim(name), '\s+', ' ', 'g'))) AS normalized, count(*) FROM categories GROUP BY 1, 2, 3 HAVING count(*) > 1;` (needs the `unaccent` extension; without it use `lower(regexp_replace(btrim(name), '\s+', ' ', 'g'))`).
+- Split transactions store their category on the member's personal household, outside the household that owns the category, so a merge or delete of that category does not see them (known limitation, not changed here).
+- Every writer of a category name shares the category row lock (`lockCustomCategory`), so a write racing a merge or a delete is either moved by the merge or refused with `400`, never left pointing at a deleted category. Merges lock their two categories in id order, so two opposite merges cannot deadlock.
+
 ## Project structure
 
 ```

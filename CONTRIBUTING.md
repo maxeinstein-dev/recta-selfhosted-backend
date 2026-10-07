@@ -82,6 +82,20 @@ touch another database.
 7. **Commits in English, Conventional Commits style** (`feat(scope): ...`, `fix(scope): ...`,
    `chore: ...`, `docs: ...`, `test: ...`, `refactor: ...`). Messages explain the why when it is not obvious.
 8. **The CHANGELOG is a merge gate** (next section).
+9. **Code that stores a category name takes the category lock.** Merging or deleting a custom category locks its
+   row and re-points every reference; a writer that stores `CUSTOM:<id>` without sharing that lock can leave a
+   row pointing at a category that no longer exists. Call `lockCustomCategory(tx, householdId, categoryName)`
+   (`src/shared/utils/categoryLock.ts`) inside the same database transaction that writes the row. A function
+   that only writes fixed system names (such as `TRANSFER`) is listed with its reason in `EXCEPTIONS` in
+   `src/shared/utils/categoryLock.guard.test.ts`, a text scan that fails and names any other function that
+   writes a category name without the lock. It covers `function` declarations (also `export default`), arrow-function constants (also wrapped in a call such as `withTx(async ...)`) and two-space-indented methods with a one-line signature, that call Prisma
+   `create`/`createMany`/`createManyAndReturn`/`update`/`updateMany`/`upsert` with `categoryName` (or with a `data`
+   variable in a unit that mentions it), or raw SQL that INSERTs or UPDATEs `category_name` or a table that has it
+   (or `$executeRaw(variable)` in such a unit), and requires a `lockCustomCategory(` call BEFORE the first write.
+   It does not see: a write in a unit that never spells `categoryName`; a callback nested in a unit; a method whose
+   signature spans lines or an anonymous `export default` function; a lock taken for another category than the one
+   written (the check is textual). Those rely on review. The header of that file has the exact list and the
+   checklist. Going through `createTransaction`, `updateTransaction` or `batchCreateTransactions` already locks.
 
 ### Migrations
 
