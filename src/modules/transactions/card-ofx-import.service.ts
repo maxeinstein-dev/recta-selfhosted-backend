@@ -10,6 +10,7 @@ import { AccountType } from '../../shared/enums/index.js';
 import { BadRequestError, NotFoundError } from '../../shared/errors/app-error.js';
 import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { addMonths, monthKey, type YearMonth } from './import/months.js';
+import { findPossibleDuplicates, suggestCategories } from './card-ofx-duplicates.js';
 import { parseCardOfx, type CardOfxStatementLine } from './parsers/ofx-card.parser.js';
 import { loadInvoicePayments, utcToday } from './transactions.service.js';
 import type {
@@ -175,10 +176,14 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
   }
 
   const known = await loadKnownRefs(account.householdId, statement.lines.map((l) => l.ref));
-  const lines = statement.lines.map((l) => ({
-    ...l,
-    status: l.kind === 'payment' ? ('payment' as const) : known.has(l.ref) ? ('reconciled' as const) : ('new' as const),
-  }));
+  const statusOf = (l: CardOfxStatementLine) => (l.kind === 'payment' ? ('payment' as const) : known.has(l.ref) ? ('reconciled' as const) : ('new' as const));
+  const newLines = statement.lines.filter((l) => statusOf(l) === 'new');
+  const [duplicates, categorySuggestions] = await Promise.all([
+    findPossibleDuplicates(account, newLines),
+    suggestCategories(account.householdId, newLines),
+  ]);
+  if (duplicates.size > 0) warnings.push('possible-duplicates');
+  const lines = statement.lines.map((l) => ({ ...l, status: statusOf(l), possibleDuplicate: duplicates.get(l.ref) ?? null }));
   const count = (status: (typeof lines)[number]['status']) => lines.filter((l) => l.status === status).length;
 
   return {
@@ -192,6 +197,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
     lines,
     // Capped: a file of empty transactions would otherwise answer with hundreds of thousands of entries.
     skipped: statement.skipped.slice(0, MAX_LISTED_SKIPPED),
+    categorySuggestions,
     payment: await describePayment(account, month, statement.lines.filter((l) => l.kind === 'payment')),
     totals: {
       lines: lines.length,
@@ -199,6 +205,7 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
       reconciled: count('reconciled'),
       payments: count('payment'),
       skipped: statement.skipped.length,
+      possibleDuplicates: duplicates.size,
     },
     warnings,
   };

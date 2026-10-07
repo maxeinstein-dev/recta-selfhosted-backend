@@ -116,7 +116,7 @@ export function cardOfxRef(fitid: string, memo: string, signedAmount: number, da
 }
 
 /** Key of the lines that share one ref sequence (the occurrence counter of cardOfxRef). */
-function cardOfxContentKey(fitid: string, memo: string, signedAmount: number, date: string): string {
+export function cardOfxContentKey(fitid: string, memo: string, signedAmount: number, date: string): string {
   return `${fitid}|${memo}|${signedAmountText(signedAmount)}|${date}`;
 }
 

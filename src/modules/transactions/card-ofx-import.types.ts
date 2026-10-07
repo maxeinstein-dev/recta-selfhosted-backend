@@ -1,6 +1,7 @@
 /**
  * HTTP contract of the card invoice OFX importer:
  *   POST /transactions/import/card-ofx/preview  (multipart: file .ofx, accountId, options JSON optional)
+ *   POST /transactions/import/card-ofx/confirm  (JSON: the preview lines echoed back and what to do with each)
  *
  * The frontend builds against these shapes: keep them free of Prisma types and of internal helper types. Anything
  * the client has to word (warnings, skipped lines) is a code, never prose.
@@ -18,6 +19,17 @@ export interface CardOfxOptionsInput {
  */
 export type CardOfxStatus = 'new' | 'reconciled' | 'payment';
 
+/**
+ * A transaction typed by hand (no source reference) on the same card that looks like the same purchase: same
+ * direction, same amount in cents, a date within 3 days. Only a hint: the user decides (create anyway, skip, or link).
+ */
+export interface CardOfxPossibleDuplicate {
+  transactionId: string;
+  description: string | null;
+  /** YYYY-MM-DD */
+  date: string;
+}
+
 export interface CardOfxLine {
   /** ofx:<FITID>:<8 hex>, see the README "Source references". */
   ref: string;
@@ -34,6 +46,17 @@ export interface CardOfxLine {
   merchant: string;
   installment: CardOfxInstallment | null;
   status: CardOfxStatus;
+  /** Only on `new` lines that are not payments. */
+  possibleDuplicate: CardOfxPossibleDuplicate | null;
+}
+
+/** The category a merchant's lines got the last time the household booked it (never invented). */
+export interface CardOfxCategorySuggestion {
+  /** The line's `merchant`. */
+  merchant: string;
+  type: 'INCOME' | 'EXPENSE';
+  /** A system category name or `CUSTOM:<id>`. */
+  categoryName: string;
 }
 
 /**
@@ -61,7 +84,9 @@ export type CardOfxWarning =
   /** The card has neither closing nor due day: invoices follow the calendar month. */
   | 'card-without-closing-day'
   /** LEDGERBAL differs from the sum of the lines by more than a few cents. */
-  | 'balance-mismatch';
+  | 'balance-mismatch'
+  /** Some new lines look like transactions typed by hand; they come unselected. */
+  | 'possible-duplicates';
 
 export interface CardOfxPreviewResponse {
   accountId: string;
@@ -79,6 +104,47 @@ export interface CardOfxPreviewResponse {
   /** The first 100 transactions of the file that could not be read (1-based position and why); `totals.skipped` has the count. */
   skipped: Array<{ position: number; reason: CardOfxSkipReason }>;
   payment: CardOfxPayment | null;
-  totals: { lines: number; new: number; reconciled: number; payments: number; skipped: number };
+  /** Merchants of the new lines that the household already categorized. */
+  categorySuggestions: CardOfxCategorySuggestion[];
+  totals: { lines: number; new: number; reconciled: number; payments: number; skipped: number; possibleDuplicates: number };
   warnings: CardOfxWarning[];
+}
+
+// ---------------------------------------------------------------------------
+// Confirm
+// ---------------------------------------------------------------------------
+
+/** A preview line as the client echoes it back (without `status` and `possibleDuplicate`, which the server recomputes). */
+export type CardOfxConfirmLine = Omit<CardOfxLine, 'status' | 'possibleDuplicate'>;
+
+export interface CardOfxConfirmRequest {
+  accountId: string;
+  /** Every line of the preview, in order: identical lines are told apart by their order, so none may be left out. */
+  lines: CardOfxConfirmLine[];
+  /** Refs of the lines to create as transactions. Payment lines are refused. */
+  selectedRefs: string[];
+  /** A selected line that still looks like a hand-typed transaction is skipped unless its ref is listed here. */
+  createDespiteDuplicate: string[];
+  /** Record a line as already represented by an existing transaction instead of creating one. */
+  links: Array<{ ref: string; transactionId: string }>;
+  /** Category per merchant; a merchant without an entry gets "other expenses" or "other income". */
+  categoryMap: Array<{ merchant: string; type: 'INCOME' | 'EXPENSE'; categoryName: string }>;
+}
+
+export type CardOfxSkipCause =
+  /** A transaction already carries (or represents) the ref: an earlier import, or a parallel one, did it. */
+  | 'already-imported'
+  /** Selected, looks like a hand-typed transaction and was not listed in `createDespiteDuplicate`. */
+  | 'possible-duplicate'
+  /** A link whose transaction no longer fits (changed, deleted, already linked, another card). */
+  | 'link-refused';
+
+export interface CardOfxConfirmResponse {
+  created: number;
+  linked: number;
+  skipped: Array<{ ref: string; cause: CardOfxSkipCause }>;
+  /** Ids of the transactions created, in line order. */
+  ids: string[];
+  /** Set when a line failed after others were saved: the lines before it are saved, the rest are not. */
+  stoppedAt?: { ref: string; message: string };
 }

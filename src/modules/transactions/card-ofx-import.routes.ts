@@ -1,10 +1,12 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { authMiddleware } from '../../shared/middleware/auth.middleware.js';
-import { requireEditor } from '../../shared/middleware/authorization.middleware.js';
+import { authMiddleware, getAuthUser } from '../../shared/middleware/auth.middleware.js';
+import { requireEditor, getUserByFirebaseUid } from '../../shared/middleware/authorization.middleware.js';
 import { BadRequestError } from '../../shared/errors/app-error.js';
-import { buildCardOfxPreview, resolveCardAccount } from './card-ofx-import.service.js';
+import { MAX_CARD_OFX_LINES, buildCardOfxPreview, resolveCardAccount } from './card-ofx-import.service.js';
+import { confirmCardOfxImport } from './card-ofx-confirm.service.js';
 import { importErrorHandler } from './import.routes.js';
+import { MAX_CARD_OFX_AMOUNT, MAX_CARD_OFX_FITID_LENGTH } from './parsers/ofx-card.parser.js';
 
 // Error shape mirrors the other import routes and the central error handler.
 const errorResponseSchema = {
@@ -36,6 +38,32 @@ export const cardOfxOptionsSchema = z.object({
       month: z.number().int().min(1).max(12),
     })
     .optional(),
+});
+
+const typeSchema = z.enum(['INCOME', 'EXPENSE']);
+
+const cardOfxLineSchema = z.object({
+  ref: z.string().min(1).max(120),
+  fitid: z.string().min(1).max(MAX_CARD_OFX_FITID_LENGTH),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  amount: z.number().positive().max(MAX_CARD_OFX_AMOUNT),
+  type: typeSchema,
+  kind: z.enum(['purchase', 'refund', 'discount', 'payment']),
+  memo: z.string().min(1).max(255),
+  merchant: z.string().min(1).max(255),
+  installment: z.object({ number: z.number().int().min(1).max(99), total: z.number().int().min(1).max(99) }).nullable(),
+});
+
+export const cardOfxConfirmBodySchema = z.object({
+  accountId: z.string().uuid(),
+  lines: z.array(cardOfxLineSchema).min(1).max(MAX_CARD_OFX_LINES),
+  selectedRefs: z.array(z.string().min(1).max(120)).max(MAX_CARD_OFX_LINES),
+  createDespiteDuplicate: z.array(z.string().min(1).max(120)).max(MAX_CARD_OFX_LINES).default([]),
+  links: z.array(z.object({ ref: z.string().min(1).max(120), transactionId: z.string().uuid() })).max(MAX_CARD_OFX_LINES).default([]),
+  categoryMap: z
+    .array(z.object({ merchant: z.string().min(1).max(255), type: typeSchema, categoryName: z.string().min(1).max(60) }))
+    .max(MAX_CARD_OFX_LINES)
+    .default([]),
 });
 
 /** The `options` multipart field is a JSON string; a client that already parsed it may send the object. */
@@ -121,5 +149,46 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
 
     const preview = await buildCardOfxPreview({ account, buffer, options });
     return reply.send({ success: true, data: preview });
+  });
+
+  /**
+   * POST /transactions/import/card-ofx/confirm — application/json ONLY.
+   * Creates the selected lines as transactions (idempotent by ref) and links lines to hand-typed transactions.
+   */
+  app.post('/import/card-ofx/confirm', {
+    schema: {
+      description:
+        'Confirm a credit card invoice OFX import (application/json: { accountId, lines (the preview lines, up to 1000, in the preview order), selectedRefs, createDespiteDuplicate?, links?: [{ ref, transactionId }], categoryMap?: [{ merchant, type, categoryName }] }). The lines are checked against their own content; what is new is decided on fresh data. Each selected line becomes a transaction on the card carrying its ref, so sending the same request again creates nothing twice; a line that still looks like a hand-typed transaction is skipped unless listed in createDespiteDuplicate, and a link records the line as represented by that transaction. Payment lines are refused. Not atomic: if a line fails after others were saved the answer carries stoppedAt and sending the same request again continues. Requires EDITOR+ on the card household.',
+      tags: ['Transactions'],
+      security: [{ bearerAuth: [] }],
+      body: {
+        type: 'object',
+        required: ['accountId', 'lines', 'selectedRefs'],
+        properties: {
+          accountId: { type: 'string' },
+          lines: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          selectedRefs: { type: 'array', items: { type: 'string' } },
+          createDespiteDuplicate: { type: 'array', items: { type: 'string' } },
+          links: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          categoryMap: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        },
+      },
+      response: {
+        201: okResponseSchema,
+        400: errorResponseSchema,
+        403: errorResponseSchema,
+        404: errorResponseSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const input = cardOfxConfirmBodySchema.parse(request.body);
+
+    const account = await resolveCardAccount(input.accountId, (householdId) => requireEditor(request, householdId));
+
+    const authUser = getAuthUser(request);
+    const user = await getUserByFirebaseUid(authUser.uid, authUser.email);
+
+    const result = await confirmCardOfxImport({ account, request: input, userId: user.id });
+    return reply.status(201).send({ success: true, data: result });
   });
 }
