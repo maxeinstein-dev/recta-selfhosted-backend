@@ -37,5 +37,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - The list of an invoice's transactions shows only the payments already made (dated up to today, by the UTC date: between 21:00 and midnight in Brasília a payment dated tomorrow already counts), so it agrees with the invoice total instead of listing a payment scheduled for the due date as if it had been paid.
 - A card with no purchases before the invoice window (its initial debt comes from the account balance) now counts payments by the invoice they pay, like the rest of the invoice and the payment, instead of by the dates inside the window: a payment for this invoice, or made ahead for a later one, is added back to the balance estimate wherever it is dated, and a payment for an earlier invoice is not (so one made after the window closes no longer inflates the previous balance, and one made inside the window is no longer ignored in the total). A payment dated in the future that the balance already holds still counts through the balance, as it did before.
 
+### Changed
+
+- Updating or deleting a transaction locks its row and reads it again, taking the row first and then the accounts, in the same order in both. If someone else changed the account, amount or type that an update was itself changing, it now answers 409 ("changed by someone else; reload and try again") instead of applying the update on stale balances; other concurrent changes are applied on top, and a Postgres deadlock is retried up to 3 times before answering 409. A delete whose row changed meanwhile is retried too.
+- Internal hooks in the transaction service (an in-transaction hook on create, a before-write and an in-transaction hook on update, a guard on delete) for importers, documented in the README ("Transaction write hooks"). Not reachable over HTTP.
+
 <!-- Reference entries to their PR like this (see CONTRIBUTING.md): `... ([#123]).` and, at the bottom of this file,
      `[#123]: https://github.com/lucianodiisouza/recta-selfhosted-backend/pull/123`. -->
