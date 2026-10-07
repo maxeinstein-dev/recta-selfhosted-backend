@@ -32,3 +32,5 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 <!-- Reference entries to their PR like this (see CONTRIBUTING.md): `... ([#123]).` and, at the bottom of this file,
      `[#123]: https://github.com/lucianodiisouza/recta-selfhosted-backend/pull/123`. -->
+- Credit card invoice payments (`invoice_pay:<card>:<year>-<zero-based month>`) are counted by the invoice they pay, not by the window their date falls in. A payment is dated on or after the closing day of its own invoice, so the date window never contained it: the paid invoice stayed in the next invoice's previous balance and the debt was counted twice. Payments tagged for an earlier invoice reduce the previous balance, payments tagged for the invoice itself count as its payments, and payments tagged for a later invoice (paid in advance) are not subtracted from earlier ones. Pay, undo and the invoice view share one helper.
+- A payment dated after today (scheduled for an upcoming due date) no longer counts as paid until its date arrives.
