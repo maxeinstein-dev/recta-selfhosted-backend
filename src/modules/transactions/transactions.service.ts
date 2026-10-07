@@ -39,6 +39,12 @@ function calculateBalanceChange(amount: number, isIncome: boolean, accountType: 
   return isIncome ? amount : -amount;
 }
 
+/**
+ * Server-side extras of a create (not part of the HTTP schema, so a client cannot set them): an importer stamps the
+ * row with the stable id of its source line.
+ */
+export type InternalCreateTransactionInput = CreateTransactionInput & { sourceRef?: string };
+
 /** Hooks of createTransaction. */
 export interface CreateTransactionHooks {
   /**
@@ -55,7 +61,7 @@ export interface CreateTransactionHooks {
  * @param hooks Optional caller writes that commit or roll back together with the transaction
  */
 export async function createTransaction(
-  input: CreateTransactionInput,
+  input: InternalCreateTransactionInput,
   userId?: string,
   hooks?: CreateTransactionHooks
 ) {
@@ -204,6 +210,7 @@ export async function createTransaction(
         ...(input.installmentId && { installmentId: input.installmentId }),
         ...(input.installmentNumber && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments && { totalInstallments: input.totalInstallments }),
+        ...(input.sourceRef && { sourceRef: input.sourceRef }),
         ...(input.attachmentUrl && { attachmentUrl: input.attachmentUrl }),
       },
       include: {
@@ -722,6 +729,9 @@ export async function listTransactions(query: ListTransactionsQuery) {
   return createPaginatedResponse(convertedTransactions, limit, total);
 }
 
+/** Server-side extras of an update (not part of the HTTP schema): the importer re-points the source of a row. */
+export type InternalUpdateTransactionInput = UpdateTransactionInput & { sourceRef?: string | null };
+
 /** Hooks of updateTransaction, both run inside the same database transaction as the update. */
 export interface UpdateTransactionOptions {
   /**
@@ -772,7 +782,7 @@ export function isDeadlock(error: unknown): boolean {
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput,
+  input: InternalUpdateTransactionInput,
   options: UpdateTransactionOptions = {}
 ) {
   for (let attempt = 1; ; attempt++) {
@@ -790,7 +800,7 @@ export async function updateTransaction(
 async function updateTransactionOnce(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput,
+  input: InternalUpdateTransactionInput,
   options: UpdateTransactionOptions
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
@@ -962,6 +972,7 @@ async function updateTransactionOnce(
         ...(input.installmentNumber !== undefined && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments !== undefined && { totalInstallments: input.totalInstallments }),
         ...(input.attachmentUrl !== undefined && { attachmentUrl: input.attachmentUrl }),
+        ...(input.sourceRef !== undefined && { sourceRef: input.sourceRef }),
       },
       include: {
         account: {

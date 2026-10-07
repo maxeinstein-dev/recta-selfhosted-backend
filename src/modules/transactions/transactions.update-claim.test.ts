@@ -178,4 +178,22 @@ describe('updateTransaction: lock, re-read and conflicts', () => {
     expect(isDeadlock({ code: 'P2002' })).toBe(false);
     expect(isDeadlock(null)).toBe(false);
   });
+
+  it('writes the source ref the importer sets, clears it with null, and leaves it alone otherwise', async () => {
+    db.transactionUpdate.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({
+      ...ROW,
+      ...data,
+      amount: decimal(100),
+      account: { id: CARD, name: 'x', type: AccountType.CREDIT },
+    }));
+
+    await updateTransaction(ROW.id, ROW.householdId, { sourceRef: 'ofx:a:00000001' });
+    expect(db.transactionUpdate.mock.calls[0]![0].data).toMatchObject({ sourceRef: 'ofx:a:00000001' });
+
+    await updateTransaction(ROW.id, ROW.householdId, { sourceRef: null });
+    expect(db.transactionUpdate.mock.calls[1]![0].data).toMatchObject({ sourceRef: null });
+
+    await updateTransaction(ROW.id, ROW.householdId, { description: 'x' });
+    expect(db.transactionUpdate.mock.calls[2]![0].data).not.toHaveProperty('sourceRef');
+  });
 });

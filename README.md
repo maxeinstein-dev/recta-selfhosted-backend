@@ -196,12 +196,25 @@ Code that writes transactions together with rows of its own (an importer recordi
 | `deleteTransaction(id, household, options)` | `options.guard(tx)` | after the row is locked and read again, before anything is written, for any delete except the three paid cases below (a plain income or expense, paid or not; an unpaid transfer, allocation or split expense; a paid row with no account or category) | nothing is deleted |
 
 `guard` does **not** run for a **paid** transfer, a **paid** allocation or a **paid** split expense, which have their own delete paths.
+`sourceRef` is accepted by `createTransaction` and `updateTransaction` as a server-side field (`InternalCreateTransactionInput`, `InternalUpdateTransactionInput`); it is not in the HTTP schemas, so a client cannot set it. `guard` does not run for transfers, allocations and split expenses, which have their own delete paths. `guard` does not run for a paid transfer, a paid allocation or a paid split expense, which have their own delete paths.
 
 **Locks, in one order.** `updateTransaction` and `deleteTransaction` both lock the transaction row first (`SELECT ... FOR UPDATE`), read it again, and only then the accounts it touches (several accounts are always locked by id). Because both take their locks in the same order, an update and a delete of the same row, or two moves that cross, wait for each other instead of deadlocking.
 
 **Conflicts and retries.** If someone changed the account, amount or type that the request itself sets, `updateTransaction` answers 409. Any other concurrent change makes the call read the row again and go on, and a Postgres deadlock (SQLSTATE 40P01) is also retried; each call tries up to 3 times, then answers 409. A delete whose row changed between its read and its lock is retried the same way (404 if the row is gone). **The hooks run on every attempt**, each inside a fresh database transaction, so a hook must be safe to run more than once.
 
 **Who uses them.** `inTransaction` on create and `beforeWrite`/`inTransaction` on update are what the card invoice import (record the external refs together with the row) and the review queue (move or delete rows, claiming them first) need; `guard` is for callers that must recheck something atomically with a delete (shares, settlements).
+
+## Source references
+
+`transactions.source_ref` (up to 120 characters, nullable, unique per household) and the `transaction_external_refs` table (a `ref` per household, pointing at the transaction that represents it) hold the identity of the external line a transaction came from. They make a re-import recognize what it already holds. Manual transactions have no `source_ref`.
+
+The prefix names the importer and is a public contract: refs are written once and never rewritten, so the layout of a ref must not change.
+
+| Prefix | Layout | Written by |
+|---|---|---|
+| `ofx:` | `ofx:<FITID>:<8 hex>` | The card invoice OFX import. `<FITID>` is the statement's id as is when it is short and made of `A-Za-z0-9._-`, otherwise `h` + 32 hex of its sha1; the 8 hex are the start of sha1 of `memo|signed amount|date` (two identical lines of one file add `|#2`, `|#3`... to the hashed text, in file order), which tells apart the installments of one purchase that share a `FITID`. |
+
+A new importer picks its own prefix and must not write refs under `ofx:`.
 
 ## Project structure
 

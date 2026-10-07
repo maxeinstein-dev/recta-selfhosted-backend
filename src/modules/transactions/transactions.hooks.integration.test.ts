@@ -336,4 +336,59 @@ describe.skipIf(!enabled)('transaction write hooks on Postgres', { timeout: 30_0
       expect(locked).toBe(true);
     });
   });
+
+  describe('source refs', () => {
+    it('stores the ref on create and on update, and a hook can record the external refs of the same row', async () => {
+      const accountId = await newAccount('refs ok');
+      const created = await createTransaction(
+        { householdId, accountId, categoryName: 'OTHER_EXPENSES', amount: 5, date: DAY, paid: true, isSplit: false, sourceRef: 'ofx:r1:00000001' },
+        undefined,
+        { inTransaction: async (tx, row) => void (await tx.transactionExternalRef.create({ data: { householdId, transactionId: row.id, ref: 'ofx:r1:ext1' } })) },
+      );
+      expect((await prisma.transaction.findUniqueOrThrow({ where: { id: created.id } })).sourceRef).toBe('ofx:r1:00000001');
+      expect(await prisma.transactionExternalRef.count({ where: { householdId, ref: 'ofx:r1:ext1' } })).toBe(1);
+
+      await updateTransaction(created.id, householdId, { sourceRef: 'ofx:r1:00000002' });
+      expect((await prisma.transaction.findUniqueOrThrow({ where: { id: created.id } })).sourceRef).toBe('ofx:r1:00000002');
+      await updateTransaction(created.id, householdId, { sourceRef: null });
+      expect((await prisma.transaction.findUniqueOrThrow({ where: { id: created.id } })).sourceRef).toBeNull();
+    });
+
+    it('rolls the external refs back with the create, and refuses a repeated ref in the household without a stray balance', async () => {
+      const accountId = await newAccount('refs rollback');
+      await expect(
+        createTransaction({ householdId, accountId, categoryName: 'OTHER_EXPENSES', amount: 10, date: DAY, paid: true, isSplit: false, sourceRef: 'ofx:r2:00000001' }, undefined, {
+          inTransaction: async (tx, row) => {
+            await tx.transactionExternalRef.create({ data: { householdId, transactionId: row.id, ref: 'ofx:r2:ext1' } });
+            throw new Error('refused');
+          },
+        }),
+      ).rejects.toThrow('refused');
+      expect(await prisma.transactionExternalRef.count({ where: { householdId, ref: 'ofx:r2:ext1' } })).toBe(0);
+      expect(await prisma.transaction.count({ where: { accountId } })).toBe(0);
+
+      await expense(accountId, { sourceRef: 'ofx:r2:00000002' });
+      await expect(expense(accountId, { sourceRef: 'ofx:r2:00000002' })).rejects.toMatchObject({ code: 'P2002' });
+      expect(await balance(accountId)).toBe(-10);
+    });
+
+    it('lets two households use the same ref, rows without a ref repeat freely, and external refs go with their row', async () => {
+      const other = (await prisma.household.create({ data: { name: 'Hooks test 2' } })).id;
+      try {
+        const a = await newAccount('refs a');
+        const b = (await prisma.account.create({ data: { householdId: other, name: 'refs b', type: 'CHECKING' } })).id;
+        await expense(a, { sourceRef: 'ofx:r3:00000001' });
+        await createTransaction({ householdId: other, accountId: b, categoryName: 'OTHER_EXPENSES', amount: 1, date: DAY, paid: true, isSplit: false, sourceRef: 'ofx:r3:00000001' });
+        await expense(a);
+        const row = await expense(a);
+
+        await prisma.transactionExternalRef.create({ data: { householdId, transactionId: row.id, ref: 'ofx:r3:ext1' } });
+        await expect(prisma.transactionExternalRef.create({ data: { householdId, transactionId: row.id, ref: 'ofx:r3:ext1' } })).rejects.toMatchObject({ code: 'P2002' });
+        await prisma.transaction.delete({ where: { id: row.id } });
+        expect(await prisma.transactionExternalRef.count({ where: { householdId, ref: 'ofx:r3:ext1' } })).toBe(0);
+      } finally {
+        await prisma.household.delete({ where: { id: other } });
+      }
+    });
+  });
 });
