@@ -19,8 +19,9 @@ const store = vi.hoisted(() => ({ rows: [] as unknown[] }));
 const updates = vi.hoisted(() => ({ updateMany: vi.fn(), create: vi.fn(), accountUpdate: vi.fn() }));
 
 function matches(row: Row, where: Record<string, any>): boolean {
-  if (where.OR) return (where.OR as Record<string, any>[]).some((w) => matches(row, w));
-  for (const [key, cond] of Object.entries(where)) {
+  const { OR, ...rest } = where;
+  if (OR && !(OR as Record<string, any>[]).some((w) => matches(row, w))) return false;
+  for (const [key, cond] of Object.entries(rest)) {
     const value = (row as any)[key];
     if (key === 'date') {
       const t = row.date.getTime();
@@ -31,7 +32,13 @@ function matches(row: Row, where: Record<string, any>): boolean {
     } else if (cond !== null && typeof cond === 'object') {
       if ('equals' in cond && value !== cond.equals) return false;
       if ('startsWith' in cond && !(typeof value === 'string' && value.startsWith(cond.startsWith))) return false;
-      if ('not' in cond && value === cond.not) return false;
+      if ('not' in cond) {
+        const not = cond.not;
+        // `not: { startsWith }` is SQL NOT LIKE: a NULL column does not satisfy it.
+        if (not !== null && typeof not === 'object' && 'startsWith' in not) {
+          if (typeof value !== 'string' || value.startsWith(not.startsWith)) return false;
+        } else if (value === not) return false;
+      }
     } else if (value !== cond) return false;
   }
   return true;
@@ -187,6 +194,17 @@ describe('calculateCreditCardInvoice payments by invoice tag', () => {
     expect(nov.previousBalance).toBeCloseTo(5384.98, 2);
   });
 
+  it('lists only the payments already made, so the list agrees with the total', async () => {
+    seedSepAndOct();
+    const future = payment('2026-10-09', 5384.98, '2026-10');
+    store.rows.push(future);
+    const listed = async (today?: Date) =>
+      (await calculateCreditCardInvoice(CARD.id, '2026-10', CARD.householdId, { limit: 50 }, { today: today ?? TODAY })).data.invoiceTransactions.map((t: { id: string }) => t.id);
+
+    expect(await listed()).not.toContain(future.id);
+    expect(await listed(day('2026-10-09'))).toContain(future.id);
+  });
+
   it('counts a payment tagged for the same invoice as currentPayments even when dated after its closing', async () => {
     seedSepAndOct();
     store.rows.push(payment('2026-09-02', 4793.57, '2026-09'));
@@ -255,6 +273,46 @@ describe('calculateCreditCardInvoice payments by invoice tag', () => {
   });
 });
 
+describe('a card with no purchases before the invoice window', () => {
+  // Initial debt 300 (no purchases for it), one purchase of 1000 in the Oct window (2026-09-02..2026-10-01) and a
+  // payment of 300 for the Sep invoice made on 2026-10-02: after the window, so a date window never sees it.
+  // The account balance already holds all of it: 300 + 1000 - 300.
+  const seed = () => {
+    accounts.byId = { [CARD.id]: { ...CARD, balance: decimal(1000) }, [SOURCE.id]: SOURCE };
+    store.rows = [purchase('2026-09-15', 1000), payment('2026-10-02', 300, '2026-09')];
+  };
+
+  it('takes the initial debt from the balance less the period purchases: a payment of the previous invoice made after the window leaves nothing owed from before', async () => {
+    seed();
+
+    const oct = await invoice('2026-10');
+
+    // 300 owed, 1000 bought, the 300 paid on 2 Oct: the balance is 1000, all of it this invoice.
+    expect(oct.previousBalance).toBeCloseTo(0, 2);
+    expect(oct.total).toBeCloseTo(1000, 2);
+  });
+
+  it('does not take out again a payment made before the window, which the balance already holds', async () => {
+    // Initial debt 1000, a payment of 400 in July for an old invoice, a purchase of 100 in the window: balance 700.
+    accounts.byId = { [CARD.id]: { ...CARD, balance: decimal(700) }, [SOURCE.id]: SOURCE };
+    store.rows = [purchase('2026-09-15', 100), payment('2026-07-10', 400, '2026-06')];
+
+    const oct = await invoice('2026-10');
+
+    expect(oct.previousBalance).toBeCloseTo(600, 2);
+    expect(oct.total).toBeCloseTo(700, 2);
+  });
+
+  it('does not count a payment still dated in the future, as the rest of the invoice does', async () => {
+    seed();
+
+    const early = await invoice('2026-10', day('2026-10-01'));
+
+    // Not paid yet at that date, and the balance (which already holds it) is not adjusted for it either.
+    expect(early.previousBalance).toBeCloseTo(0, 2);
+  });
+});
+
 describe('payCreditCardInvoice', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -283,6 +341,26 @@ describe('payCreditCardInvoice', () => {
     expect(data.amount.toNumber()).toBeCloseTo(5384.98, 2);
   });
 
+  it('takes the initial debt of a card with no earlier purchases from the balance, a payment of the previous invoice after the window included', async () => {
+    accounts.byId = { [CARD.id]: { ...CARD, balance: decimal(1000) }, [SOURCE.id]: SOURCE };
+    store.rows = [purchase('2026-09-15', 1000), payment('2026-10-02', 300, '2026-09')];
+
+    const result = await payCreditCardInvoice({ householdId: CARD.householdId, accountId: CARD.id, sourceAccountId: SOURCE.id, month: '2026-10' } as never);
+
+    expect(result.previousBalance).toBeCloseTo(0, 2);
+    expect(result.invoiceTotal).toBeCloseTo(1000, 2);
+  });
+
+  it('does not take out again a payment made before the window when it works out the initial debt', async () => {
+    accounts.byId = { [CARD.id]: { ...CARD, balance: decimal(700) }, [SOURCE.id]: SOURCE };
+    store.rows = [purchase('2026-09-15', 100), payment('2026-07-10', 400, '2026-06')];
+
+    const result = await payCreditCardInvoice({ householdId: CARD.householdId, accountId: CARD.id, sourceAccountId: SOURCE.id, month: '2026-10' } as never);
+
+    expect(result.previousBalance).toBeCloseTo(600, 2);
+    expect(result.invoiceTotal).toBeCloseTo(700, 2);
+  });
+
   it('finds a payment made today for the current statement when computing what is still owed', async () => {
     // Paid today (after the 2026-10-01 end of the window) for invoice 2026-10: nothing remains
     store.rows = [purchase('2026-09-15', 1000), payment('2026-10-06', 1000, '2026-10')];
@@ -292,3 +370,84 @@ describe('payCreditCardInvoice', () => {
     ).rejects.toThrow(/greater than zero/);
   });
 });
+
+describe('a card with no purchases before the window: every combination of payments', () => {
+  // Window of the October invoice: 2026-09-02..2026-10-01; today 2026-10-06. The balance is the initial debt plus the
+  // purchase of 1000 in the window less every payment made (also one dated in the future, applied when it was made).
+  // What each payment means for the invoice is decided by its tag, wherever it is dated:
+  //   tag for this invoice  -> counts as paid for it (taken out of the total), if its date has come;
+  //   tag for an earlier one -> reduces what was owed before;
+  //   tag for a later one    -> an advance: it reduces nothing of this invoice (the balance holds it, so it is added back).
+  // A payment dated in the future is not paid yet: it counts for nothing, while the balance already holds it.
+  const DATES = { before: '2026-08-10', inside: '2026-09-20', after: '2026-10-03', future: '2026-10-20' } as const
+  const TAGS = { current: '2026-10', previous: '2026-09', old: '2026-07', later: '2026-11' } as const
+  type When = keyof typeof DATES
+  type Tag = keyof typeof TAGS
+  type Pay = { when: When; tag: Tag; amount: number }
+
+  const singles: Pay[] = []
+  for (const when of Object.keys(DATES) as When[]) for (const tag of Object.keys(TAGS) as Tag[]) singles.push({ when, tag, amount: 150 })
+  const sets: Pay[][] = [[], ...singles.map((p) => [p])]
+  for (let a = 0; a < singles.length; a++) for (let b = a + 1; b < singles.length; b++) sets.push([singles[a]!, { ...singles[b]!, amount: 90 }])
+
+  const expected = (debt: number, pays: Pay[]) => {
+    const made = pays.filter((p) => p.when !== 'future')
+    const sum = (list: Pay[]) => list.reduce((total, p) => total + p.amount, 0)
+    const previousPaid = sum(made.filter((p) => p.tag === 'previous' || p.tag === 'old'))
+    const currentPaid = sum(made.filter((p) => p.tag === 'current'))
+    const futureApplied = sum(pays.filter((p) => p.when === 'future'))
+    const previousBalance = Math.max(0, debt - previousPaid - futureApplied)
+    return { previousBalance, total: previousBalance + 1000 - currentPaid }
+  }
+
+  const arrange = (debt: number, pays: Pay[]) => {
+    store.rows = [purchase('2026-09-15', 1000), ...pays.map((p) => payment(DATES[p.when], p.amount, TAGS[p.tag]))]
+    const balance = debt + 1000 - pays.reduce((total, p) => total + p.amount, 0)
+    accounts.byId = { [CARD.id]: { ...CARD, balance: decimal(balance) }, [SOURCE.id]: SOURCE }
+  }
+  const label = (debt: number, pays: Pay[]) => `debt ${debt}, ${pays.map((p) => `${p.when}/${p.tag}/${p.amount}`).join(' + ') || 'no payments'}`
+
+  it('the invoice shows what the model says, for 2 initial debts and 137 sets of payments', async () => {
+    const wrong: string[] = []
+    for (const debt of [0, 300]) {
+      for (const pays of sets) {
+        arrange(debt, pays)
+        const got = await invoice('2026-10')
+        const want = expected(debt, pays)
+        if (Math.abs(got.previousBalance - want.previousBalance) > 0.005 || Math.abs(got.total - want.total) > 0.005) {
+          wrong.push(`${label(debt, pays)}: got ${got.previousBalance}/${got.total}, want ${want.previousBalance}/${want.total}`)
+        }
+      }
+    }
+    expect(wrong).toEqual([])
+  })
+
+  describe('paying the invoice', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date('2026-10-06T12:00:00Z'))
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('works out the same previous balance and total as the invoice view, for every set', async () => {
+      const wrong: string[] = []
+      for (const debt of [0, 300]) {
+        for (const pays of sets) {
+          arrange(debt, pays)
+          const want = expected(debt, pays)
+          const result = await payCreditCardInvoice({ householdId: CARD.householdId, accountId: CARD.id, sourceAccountId: SOURCE.id, month: '2026-10', amount: 1 } as never).catch(
+            () => ({ previousBalance: NaN, invoiceTotal: NaN }),
+          )
+          // A set that pays the invoice off completely is refused ("greater than zero"): nothing to compare there.
+          if (want.total <= 0.005) continue
+          if (Math.abs(result.previousBalance - want.previousBalance) > 0.005 || Math.abs(result.invoiceTotal - want.total) > 0.005) {
+            wrong.push(`${label(debt, pays)}: got ${result.previousBalance}/${result.invoiceTotal}, want ${want.previousBalance}/${want.total}`)
+          }
+        }
+      }
+      expect(wrong).toEqual([])
+    })
+  })
+})

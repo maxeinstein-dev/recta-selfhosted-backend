@@ -1806,14 +1806,17 @@ export async function loadInvoicePayments(
   const current = invoiceOrdinal(invoice.year, invoice.monthNum);
   const previous: typeof rows = [];
   const currentRows: typeof rows = [];
+  const later: typeof rows = [];
   for (const row of rows) {
     const ordinal = parseInvoicePaymentOrdinal(row.attachmentUrl, accountId);
     if (ordinal === null) continue;
     if (ordinal < current) previous.push(row);
     else if (ordinal === current) currentRows.push(row);
+    else later.push(row);
   }
   const sum = (list: typeof rows) => list.reduce((total, t) => total + t.amount.toNumber(), 0);
-  return { previousTotal: sum(previous), currentTotal: sum(currentRows), currentRows };
+  // laterTotal: payments made ahead for invoices after this one; they never reduce this invoice, but the card balance holds them.
+  return { previousTotal: sum(previous), currentTotal: sum(currentRows), laterTotal: sum(later), currentRows };
 }
 
 /**
@@ -1888,26 +1891,22 @@ export async function calculateCreditCardInvoice(
     // No previous transactions - check if account has initial debt
     // Get current invoice period transactions to see if balance was modified
     const currentPeriodTransactions = await prisma.transaction.findMany({
-      where: {
-        OR: [
-          { accountId, householdId, date: { gte: invoiceStart, lte: invoiceEnd } },
-          { householdId, attachmentUrl: { startsWith: `invoice_pay:${accountId}:` }, date: { gte: invoiceStart, lte: invoiceEnd } },
-        ],
-      },
+      where: { accountId, householdId, date: { gte: invoiceStart, lte: invoiceEnd }, OR: [{ attachmentUrl: null }, { attachmentUrl: { not: { startsWith: `invoice_pay:${accountId}:` } } }] },
     });
-    
-    if (currentPeriodTransactions.length === 0) {
+    // The balance already holds every payment made. Those for this invoice are taken out of the total below and those
+    // for later invoices never reduce it, so both are added back here; payments for earlier invoices are not, because
+    // the branch above does not take them out either (the initial debt is what is left of the balance before them).
+    const paidSoFar = payments.currentTotal + payments.laterTotal;
+
+    if (currentPeriodTransactions.length === 0 && paidSoFar === 0) {
       // No transactions at all - use account balance as initial debt
       previousBalance = Math.max(0, account.balance.toNumber());
     } else {
       // Has transactions in current period but none before
       // Calculate net change in current period
-      let currentPeriodNetChange = 0;
+      let currentPeriodNetChange = -paidSoFar; // Payments decrease debt
       for (const t of currentPeriodTransactions) {
-        if (t.attachmentUrl?.startsWith(`invoice_pay:${accountId}:`)) {
-          // Payment decreases debt
-          currentPeriodNetChange -= t.amount.toNumber();
-        } else if (t.accountId === accountId && t.categoryName) {
+        if (t.accountId === accountId && t.categoryName) {
           // Use transaction type if available, otherwise infer from category
           const isIncome = t.type === TransactionType.INCOME || 
             (t.type !== TransactionType.EXPENSE && getCategoriesByType(CategoryType.INCOME).includes(t.categoryName as any));
@@ -1971,6 +1970,8 @@ export async function calculateCreditCardInvoice(
       {
         householdId,
         attachmentUrl: technicalIdentifier,
+        // Only payments already made, as in the total above: one still dated in the future is not paid yet.
+        date: { lte: options?.today ?? utcToday() },
       },
     ],
   };
@@ -2123,26 +2124,20 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
       // No previous transactions - check if account has initial debt
       // Get current period transactions to see if balance was modified
       const currentPeriodTransactions = await tx.transaction.findMany({
-        where: {
-          OR: [
-            { accountId, householdId: householdId!, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd } },
-            { householdId: householdId!, attachmentUrl: { startsWith: `invoice_pay:${accountId}:` }, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd } },
-          ],
-        },
+        where: { accountId, householdId: householdId!, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd }, OR: [{ attachmentUrl: null }, { attachmentUrl: { not: { startsWith: `invoice_pay:${accountId}:` } } }] },
       });
-      
-      if (currentPeriodTransactions.length === 0) {
+      // The balance already holds every payment made: see calculateCreditCardInvoice for which ones are added back.
+      const paidSoFar = invoicePayments.currentTotal + invoicePayments.laterTotal;
+
+      if (currentPeriodTransactions.length === 0 && paidSoFar === 0) {
         // No transactions at all - use account balance as initial debt
         invoicePreviousBalance = Math.max(0, creditCard.balance.toNumber());
       } else {
         // Has transactions in current period but none before
         // Calculate net change in current period
-        let currentPeriodNetChange = 0;
+        let currentPeriodNetChange = -paidSoFar; // Payments decrease debt
         for (const t of currentPeriodTransactions) {
-          if (t.attachmentUrl?.startsWith(`invoice_pay:${accountId}:`)) {
-            // Payment decreases debt
-            currentPeriodNetChange -= t.amount.toNumber();
-        } else if (t.accountId === accountId && t.categoryName) {
+        if (t.accountId === accountId && t.categoryName) {
           // Use transaction type if available, otherwise infer from category
           const isIncome = t.type === TransactionType.INCOME || 
             (t.type !== TransactionType.EXPENSE && getCategoriesByType(CategoryType.INCOME).includes(t.categoryName as any));
