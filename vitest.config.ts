@@ -10,6 +10,8 @@ import { defineConfig } from 'vitest/config';
 // day-shifting bugs show up on a machine whose own zone happens to be UTC.
 export default defineConfig({
   test: {
+    // Fixes the time zone to one behind UTC, see src/test/global-setup.ts.
+    globalSetup: ['./src/test/global-setup.ts'],
     env: {
       DATABASE_URL:
         process.env.IMPORT_DB_TEST_URL ??

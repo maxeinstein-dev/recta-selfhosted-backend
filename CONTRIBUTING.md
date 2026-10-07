@@ -20,6 +20,9 @@ Requirements: Node.js 20.19 or newer, or 22.12 or newer (the same as the fronten
 `shared/db/prisma.ts`, which exits the process when the variable is missing. If your shell already defines
 `DATABASE_URL` it is respected (`src/shared/config/env.test.ts` covers the validation that makes the dummy necessary); never point the tests at a database that holds real data.
 
+Tests also run in a fixed time zone behind UTC (`America/Sao_Paulo`, set by `src/test/global-setup.ts`, overriding any `TZ`
+in your shell), because bugs where a local-time `Date` is truncated to the UTC day only show behind UTC and CI runs in UTC.
+
 ## Commit attribution
 
 GitHub associates commits with accounts through the author e-mail stored in each commit. Before pushing a
