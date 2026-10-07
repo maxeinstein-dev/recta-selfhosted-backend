@@ -275,7 +275,8 @@ export async function authRoutes(app: FastifyInstance) {
       try {
         household = await getOrCreatePersonalHousehold(user.id, user.email);
       } catch (error) {
-        await discardRegisteredUser(user.id);
+        // Best effort: if the cleanup fails too, the original error is the one worth reporting.
+        await discardRegisteredUser(user.id).catch(() => undefined);
         throw error;
       }
 

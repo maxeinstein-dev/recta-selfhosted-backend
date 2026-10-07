@@ -6,6 +6,7 @@ import { prisma } from '../../shared/db/prisma.js';
 import { env } from '../../shared/config/env.js';
 import {
   ConflictError,
+  TooManyRequestsError,
   InvalidTokenError,
   UnauthorizedError,
   ValidationError,
@@ -30,9 +31,45 @@ const credentialsSchema = z.object({
     .refine((value) => Buffer.byteLength(value, 'utf8') <= PASSWORD_MAX_BYTES, `Password must be at most ${PASSWORD_MAX_BYTES} bytes`),
 });
 
-// Login runs bcrypt even when there is no user or no hash, against this hash of a random password, so that the
-// response time does not tell whether an email is registered.
-const DUMMY_PASSWORD_HASH = bcrypt.hashSync(randomBytes(16).toString('hex'), BCRYPT_COST);
+// Login runs bcrypt even when there is no user or no hash, against a hash of a random password, so that the
+// response time does not tell whether an email is registered. Built on first use, not at import: hashing takes
+// about 300 ms, which a server in Firebase mode (or a test that never logs in) should not pay.
+let dummyPasswordHash: Promise<string> | null = null;
+const getDummyPasswordHash = (): Promise<string> =>
+  (dummyPasswordHash ??= bcrypt.hash(randomBytes(16).toString('hex'), BCRYPT_COST));
+
+// Failed logins per email, in memory (one counter per server process). Together with the per-IP limit on the
+// route it keeps a guesser from trying passwords for one account without end, even when the IP header is
+// spoofed. The price: anyone can lock a known email out for the rest of the window by failing on purpose.
+export const LOGIN_FAILURE_LIMIT = 30;
+export const LOGIN_FAILURE_WINDOW_MS = 60 * 60 * 1000;
+const loginFailures = new Map<string, { count: number; resetAt: number }>();
+
+function assertLoginAllowed(email: string, now = Date.now()): void {
+  const entry = loginFailures.get(email);
+  if (!entry) return;
+  if (entry.resetAt <= now) {
+    loginFailures.delete(email);
+    return;
+  }
+  if (entry.count >= LOGIN_FAILURE_LIMIT) {
+    throw new TooManyRequestsError('Too many failed sign-in attempts for this account, try again later', Math.ceil((entry.resetAt - now) / 1000));
+  }
+}
+
+function recordLoginFailure(email: string, now = Date.now()): void {
+  const entry = loginFailures.get(email);
+  if (!entry || entry.resetAt <= now) {
+    loginFailures.set(email, { count: 1, resetAt: now + LOGIN_FAILURE_WINDOW_MS });
+    return;
+  }
+  entry.count += 1;
+}
+
+/** For tests: forget every failure counter. */
+export function resetLoginFailures(): void {
+  loginFailures.clear();
+}
 
 export interface LocalJwtPayload {
   sub: string;
@@ -79,8 +116,11 @@ export async function register(email: string, password: string) {
     throw new ValidationError('Validation failed', parsed.error.flatten().fieldErrors);
   }
 
-  const existing = await prisma.user.findUnique({
-    where: { email: parsed.data.email },
+  // Case-insensitive: a user created elsewhere (Firebase) may be stored with capitals, and the unique index
+  // would not see `Mixed@x.com` and `mixed@x.com` as the same email.
+  const existing = await prisma.user.findFirst({
+    where: { email: { equals: parsed.data.email, mode: 'insensitive' } },
+    select: { id: true },
   });
   if (existing) {
     throw new ConflictError('Email already registered');
@@ -114,16 +154,21 @@ export async function login(email: string, password: string) {
     throw new UnauthorizedError('Invalid credentials');
   }
 
+  assertLoginAllowed(parsed.data.email);
+
+  // Local accounts are always stored lowercase (register lowercases), so the exact lookup finds them.
   const user = await prisma.user.findUnique({
     where: { email: parsed.data.email },
   });
 
-  // Always one bcrypt comparison, whether or not the user or its hash exists (see DUMMY_PASSWORD_HASH).
-  const matches = await bcrypt.compare(parsed.data.password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
+  // Always one bcrypt comparison, whether or not the user or its hash exists (see getDummyPasswordHash).
+  const matches = await bcrypt.compare(parsed.data.password, user?.passwordHash ?? (await getDummyPasswordHash()));
 
   if (!user?.passwordHash || !matches) {
+    recordLoginFailure(parsed.data.email);
     throw new UnauthorizedError('Invalid credentials');
   }
+  loginFailures.delete(parsed.data.email);
 
   const token = signJwt(user.id, user.email);
   const { passwordHash: _omitted, ...safeUser } = user;

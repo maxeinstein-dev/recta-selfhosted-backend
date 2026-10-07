@@ -1,6 +1,6 @@
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
-import { AppError, ValidationError } from './app-error.js';
+import { AppError, TooManyRequestsError, ValidationError } from './app-error.js';
 import { isProduction } from '../config/env.js';
 
 interface ErrorResponse {
@@ -69,6 +69,10 @@ export function errorHandler(
         ...(!isProduction && { stack: error.stack }),
       },
     };
+    // AppError resets the prototype, so `instanceof TooManyRequestsError` would be false here
+    if (error.statusCode === 429 && 'retryAfterSeconds' in error) {
+      reply.header('Retry-After', String((error as TooManyRequestsError).retryAfterSeconds));
+    }
     reply.status(error.statusCode).send(response);
     return;
   }

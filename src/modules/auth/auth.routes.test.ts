@@ -18,6 +18,7 @@ const config = vi.hoisted(() => {
 });
 const db = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
+  userFindFirst: vi.fn(),
   userCreate: vi.fn(),
   userUpdate: vi.fn(),
   userDelete: vi.fn(),
@@ -29,7 +30,7 @@ const db = vi.hoisted(() => ({
 vi.mock('../../shared/config/env.js', () => config);
 vi.mock('../../shared/db/prisma.js', () => ({
   prisma: {
-    user: { findUnique: db.userFindUnique, create: db.userCreate, update: db.userUpdate, delete: db.userDelete },
+    user: { findUnique: db.userFindUnique, findFirst: db.userFindFirst, create: db.userCreate, update: db.userUpdate, delete: db.userDelete },
     householdMember: { findMany: db.memberFindMany },
     referral: { findUnique: db.referralFindUnique },
   },
@@ -41,7 +42,7 @@ vi.mock('../../shared/config/firebase.js', () => ({
 
 const { authRoutes } = await import('./auth.routes.js');
 const { errorHandler } = await import('../../shared/errors/error-handler.js');
-const { signJwt } = await import('./local.service.js');
+const { resetLoginFailures, signJwt } = await import('./local.service.js');
 
 let app: FastifyInstance;
 beforeAll(async () => {
@@ -58,6 +59,8 @@ const credentials = { email: 'ana@example.com', password: 'correct horse' };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetLoginFailures();
+  db.userFindFirst.mockResolvedValue(null);
   config.state.local = true;
   config.env.AUTH_ALLOW_REGISTRATION = true;
   db.personalHousehold.mockResolvedValue({ id: HOUSEHOLD_ID });
@@ -78,7 +81,7 @@ describe('POST /auth/register', () => {
   });
 
   it('answers 409 with an error object when the email exists', async () => {
-    db.userFindUnique.mockResolvedValue(USER_ROW);
+    db.userFindFirst.mockResolvedValue(USER_ROW);
 
     const res = await app.inject({ method: 'POST', url: '/auth/register', payload: credentials });
 
@@ -93,12 +96,11 @@ describe('POST /auth/register', () => {
     const res = await app.inject({ method: 'POST', url: '/auth/register', payload: { ...credentials, email: ' Ana@Example.COM ' } });
 
     expect(res.statusCode).toBe(201);
-    expect(db.userFindUnique).toHaveBeenCalledWith({ where: { email: 'ana@example.com' } });
+    expect(db.userFindFirst).toHaveBeenCalledWith({ where: { email: { equals: 'ana@example.com', mode: 'insensitive' } }, select: { id: true } });
     expect(res.json().data.email).toBe('ana@example.com');
   });
 
   it('answers 409 when a concurrent request took the email between the lookup and the insert', async () => {
-    db.userFindUnique.mockResolvedValue(null);
     db.userCreate.mockRejectedValue(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
 
     const res = await app.inject({ method: 'POST', url: '/auth/register', payload: credentials });
@@ -115,6 +117,17 @@ describe('POST /auth/register', () => {
 
     expect(res.statusCode).toBe(500);
     expect(db.userDelete).toHaveBeenCalledWith({ where: { id: USER_ROW.id } });
+  });
+
+  it('reports the household failure, not the cleanup failure, when both go wrong', async () => {
+    db.userFindUnique.mockResolvedValue(null);
+    db.userCreate.mockImplementation(async ({ data }) => ({ ...USER_ROW, ...data }));
+    db.personalHousehold.mockRejectedValue(new Error('household failed'));
+    db.userDelete.mockRejectedValue(new Error('delete failed'));
+
+    const res = await app.inject({ method: 'POST', url: '/auth/register', payload: credentials });
+
+    expect(res.json().error.message).toBe('household failed');
   });
 
   it('answers 403 and creates nothing when registration is closed', async () => {
@@ -258,6 +271,33 @@ describe('GET /auth/config', () => {
 });
 
 describe('rate limit on the credential routes', () => {
+  it('keeps counting one email when the client rotates X-Forwarded-For to dodge the per-IP limit', async () => {
+    const limited = Fastify({ trustProxy: true });
+    limited.setErrorHandler(errorHandler);
+    await limited.register(rateLimit, { max: 1000, timeWindow: 60000 });
+    await limited.register(authRoutes, { prefix: '/auth' });
+    db.userFindUnique.mockResolvedValue(null);
+
+    const statuses: number[] = [];
+    let blocked;
+    for (let i = 0; i < 31; i++) {
+      const res = await limited.inject({
+        method: 'POST',
+        url: '/auth/login',
+        headers: { 'x-forwarded-for': `10.0.0.${i + 1}` },
+        payload: credentials,
+      });
+      statuses.push(res.statusCode);
+      blocked = res;
+    }
+    await limited.close();
+
+    expect(statuses.slice(0, 30)).toEqual(Array(30).fill(401));
+    expect(statuses[30]).toBe(429);
+    expect(blocked?.headers['retry-after']).toBeDefined();
+    expect(blocked?.json()).toMatchObject({ success: false, error: { code: 'RATE_LIMITED' } });
+  }, 30000);
+
   it('answers 429 as an error object after 10 attempts from one IP, and only on those routes', async () => {
     const limited = Fastify();
     limited.setErrorHandler(errorHandler);

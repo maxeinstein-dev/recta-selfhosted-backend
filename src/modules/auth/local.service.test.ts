@@ -5,15 +5,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const SECRET = 'x'.repeat(40);
 const UID = '6f1c1f0e-8a49-4c53-9c06-3f0a1d1c2b11';
 const config = vi.hoisted(() => ({ env: { AUTH_JWT_SECRET: undefined as string | undefined, AUTH_TOKEN_TTL_HOURS: 1 } }));
-const db = vi.hoisted(() => ({ findUnique: vi.fn(), create: vi.fn(), delete: vi.fn() }));
+const db = vi.hoisted(() => ({ findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), delete: vi.fn() }));
 
 vi.mock('../../shared/config/env.js', () => config);
-vi.mock('../../shared/db/prisma.js', () => ({ prisma: { user: { findUnique: db.findUnique, create: db.create, delete: db.delete } } }));
+vi.mock('../../shared/db/prisma.js', () => ({ prisma: { user: { findUnique: db.findUnique, findFirst: db.findFirst, create: db.create, delete: db.delete } } }));
 
-const { BCRYPT_COST, discardRegisteredUser, login, register, signJwt, verifyJwt } = await import('./local.service.js');
+const { BCRYPT_COST, LOGIN_FAILURE_LIMIT, discardRegisteredUser, login, register, resetLoginFailures, signJwt, verifyJwt } = await import('./local.service.js');
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetLoginFailures();
+  db.findFirst.mockResolvedValue(null);
   config.env.AUTH_JWT_SECRET = SECRET;
   config.env.AUTH_TOKEN_TTL_HOURS = 1;
 });
@@ -79,7 +81,6 @@ describe('signJwt / verifyJwt', () => {
 
 describe('register', () => {
   it('stores a bcrypt hash, never the password, and returns no hash', async () => {
-    db.findUnique.mockResolvedValue(null);
     db.create.mockImplementation(async ({ data }) => ({ id: UID, createdAt: new Date(), ...data }));
 
     const user = await register('ana@example.com', 'correct horse');
@@ -93,7 +94,7 @@ describe('register', () => {
   });
 
   it('rejects an email that is already registered', async () => {
-    db.findUnique.mockResolvedValue({ id: UID });
+    db.findFirst.mockResolvedValue({ id: UID });
 
     await expect(register('ana@example.com', 'correct horse')).rejects.toMatchObject({ statusCode: 409 });
     expect(db.create).not.toHaveBeenCalled();
@@ -102,7 +103,7 @@ describe('register', () => {
   it('rejects a short password and a malformed email without touching the database', async () => {
     await expect(register('ana@example.com', 'short')).rejects.toMatchObject({ statusCode: 400 });
     await expect(register('not-an-email', 'correct horse')).rejects.toMatchObject({ statusCode: 400 });
-    expect(db.findUnique).not.toHaveBeenCalled();
+    expect(db.findFirst).not.toHaveBeenCalled();
   });
 });
 
@@ -110,15 +111,21 @@ describe('register: email and password rules', () => {
   const created = () => db.create.mock.calls[0][0].data;
 
   beforeEach(() => {
-    db.findUnique.mockResolvedValue(null);
     db.create.mockImplementation(async ({ data }) => ({ id: UID, createdAt: new Date(), ...data }));
   });
 
   it('stores and looks up the email trimmed and lowercased', async () => {
     await register('  Ana@Example.COM ', 'correct horse');
 
-    expect(db.findUnique).toHaveBeenCalledWith({ where: { email: 'ana@example.com' } });
+    expect(db.findFirst).toHaveBeenCalledWith({ where: { email: { equals: 'ana@example.com', mode: 'insensitive' } }, select: { id: true } });
     expect(created().email).toBe('ana@example.com');
+  });
+
+  it('refuses an email that exists with other capitals (a user created through Firebase)', async () => {
+    db.findFirst.mockResolvedValue({ id: UID });
+
+    await expect(register('mixed.case@example.com', 'correct horse')).rejects.toMatchObject({ statusCode: 409 });
+    expect(db.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { email: { equals: 'mixed.case@example.com', mode: 'insensitive' } } }));
   });
 
   it('hashes with bcrypt cost 12', async () => {
@@ -234,5 +241,74 @@ describe('login: email, passwords and timing', () => {
     await expect(login('ana@example.com', 'a'.repeat(72) + 'QQQ')).rejects.toMatchObject({ statusCode: 401 });
     await expect(login('ana@example.com', 'a'.repeat(72) + 'XYZ')).rejects.toMatchObject({ statusCode: 401 });
     await expect(login('ana@example.com', 'a'.repeat(72))).resolves.toBeDefined();
+  });
+});
+
+describe('login: failures per email', () => {
+  const passwordHash = bcrypt.hashSync('correct horse', 4);
+
+  beforeEach(() => db.findUnique.mockResolvedValue({ id: UID, email: 'ana@example.com', passwordHash }));
+
+  const fail = () => login('ana@example.com', 'wrong password').catch((e) => e);
+
+  it('answers 429 with a retry delay after the limit of failed attempts, even with the right password', async () => {
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT; i++) {
+      expect(await fail()).toMatchObject({ statusCode: 401 });
+    }
+
+    const blocked = await login('ana@example.com', 'correct horse').catch((e) => e);
+
+    expect(blocked).toMatchObject({ statusCode: 429, code: 'RATE_LIMITED' });
+    expect(blocked.retryAfterSeconds).toBeGreaterThan(3500);
+  });
+
+  it('counts the lowercased email, so changing the casing does not reset it', async () => {
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT; i++) {
+      await login(i % 2 ? 'ANA@example.com' : ' Ana@Example.com ', 'wrong password').catch(() => undefined);
+    }
+
+    expect(await login('ana@example.com', 'correct horse').catch((e) => e)).toMatchObject({ statusCode: 429 });
+  });
+
+  it('forgets earlier failures after a successful login', async () => {
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT - 1; i++) await fail();
+    await login('ana@example.com', 'correct horse');
+
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT - 1; i++) await fail();
+
+    expect(await login('ana@example.com', 'correct horse')).toBeDefined();
+  });
+
+  it('does not let one email lock another', async () => {
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT; i++) await fail();
+
+    db.findUnique.mockResolvedValue({ id: UID, email: 'bob@example.com', passwordHash });
+    expect(await login('bob@example.com', 'correct horse')).toBeDefined();
+  });
+
+  it('counts unknown emails too, so the limit does not reveal which exist', async () => {
+    db.findUnique.mockResolvedValue(null);
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT; i++) await fail();
+
+    expect(await fail()).toMatchObject({ statusCode: 429 });
+  }, 30000); // 30 comparisons against the real-cost dummy hash
+});
+
+describe('registration cleanup', () => {
+  it('builds the dummy hash on the first login, not at import', async () => {
+    vi.resetModules();
+    const hash = vi.spyOn(bcrypt, 'hash');
+    try {
+      const fresh = await import('./local.service.js');
+      expect(hash).not.toHaveBeenCalled();
+
+      db.findUnique.mockResolvedValue(null);
+      await fresh.login('ana@example.com', 'correct horse').catch(() => undefined);
+      await fresh.login('ana@example.com', 'correct horse').catch(() => undefined);
+
+      expect(hash).toHaveBeenCalledTimes(1);
+    } finally {
+      hash.mockRestore();
+    }
   });
 });

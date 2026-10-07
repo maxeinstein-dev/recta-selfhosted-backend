@@ -82,4 +82,14 @@ describe('auth settings', () => {
       await expect(load({ AUTH_ALLOW_REGISTRATION: 'no' })).rejects.toThrow('exit 1');
     });
   });
+
+  describe('AUTH_TOKEN_TTL_HOURS', () => {
+    it.each(['0', '-5', 'abc', '100000'])('rejects %s', async (hours) => {
+      await expect(load({ AUTH_TOKEN_TTL_HOURS: hours })).rejects.toThrow('exit 1');
+    });
+
+    it('accepts a positive number of hours', async () => {
+      expect((await load({ AUTH_TOKEN_TTL_HOURS: '24' })).env.AUTH_TOKEN_TTL_HOURS).toBe(24);
+    });
+  });
 });

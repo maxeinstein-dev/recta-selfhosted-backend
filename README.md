@@ -83,10 +83,19 @@ Local mode details worth knowing when you host it:
   `ana@example.com` are the same account. Passwords are 8 to 72 bytes (bcrypt ignores the rest).
 - Registration answers 409 for an email that is already taken, so it reveals which emails have an
   account. Login does not: a wrong password and an unknown email answer (and take) the same.
-- `POST /auth/register` and `POST /auth/login` are limited to 10 requests per minute per IP. The server
-  runs with `trustProxy` on, so the IP is the one in `X-Forwarded-For`: **put the app behind a reverse
-  proxy that overwrites that header** (and does not expose the app port directly), otherwise a client can
-  send a different value on every request and skip the limit.
+- `POST /auth/register` and `POST /auth/login` are limited to 10 requests per minute per IP, and a
+  given email can fail to sign in 30 times per hour (per server process, kept in memory); after that
+  login answers 429 with `Retry-After`, even for the right password. The per-email counter is what
+  stops password guessing against one account when the IP is spoofed, and its price is that anyone who
+  knows an email can lock that account out of sign-in for up to an hour by failing on purpose.
+- The server runs with `trustProxy` on, so the IP is the one in `X-Forwarded-For`: **put the app behind
+  a reverse proxy that overwrites that header** (and does not expose the app port directly). Without
+  one, a client can send a different value on every request and skip the per-IP limit, and can also
+  forge somebody else's IP (a shared NAT, say) to use up that address's allowance and block it.
+- Instances that already have users with capital letters in their emails (for example from Firebase):
+  registration and invitations compare emails ignoring case, but sign-in looks up the lowercase email,
+  so lowercase them once: `UPDATE users SET email = lower(email);`. Run it only if no two users differ
+  only by case (the unique index will refuse the update otherwise).
 
 **Firebase – option A (file):**
 
