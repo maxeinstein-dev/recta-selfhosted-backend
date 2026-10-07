@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only superseded pull request runs are cancelled; a push to main always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gates:
@@ -19,8 +20,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # engines.node is ">=20": test the floor and the current LTS.
-        node: [20, 22]
+        # Documented floor (20.19, the same as the frontend, which Vite 7 requires) and the current LTS.
+        node: ['20.19', 22]
     steps:
       - uses: actions/checkout@v4
         with:
