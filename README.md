@@ -135,6 +135,7 @@ so the schema and endpoints stay in sync.
 | `npm run db:generate` | Generate Prisma Client |
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
+| `npm test` | Unit tests (Vitest, no database needed) |
 
 ## Recurring transactions (cron)
 
@@ -161,6 +162,10 @@ src/
 │   └── utils/
 └── jobs/               # Cron (e.g. processRecurrences)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks that must pass before a push, and the pull request rules. User-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
