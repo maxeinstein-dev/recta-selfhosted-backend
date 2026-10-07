@@ -205,6 +205,34 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
       expect(await prisma.transactionExternalRef.count({ where: { householdId } })).toBe(0);
     });
 
+    it('does not offer a row that already stands for another line', async () => {
+      const { account, cardId, householdId } = await setup();
+      const hand = await typed(householdId, cardId, 60, '2025-11-10');
+      const file = ofx(MARKET, trn('20251111', '-60.00', 'fit-other', 'Other shop'));
+      const p = await preview(account, file);
+      const market = p.lines.find((l) => l.memo === 'Corner market')!;
+      expect(market.possibleDuplicate?.transactionId).toBe(hand.id);
+      await confirm(account, requestFrom(p, { selectedRefs: [], links: [{ ref: market.ref, transactionId: hand.id }] }));
+
+      const after = await preview(account, file);
+
+      expect(after.lines.map((l) => [l.status, l.possibleDuplicate])).toEqual([['reconciled', null], ['new', null]]);
+    });
+
+    it('refuses a link to a row that fits the line but is not the one offered', async () => {
+      const { account, cardId, householdId } = await setup();
+      const offered = await typed(householdId, cardId, 60, '2025-11-10');
+      const fits = await typed(householdId, cardId, 60, '2025-11-12');
+      const p = await preview(account, FILE);
+      const market = p.lines.find((l) => l.memo === 'Corner market')!;
+      expect(market.possibleDuplicate?.transactionId).toBe(offered.id);
+
+      const result = await confirm(account, requestFrom(p, { selectedRefs: [], links: [{ ref: market.ref, transactionId: fits.id }] }));
+
+      expect(result).toMatchObject({ linked: 0, skipped: [{ ref: market.ref, cause: 'link-refused' }] });
+      expect(await prisma.transactionExternalRef.count({ where: { householdId } })).toBe(0);
+    });
+
     it('rejects a line both created and linked, and one transaction linked to two lines', async () => {
       const { account, cardId, householdId } = await setup();
       const hand = await typed(householdId, cardId, 60, '2025-11-12');
@@ -218,12 +246,13 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
     });
 
     it('offers a hand-typed row to one line only, the closest by date, and ignores what does not fit', async () => {
-      const twin = trn('20251110', '-15.00', 'fit-twin', 'Garage');
+      const first = trn('20251110', '-15.00', 'fit-park-1', 'Garage');
+      const second = trn('20251120', '-15.00', 'fit-park-2', 'Garage');
       const { account, cardId, householdId } = await setup();
       const other = await newHousehold();
       const otherCard = await newCard(other);
       const near = await typed(householdId, cardId, 15, '2025-11-11');
-      await typed(householdId, cardId, 15, '2025-11-14'); // 4 days: outside the window
+      await typed(householdId, cardId, 15, '2025-11-14'); // 4 days from the first line, 6 from the second: outside the window
       await typed(householdId, cardId, 16, '2025-11-10'); // other amount
       await typed(householdId, cardId, 15, '2025-11-10', { sourceRef: 'ofx:other:00000001' }); // already an import
       await typed(other, otherCard, 15, '2025-11-10'); // another household
@@ -231,7 +260,7 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
         data: { householdId, accountId: cardId, type: 'INCOME', categoryName: 'OTHER_INCOME', amount: 15, date: new Date('2025-11-10T00:00:00Z') },
       }); // other direction
 
-      const p = await preview(account, ofx(twin, twin));
+      const p = await preview(account, ofx(first, second));
 
       expect(p.lines.map((l) => l.possibleDuplicate?.transactionId ?? null)).toEqual([near.id, null]);
     });
