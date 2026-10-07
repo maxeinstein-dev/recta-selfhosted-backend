@@ -15,10 +15,10 @@ npm run db:generate     # generates the Prisma Client in src/generated
 npm run dev
 ```
 
-Requirements: Node.js 20 or newer and PostgreSQL. Unit tests do **not** need a database:
+Requirements: Node.js 20.19 or newer, or 22.12 or newer (the same as the frontend, which Vite 7 requires; CI tests 20.19 and 22), and PostgreSQL. Unit tests do **not** need a database:
 `vitest.config.ts` injects a dummy `DATABASE_URL`, because importing any service loads
 `shared/db/prisma.ts`, which exits the process when the variable is missing. If your shell already defines
-`DATABASE_URL` it is respected; never point the tests at a database that holds real data.
+`DATABASE_URL` it is respected (`src/shared/config/env.test.ts` covers the validation that makes the dummy necessary); never point the tests at a database that holds real data.
 
 ## Commit attribution
 
@@ -98,7 +98,14 @@ removal and test-only churn are exempt.
 
 Reviewers treat a missing entry as **blocking**; the PR template has a checkbox for it. Write one
 past-tense sentence and place it under the right heading (`### Added`, `### Changed`, `### Fixed`, ...).
-After opening the PR, append its number to the entry, like `([#123])`.
+After opening the PR, append its number to the entry as a reference-style link and define the link at the
+bottom of `CHANGELOG.md`:
+
+```markdown
+- Added the `POST /accounts/:id/adjust-balance` route ([#123]).
+
+[#123]: https://github.com/lucianodiisouza/recta-selfhosted-backend/pull/123
+```
 
 ## Versioning and deprecation policy
 
@@ -112,7 +119,8 @@ This project follows [Semantic Versioning](https://semver.org/):
 
 Put your CHANGELOG entry under the heading that matches its semver impact: a fix filed under `Added` (or
 vice versa) can make the maintainer pick the wrong version. Do not change the `version` field of
-`package.json` in a PR; whoever cuts the release decides the version. If your change is breaking, say so in
+`package.json` in a PR (the root `version` recorded in `package-lock.json` follows it; if npm rewrites it, commit
+that on its own as `chore(deps): sync lockfile root version`); whoever cuts the release decides the version. If your change is breaking, say so in
 the PR description and check "Major" in the template.
 
 Deprecated items go under `### Deprecated` in the CHANGELOG and are removed no sooner than the following

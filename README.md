@@ -12,7 +12,7 @@ This project is maintained by [PrimoDev](https://www.oprimo.dev).
 
 ## Tech stack
 
-- **Node.js** 20+
+- **Node.js** 20.19+ (or 22.12+)
 - **Fastify** – REST API
 - **PostgreSQL** – database
 - **Prisma** – ORM
@@ -37,7 +37,7 @@ You don't need Firebase to run a working instance — `local` auth mode plus Pos
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ (or 22.12+)
 - PostgreSQL 16+
 - Firebase project with Authentication enabled
 
