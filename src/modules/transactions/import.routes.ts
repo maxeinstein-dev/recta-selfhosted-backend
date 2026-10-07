@@ -91,7 +91,7 @@ const confirmImportBodySchema = z.object({
  * Fastify's own 4xx errors (file over the limit, body over 1 MB, too many parts) would otherwise reach the global
  * handler as unknown errors and answer 500.
  */
-function importErrorHandler(error: FastifyError | Error, request: Parameters<typeof errorHandler>[1], reply: Parameters<typeof errorHandler>[2]) {
+export function importErrorHandler(error: FastifyError | Error, request: Parameters<typeof errorHandler>[1], reply: Parameters<typeof errorHandler>[2]) {
   const fastifyError = error as FastifyError;
   const status = fastifyError.statusCode;
   if (typeof fastifyError.code === 'string' && fastifyError.code.startsWith('FST_') && status && status >= 400 && status < 500) {
