@@ -26,6 +26,7 @@ describe.skipIf(!ADMIN_URL)('the people module against a real database', { timeo
   // Loaded after DATABASE_URL points at the scratch database (the prisma client reads it when imported).
   let prisma: any;
   let sharesSvc: any;
+  let settlementsSvc: any;
   let peopleSvc: any;
   let txSvc: any;
   let lock: any;
@@ -47,6 +48,7 @@ describe.skipIf(!ADMIN_URL)('the people module against a real database', { timeo
     ({ prisma } = await import('../../shared/db/prisma.js'));
     lock = await import('../../shared/db/advisory-lock.js');
     sharesSvc = await import('./shares.service.js');
+    settlementsSvc = await import('./settlements.service.js');
     peopleSvc = await import('./people.service.js');
     txSvc = await import('../transactions/transactions.service.js');
     household = await prisma.household.create({ data: { name: 'People test' } });
@@ -255,5 +257,67 @@ describe.skipIf(!ADMIN_URL)('the people module against a real database', { timeo
     release();
     await Promise.all(holders);
     await expect(lock.withAdvisoryLock(17, 'eleventh', async () => 'ok')).resolves.toBe('ok');
+  });
+
+  it('a settlement creates the real transaction and moves the account, links once, and keeps its transaction when deleted', async () => {
+    const eva = await peopleSvc.createPerson({ householdId: household.id, name: 'Eva' });
+    const before = (await prisma.account.findUniqueOrThrow({ where: { id: account.id } })).balance.toNumber();
+    const created = await settlementsSvc.createSettlement(household.id, eva.id, {
+      householdId: household.id, direction: 'RECEIVED', amount: 25, date: '2026-10-07', createTransaction: { accountId: account.id },
+    });
+    expect(created.transactionId).toBeTruthy();
+    const after = (await prisma.account.findUniqueOrThrow({ where: { id: account.id } })).balance.toNumber();
+    expect(Math.round((after - before) * 100)).toBe(2500);
+
+    // the same transaction cannot back two settlements, and a paid settlement cannot link an income
+    const again = { householdId: household.id, direction: 'RECEIVED', amount: 25, date: '2026-10-07', transactionId: created.transactionId };
+    await expect(settlementsSvc.createSettlement(household.id, eva.id, again)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(settlementsSvc.createSettlement(household.id, eva.id, { ...again, direction: 'PAID' })).rejects.toMatchObject({ statusCode: 400 });
+    // the type a settled transaction needs is protected against an update that would change it
+    await expect(
+      sharesSvc.assertUpdateKeepsShares(household.id, created.transactionId, { type: 'INCOME' }, { type: 'EXPENSE' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    await settlementsSvc.deleteSettlement(household.id, created.id);
+    expect(await prisma.transaction.findUnique({ where: { id: created.transactionId } })).not.toBeNull();
+    await expect(settlementsSvc.deleteSettlement(household.id, created.id)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it('linking a transaction to a settlement and changing its type at the same time never leave a received settlement on an expense', async () => {
+    const fay = await peopleSvc.createPerson({ householdId: household.id, name: 'Fay' });
+    let violations = 0;
+    const outcomes = { linked: 0, retyped: 0 };
+
+    for (let round = 0; round < 60; round += 1) {
+      const income = await txSvc.createTransaction({
+        householdId: household.id, accountId: account.id, type: 'INCOME', categoryName: 'OTHER_INCOME', amount: 40,
+        description: `Link race ${round}`, date: new Date(2026, 9, 5), paid: true, isSplit: false,
+      });
+      // Alternate which request starts first, and by how much
+      const linkFirst = round % 2 === 0;
+      const lag = (round % 10) * 4;
+      const link = pause(linkFirst ? 0 : lag).then(() =>
+        settlementsSvc.createSettlement(household.id, fay.id, {
+          householdId: household.id, direction: 'RECEIVED', amount: 40, date: '2026-10-07', transactionId: income.id,
+        }),
+      );
+      const retype = pause(linkFirst ? lag : 0).then(() =>
+        sharesSvc.updateKeepingShares(household.id, income.id, { type: 'INCOME' }, { type: 'EXPENSE' }, () =>
+          txSvc.updateTransaction(income.id, household.id, { type: 'EXPENSE', categoryName: 'OTHER_EXPENSES' }),
+        ),
+      );
+      await Promise.allSettled([link, retype]);
+
+      const row = await prisma.transaction.findUniqueOrThrow({ where: { id: income.id } });
+      const settlement = await prisma.settlement.findFirst({ where: { transactionId: income.id } });
+      if (settlement && row.type !== 'INCOME') violations += 1;
+      if (settlement) outcomes.linked += 1;
+      else outcomes.retyped += 1;
+    }
+
+    expect(violations).toBe(0);
+    // Both orders happen, so the test did exercise the two sides of the race
+    expect(outcomes.linked, JSON.stringify(outcomes)).toBeGreaterThan(0);
+    expect(outcomes.retyped, JSON.stringify(outcomes)).toBeGreaterThan(0);
   });
 });

@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   fakePrisma,
+  fakeServices,
   resetStore,
   rowsOf,
+  seedAccount,
+  seedCategory,
   seedPerson,
   seedSettlement,
   seedShare,
@@ -11,12 +14,18 @@ import {
 } from './__fixtures__/people-fake-db.js';
 import { updatePersonSchema, type PutSharesInput } from './people.schema.js';
 import { createPerson, deletePerson, getLedger, listBalances, listPeople, updatePerson } from './people.service.js';
+import { createSettlementSchema } from './people.schema.js';
+import { createSettlement, deleteSettlement, listSettlements } from './settlements.service.js';
 import { getTransactionShares, previewTransactionShares, putTransactionShares } from './shares.service.js';
 
 vi.mock('../../shared/db/advisory-lock.js', () => ({ withAdvisoryLock: (_namespace: number, _key: string, work: () => Promise<unknown>) => work() }));
 vi.mock('../../shared/db/prisma.js', async () => ({
   prisma: (await import('./__fixtures__/people-fake-db.js')).fakePrisma,
 }));
+vi.mock('../transactions/transactions.service.js', async () => {
+  const { fakeServices: s } = await import('./__fixtures__/people-fake-db.js');
+  return { createTransaction: s.createTransaction, deleteTransaction: s.deleteTransaction };
+});
 
 // Invented data only: names, amounts and ids below are fictitious.
 
@@ -315,6 +324,188 @@ describe('transaction shares', () => {
     expect(result.shares[0]).toMatchObject({ amount: 100, direction: 'I_OWE_THEM' });
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('settlements', () => {
+  async function setup() {
+    const bia = await createPerson({ householdId: HH, name: 'Bia' });
+    seedAccount({ id: 'acc-1', householdId: HH, balance: 1000 });
+    return { bia };
+  }
+  const base = { householdId: HH, amount: 80, date: '2026-10-05' } as const;
+
+  it('records only the settlement when no transaction is given', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', note: 'pix' });
+
+    expect(settlement).toEqual({ id: expect.any(String), personId: bia.id, direction: 'RECEIVED', amount: 80, date: '2026-10-05', transactionId: null, note: 'pix' });
+    expect(fakeServices.createTransaction).not.toHaveBeenCalled();
+    expect(rowsOf('transaction')).toHaveLength(0);
+  });
+
+  it('creates the income on the account when I receive, and the balance follows', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, {
+      ...base,
+      direction: 'RECEIVED',
+      createTransaction: { accountId: 'acc-1' },
+    });
+
+    expect(fakeServices.createTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ householdId: HH, accountId: 'acc-1', type: 'INCOME', categoryName: 'OTHER_INCOME', amount: 80, paid: true, description: 'Settlement received from Bia' }),
+    );
+    expect(settlement.transactionId).toEqual(expect.any(String));
+    expect(rowsOf('account')[0]!.balance).toBe(1080);
+    expect(rowsOf('transaction')).toHaveLength(1);
+  });
+
+  it('creates the expense on the account when I pay, with a custom description and category', async () => {
+    const { bia } = await setup();
+    seedCategory({ id: 'cat-1', householdId: HH, name: 'Rateios', type: 'EXPENSE' });
+    const settlement = await createSettlement(HH, bia.id, {
+      ...base,
+      direction: 'PAID',
+      createTransaction: { accountId: 'acc-1', description: 'Pix para Bia', categoryName: 'CUSTOM:cat-1' },
+    });
+
+    expect(fakeServices.createTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'EXPENSE', categoryName: 'CUSTOM:cat-1', description: 'Pix para Bia' }),
+    );
+    expect(settlement.transactionId).not.toBeNull();
+    expect(rowsOf('account')[0]!.balance).toBe(920);
+  });
+
+  it('rejects a category that does not fit the direction or does not exist', async () => {
+    const { bia } = await setup();
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1', categoryName: 'FOOD' } }),
+    ).rejects.toEqual(error(400, /not an income category/));
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'PAID', createTransaction: { accountId: 'acc-1', categoryName: 'CUSTOM:nope' } }),
+    ).rejects.toEqual(error(400, /Custom category/));
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('does not touch the balance or leave a settlement when the account is not usable', async () => {
+    const { bia } = await setup();
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-elsewhere' } }),
+    ).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('removes the transaction it created (and its balance effect) when the settlement cannot be saved', async () => {
+    const { bia } = await setup();
+    fakePrisma.settlement.create.mockRejectedValueOnce(new Error('database went away'));
+
+    await expect(
+      createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } }),
+    ).rejects.toThrow('database went away');
+
+    expect(fakeServices.deleteTransaction).toHaveBeenCalledTimes(1);
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(1000);
+  });
+
+  it('links an existing income (RECEIVED) or expense (PAID), once', async () => {
+    const { bia } = await setup();
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 80, description: 'Bia' });
+    const expense = seedTransaction({ householdId: HH, type: 'EXPENSE', amount: 80 });
+
+    const received = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id });
+    expect(received.transactionId).toBe(income.id);
+    const paid = await createSettlement(HH, bia.id, { ...base, direction: 'PAID', transactionId: expense.id });
+    expect(paid.transactionId).toBe(expense.id);
+    expect(fakeServices.createTransaction).not.toHaveBeenCalled();
+
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id })).rejects.toEqual(error(409, /already linked/));
+  });
+
+  it('answers 409 when a concurrent settlement links the same transaction first', async () => {
+    const { bia } = await setup();
+    const income = seedTransaction({ householdId: HH, type: 'INCOME', amount: 80 });
+    fakePrisma.settlement.create.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 'P2002' }));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: income.id })).rejects.toEqual(error(409));
+  });
+
+  it('rejects a linked transaction of the wrong type or of another household', async () => {
+    const { bia } = await setup();
+    const expense = seedTransaction({ householdId: HH, type: 'EXPENSE', amount: 80 });
+    const foreign = seedTransaction({ householdId: OTHER, type: 'INCOME', amount: 80 });
+
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: expense.id })).rejects.toEqual(error(400, /income transaction/));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'PAID', transactionId: seedTransaction({ householdId: HH, type: 'INCOME', amount: 5 }).id })).rejects.toEqual(error(400, /expense transaction/));
+    await expect(createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', transactionId: foreign.id })).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(0);
+  });
+
+  it('rejects a person of another household', async () => {
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    await expect(createSettlement(HH, stranger.id, { ...base, direction: 'RECEIVED' })).rejects.toEqual(error(404));
+    await expect(listSettlements(HH, stranger.id)).rejects.toEqual(error(404));
+  });
+
+  it('rejects an amount with sub-cent precision', async () => {
+    const { bia } = await setup();
+    await expect(createSettlement(HH, bia.id, { ...base, amount: 10.005, direction: 'RECEIVED' })).rejects.toEqual(error(400, /2 decimal/));
+  });
+
+  it('refuses both a linked and a created transaction at the schema level', () => {
+    const parsed = createSettlementSchema.safeParse({
+      householdId: '11111111-1111-4111-8111-111111111111',
+      direction: 'RECEIVED',
+      amount: 10,
+      date: '2026-10-05',
+      transactionId: '22222222-2222-4222-8222-222222222222',
+      createTransaction: { accountId: '33333333-3333-4333-8333-333333333333' },
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('deletes the settlement and keeps the transaction (and the account balance)', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } });
+
+    await deleteSettlement(HH, settlement.id);
+
+    expect(rowsOf('settlement')).toHaveLength(0);
+    expect(rowsOf('transaction')).toHaveLength(1);
+    expect(fakeServices.deleteTransaction).not.toHaveBeenCalled();
+    expect(rowsOf('account')[0]!.balance).toBe(1080);
+    await expect(deleteSettlement(HH, settlement.id)).rejects.toEqual(error(404));
+  });
+
+  it('does not delete a settlement of another household', async () => {
+    const stranger = await createPerson({ householdId: OTHER, name: 'Estranha' });
+    const settlement = await createSettlement(OTHER, stranger.id, { ...base, householdId: OTHER, direction: 'RECEIVED' });
+    await expect(deleteSettlement(HH, settlement.id)).rejects.toEqual(error(404));
+    expect(rowsOf('settlement')).toHaveLength(1);
+  });
+
+  it('unlinks the settlement when its transaction is deleted (the settlement stays)', async () => {
+    const { bia } = await setup();
+    const settlement = await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', createTransaction: { accountId: 'acc-1' } });
+    await fakeServices.deleteTransaction(settlement.transactionId!, HH);
+
+    expect((await listSettlements(HH, bia.id))[0]).toMatchObject({ id: settlement.id, transactionId: null });
+  });
+
+  it('lists the settlements of a person newest first', async () => {
+    const { bia } = await setup();
+    await createSettlement(HH, bia.id, { ...base, direction: 'RECEIVED', date: '2026-09-01', amount: 10 });
+    await createSettlement(HH, bia.id, { ...base, direction: 'PAID', date: '2026-10-01', amount: 20 });
+    expect((await listSettlements(HH, bia.id)).map((s) => s.amount)).toEqual([20, 10]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Balances and ledger
+// ---------------------------------------------------------------------------------------------------------------
 
 describe('balances', () => {
   it('sums shares and settlements per person, in reais', async () => {
@@ -728,4 +919,19 @@ describe('race errors become 404/409, not 500', () => {
     await expect(deletePerson(HH, b.id)).rejects.toEqual(error(404));
   });
 
+
+  it('a settlement for a person deleted meanwhile is a 409 and removes the transaction it created', async () => {
+    const bia = seedPerson({ householdId: HH, name: 'Bia' });
+    seedAccount({ id: 'acc-1', householdId: HH, balance: 100 });
+    const real = fakePrisma.settlement.create.getMockImplementation()!;
+    fakePrisma.settlement.create.mockImplementationOnce(async (args) => {
+      rowsOf('person').splice(0, 1);
+      return real(args);
+    });
+    await expect(
+      createSettlement(HH, bia.id, { householdId: HH, direction: 'RECEIVED', amount: 10, date: '2026-10-05', createTransaction: { accountId: 'acc-1' } }),
+    ).rejects.toEqual(error(409, /removed meanwhile/));
+    expect(rowsOf('transaction')).toHaveLength(0);
+    expect(rowsOf('account')[0]!.balance).toBe(100);
+  });
 });

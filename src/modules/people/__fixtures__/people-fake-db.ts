@@ -20,7 +20,7 @@ interface TableSpec {
 }
 
 const SPECS: Record<string, TableSpec> = {
-  transaction: { unique: [], parents: {}, defaults: () => ({ description: null, notes: null, paid: true }) },
+  transaction: { unique: [], parents: {}, defaults: () => ({ description: null, notes: null, paid: true, accountId: null }) },
   person: { unique: [], parents: {}, defaults: () => ({ userId: null, isActive: true }) },
   personAlias: { unique: [['householdId', 'key']], parents: { personId: 'person' }, defaults: () => ({ isName: false }) },
   transactionShare: {
@@ -29,6 +29,8 @@ const SPECS: Record<string, TableSpec> = {
     defaults: () => ({ source: 'manual', note: null }),
   },
   settlement: { unique: [['transactionId']], parents: { personId: 'person' }, defaults: () => ({ transactionId: null, note: null }) },
+  account: { unique: [], parents: {}, defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING' }) },
+  category: { unique: [], parents: {}, defaults: () => ({}) },
 };
 
 type Store = Record<string, Row[]>;
@@ -44,6 +46,7 @@ resetTables();
 export function resetStore(): void {
   resetTables();
   sequence = 0;
+  fakeServices.reset();
 }
 
 function nextId(prefix: string): string {
@@ -237,16 +240,18 @@ export const fakePrisma = {
   personAlias: table('personAlias'),
   transactionShare: table('transactionShare'),
   settlement: table('settlement'),
-  /** The two row-lock reads the module makes (`SELECT ... FOR UPDATE`); no real locking, tests hook the call. */
+  account: table('account'),
+  category: table('category'),
+  /** The row-lock reads the module makes (`SELECT ... FOR UPDATE`); no real locking, tests hook the call. */
   $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const sql = strings.join('?');
     if (!sql.includes('FOR UPDATE')) throw new Error(`Unexpected raw query: ${sql}`);
     if (sql.includes('FROM transactions')) {
-      const row = store.transaction!.find((t) => t.id === values[0]);
+      const row = store.transaction!.find((t) => t.id === values[0] && t.householdId === values[1]);
       return row ? [{ amount: { toString: () => String(row.amount) }, type: row.type }] : [];
     }
     if (sql.includes('FROM people')) {
-      const row = store.person!.find((t) => t.id === values[0]);
+      const row = store.person!.find((t) => t.id === values[0] && t.householdId === values[1]);
       return row ? [{ id: row.id }] : [];
     }
     throw new Error(`Unexpected raw query: ${sql}`);
@@ -263,6 +268,43 @@ export const fakePrisma = {
   }),
 };
 
+/** Stand-ins for the transactions service the settlements use; they keep the account balance like the real one. */
+export const fakeServices = {
+  createTransaction: vi.fn(async (input: Record<string, unknown>) => {
+    const account = store.account!.find((a) => a.id === input.accountId && a.householdId === input.householdId);
+    if (!account) throw Object.assign(new Error('Account not found'), { statusCode: 404, code: 'NOT_FOUND' });
+    const row = build('transaction', {
+      householdId: input.householdId,
+      accountId: input.accountId,
+      type: input.type,
+      categoryName: input.categoryName,
+      amount: input.amount,
+      description: input.description ?? null,
+      date: input.date,
+      notes: input.notes ?? null,
+      paid: input.paid !== false,
+    });
+    store.transaction!.push(row);
+    const sign = input.type === 'INCOME' ? 1 : -1;
+    account.balance = Math.round(((account.balance as number) + sign * (input.amount as number)) * 100) / 100;
+    return { id: row.id, ...project(row) };
+  }),
+  deleteTransaction: vi.fn(async (id: string, householdId: string) => {
+    const row = store.transaction!.find((t) => t.id === id && t.householdId === householdId);
+    if (!row) throw Object.assign(new Error('Transaction not found'), { statusCode: 404, code: 'NOT_FOUND' });
+    const account = store.account!.find((a) => a.id === row.accountId);
+    if (account && row.paid) {
+      const sign = row.type === 'INCOME' ? -1 : 1;
+      account.balance = Math.round(((account.balance as number) + sign * (row.amount as number)) * 100) / 100;
+    }
+    removeRows('transaction', [row]);
+  }),
+  reset(): void {
+    fakeServices.createTransaction.mockClear();
+    fakeServices.deleteTransaction.mockClear();
+  },
+};
+
 // ---- Seed helpers -----------------------------------------------------------------------------------------------
 
 export interface SeedTransaction {
@@ -274,11 +316,24 @@ export interface SeedTransaction {
   /** YYYY-MM-DD */
   date?: string;
   notes?: string | null;
+  accountId?: string | null;
 }
 
 export function seedTransaction(data: SeedTransaction): Row {
   const row = build('transaction', { type: 'EXPENSE', date: '2026-10-01', ...data });
   store.transaction!.push(row);
+  return row;
+}
+
+export function seedAccount(data: { id?: string; householdId: string; balance?: number; type?: string }): Row {
+  const row = build('account', data);
+  store.account!.push(row);
+  return row;
+}
+
+export function seedCategory(data: { id?: string; householdId: string; name: string; type: 'INCOME' | 'EXPENSE' }): Row {
+  const row = build('category', data);
+  store.category!.push(row);
   return row;
 }
 
