@@ -7,17 +7,24 @@
  * - What is new is decided here, on fresh data, never by the client's `status`: a line whose ref a transaction already
  *   carries (or represents) is skipped, whoever did it and whenever. Every created row carries its ref in
  *   `transactions.source_ref`, which is unique per household, so two parallel confirms cannot both create a line.
- * - A per-card advisory lock serialises confirms, and the rows are not atomic: each is created by the regular
- *   transaction service in its own database transaction. If one fails after others were saved, the answer says where
- *   it stopped and running the same selection again continues, because the saved lines are now known by their refs.
+ * - One confirm per card runs at a time in this process; a second one answers 409 at once instead of waiting. A wait
+ *   would hold a connection of the pool (10 by default) per waiting request, and a handful of parallel confirms would
+ *   starve the whole API. No database connection is held while the work runs. Across processes the unique source ref
+ *   keeps a line from being created twice (a P2002 is read as "already imported").
+ * - The rows are not atomic: each is created by the regular transaction service in its own database transaction. If
+ *   one fails after others were saved, the answer says where it stopped and running the same selection again
+ *   continues, because the saved lines are now known by their refs.
+ * - The checks of the echoed lines prove that a line is consistent with itself (its ref is what its content derives),
+ *   not that it came from a file: the ref is a public format, not a signature. A caller can do no more than an editor
+ *   creating the transaction by hand.
  * - A selected line that still looks like a hand-typed transaction is not created unless the client says so, and can be
  *   linked to that transaction instead (the line is recorded as represented by it, nothing is created).
  */
 import { prisma } from '../../shared/db/prisma.js';
-import { BadRequestError } from '../../shared/errors/app-error.js';
+import { BadRequestError, ConflictError } from '../../shared/errors/app-error.js';
 import { CategoryName, CategoryType, TransactionType, getCategoriesByType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
-import { findPossibleDuplicates } from './card-ofx-duplicates.js';
+import { DUPLICATE_WINDOW_DAYS, findPossibleDuplicates } from './card-ofx-duplicates.js';
 import { loadKnownRefs, type ResolvedCardAccount } from './card-ofx-import.service.js';
 import type { CardOfxConfirmLine, CardOfxConfirmRequest, CardOfxConfirmResponse } from './card-ofx-import.types.js';
 import {
@@ -35,6 +42,7 @@ import { buildUtcDate } from './parsers/statement.common.js';
 import { createTransaction } from './transactions.service.js';
 
 const toCents = (amount: number) => Math.round(amount * 100);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const isUniqueViolation = (error: unknown) => (error as { code?: unknown } | null)?.code === 'P2002';
 
@@ -48,6 +56,8 @@ export function validateConfirmLines(lines: CardOfxConfirmLine[]): void {
     const fail = (why: string): never => {
       throw new BadRequestError(`Line ${index + 1} of the invoice does not match its content: ${why}.`);
     };
+    // Postgres text cannot hold a NUL: it would fail the write (500) in the middle of an import.
+    if ([line.ref, line.fitid, line.memo, line.merchant].some((text) => text.includes('\u0000'))) fail('text');
     const cents = toCents(line.amount);
     if (!(line.amount > 0) || line.amount > MAX_CARD_OFX_AMOUNT || Math.abs(line.amount * 100 - cents) > 1e-6) fail('amount');
     const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(line.date);
@@ -79,6 +89,9 @@ async function resolveCategories(
   const customIds = new Set<string>();
   for (const entry of entries) {
     const customId = isCustomCategoryName(entry.categoryName) ? toCustomCategoryId(entry.categoryName) : null;
+    if (isCustomCategoryName(entry.categoryName) && !(customId && UUID.test(customId))) {
+      throw new BadRequestError('A custom category must be CUSTOM:<id> with the id of a category of this household.');
+    }
     if (customId) {
       customIds.add(customId);
     } else {
@@ -105,8 +118,8 @@ async function resolveCategories(
 
 class LinkRefused extends Error {}
 
-/** Record `ref` as represented by `transactionId`, rechecking under a row lock that the transaction still fits. */
-async function linkLine(
+/** Record `ref` as represented by `transactionId`, rechecking under a row lock that the transaction still fits (direction, amount and date). */
+export async function linkLine(
   account: ResolvedCardAccount,
   line: CardOfxStatementLine,
   transactionId: string,
@@ -119,9 +132,16 @@ async function linkLine(
       await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
       const row = await tx.transaction.findFirst({
         where: { id: transactionId, householdId: account.householdId, accountId: account.id, sourceRef: null },
-        select: { type: true, amount: true, externalRefs: { select: { id: true }, take: 1 } },
+        select: { type: true, amount: true, date: true, externalRefs: { select: { id: true }, take: 1 } },
       });
-      if (!row || row.externalRefs.length > 0 || row.type !== line.type || toCents(row.amount.toNumber()) !== toCents(line.amount)) {
+      const gapDays = row ? Math.abs(row.date.getTime() - Date.parse(`${line.date}T00:00:00.000Z`)) / (24 * 60 * 60 * 1000) : Infinity;
+      if (
+        !row ||
+        row.externalRefs.length > 0 ||
+        row.type !== line.type ||
+        toCents(row.amount.toNumber()) !== toCents(line.amount) ||
+        gapDays > DUPLICATE_WINDOW_DAYS
+      ) {
         throw new LinkRefused();
       }
       await tx.transactionExternalRef.create({ data: { householdId: account.householdId, transactionId, ref: line.ref } });
@@ -141,7 +161,29 @@ export interface ConfirmCardOfxParams {
   userId?: string;
 }
 
-export async function confirmCardOfxImport({ account, request, userId }: ConfirmCardOfxParams): Promise<CardOfxConfirmResponse> {
+/** Cards with a confirm running in this process. */
+const running = new Set<string>();
+
+/**
+ * Confirm an invoice. A second confirm for a card that already has one running answers 409 at once.
+ * @throws ConflictError (409) when an import of this card is running.
+ */
+export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promise<CardOfxConfirmResponse> {
+  // The request is validated first, so a bad request is a 400 whether or not an import is running.
+  validateConfirmLines(params.request.lines);
+  if (running.has(params.account.id)) {
+    throw new ConflictError('An import of this card invoice is already running; wait for it to finish and try again.');
+  }
+  running.add(params.account.id);
+  try {
+    return await runConfirm(params);
+  } finally {
+    running.delete(params.account.id);
+  }
+}
+
+/** The confirm without the one-at-a-time guard; exported for the tests of what keeps a line from being created twice. */
+export async function runConfirm({ account, request, userId }: ConfirmCardOfxParams): Promise<CardOfxConfirmResponse> {
   validateConfirmLines(request.lines);
   const byRef = new Map(request.lines.map((l) => [l.ref, l]));
 
@@ -168,81 +210,73 @@ export async function confirmCardOfxImport({ account, request, userId }: Confirm
   const despite = new Set(request.createDespiteDuplicate);
   const categories = await resolveCategories(account.householdId, request.categoryMap);
 
-  return prisma.$transaction(
-    async (lock) => {
-      await lock.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`card-ofx:${account.id}`}))`;
+  const acted = request.lines.filter((l) => selected.has(l.ref) || linkRefs.has(l.ref));
+  const known = await loadKnownRefs(account.householdId, acted.map((l) => l.ref));
+  const stillNew = request.lines.filter((l) => l.kind !== 'payment' && !known.has(l.ref));
+  const duplicates = await findPossibleDuplicates(account, stillNew);
 
-      const acted = request.lines.filter((l) => selected.has(l.ref) || linkRefs.has(l.ref));
-      const known = await loadKnownRefs(account.householdId, acted.map((l) => l.ref));
-      const stillNew = request.lines.filter((l) => l.kind !== 'payment' && !known.has(l.ref));
-      const duplicates = await findPossibleDuplicates(account, stillNew);
+  const skipped: CardOfxConfirmResponse['skipped'] = [];
+  const ids: string[] = [];
+  let linked = 0;
 
-      const skipped: CardOfxConfirmResponse['skipped'] = [];
-      const ids: string[] = [];
-      let linked = 0;
+  for (const { ref, transactionId } of request.links) {
+    if (known.has(ref)) {
+      skipped.push({ ref, cause: 'already-imported' });
+      continue;
+    }
+    const result = await linkLine(account, byRef.get(ref)!, transactionId, duplicates.get(ref)?.transactionId);
+    if (result === 'linked') linked += 1;
+    else skipped.push({ ref, cause: result });
+  }
 
-      for (const { ref, transactionId } of request.links) {
-        if (known.has(ref)) {
-          skipped.push({ ref, cause: 'already-imported' });
-          continue;
-        }
-        const result = await linkLine(account, byRef.get(ref)!, transactionId, duplicates.get(ref)?.transactionId);
-        if (result === 'linked') linked += 1;
-        else skipped.push({ ref, cause: result });
+  for (const line of request.lines) {
+    if (!selected.has(line.ref)) continue;
+    if (known.has(line.ref)) {
+      skipped.push({ ref: line.ref, cause: 'already-imported' });
+      continue;
+    }
+    if (duplicates.has(line.ref) && !despite.has(line.ref)) {
+      skipped.push({ ref: line.ref, cause: 'possible-duplicate' });
+      continue;
+    }
+    try {
+      const created = await createTransaction(
+        {
+          householdId: account.householdId,
+          accountId: account.id,
+          type: line.type === 'INCOME' ? TransactionType.INCOME : TransactionType.EXPENSE,
+          categoryName: categories.get(`${line.type}|${line.merchant}`) ?? (line.type === 'INCOME' ? CategoryName.OTHER_INCOME : CategoryName.OTHER_EXPENSES),
+          amount: line.amount,
+          description: line.memo,
+          date: new Date(`${line.date}T00:00:00.000Z`),
+          paid: true,
+          isSplit: false,
+          sourceRef: line.ref,
+          ...(line.installment && {
+            installmentId: `ofx:${fitidToken(line.fitid)}`,
+            installmentNumber: line.installment.number,
+            totalInstallments: line.installment.total,
+          }),
+        },
+        userId,
+      );
+      ids.push(created.id);
+    } catch (error) {
+      // The ref is unique per household: another confirm created this line between the check and the write.
+      if (isUniqueViolation(error)) {
+        skipped.push({ ref: line.ref, cause: 'already-imported' });
+        continue;
       }
+      if (ids.length === 0 && linked === 0) throw error;
+      return {
+        created: ids.length,
+        linked,
+        skipped,
+        ids,
+        stoppedAt: { ref: line.ref, message: error instanceof Error ? error.message : 'Unknown error' },
+      };
+    }
+  }
 
-      for (const line of request.lines) {
-        if (!selected.has(line.ref)) continue;
-        if (known.has(line.ref)) {
-          skipped.push({ ref: line.ref, cause: 'already-imported' });
-          continue;
-        }
-        if (duplicates.has(line.ref) && !despite.has(line.ref)) {
-          skipped.push({ ref: line.ref, cause: 'possible-duplicate' });
-          continue;
-        }
-        try {
-          const created = await createTransaction(
-            {
-              householdId: account.householdId,
-              accountId: account.id,
-              type: line.type === 'INCOME' ? TransactionType.INCOME : TransactionType.EXPENSE,
-              categoryName: categories.get(`${line.type}|${line.merchant}`) ?? (line.type === 'INCOME' ? CategoryName.OTHER_INCOME : CategoryName.OTHER_EXPENSES),
-              amount: line.amount,
-              description: line.memo,
-              date: new Date(`${line.date}T00:00:00.000Z`),
-              paid: true,
-              isSplit: false,
-              sourceRef: line.ref,
-              ...(line.installment && {
-                installmentId: `ofx:${fitidToken(line.fitid)}`,
-                installmentNumber: line.installment.number,
-                totalInstallments: line.installment.total,
-              }),
-            },
-            userId,
-          );
-          ids.push(created.id);
-        } catch (error) {
-          // The ref is unique per household: another confirm created this line between the check and the write.
-          if (isUniqueViolation(error)) {
-            skipped.push({ ref: line.ref, cause: 'already-imported' });
-            continue;
-          }
-          if (ids.length === 0 && linked === 0) throw error;
-          return {
-            created: ids.length,
-            linked,
-            skipped,
-            ids,
-            stoppedAt: { ref: line.ref, message: error instanceof Error ? error.message : 'Unknown error' },
-          };
-        }
-      }
-
-      return { created: ids.length, linked, skipped, ids };
-    },
-    // The loop can run for minutes on a big invoice; the default 5 s would abort it midway.
-    { timeout: 10 * 60 * 1000, maxWait: 30 * 1000 },
-  );
+  return { created: ids.length, linked, skipped, ids };
 }

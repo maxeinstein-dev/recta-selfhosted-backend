@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { prisma } from '../../shared/db/prisma.js';
-import { confirmCardOfxImport } from './card-ofx-confirm.service.js';
+import { confirmCardOfxImport, linkLine, runConfirm } from './card-ofx-confirm.service.js';
 import { buildCardOfxPreview, resolveCardAccount } from './card-ofx-import.service.js';
 import type { CardOfxConfirmRequest, CardOfxPreviewResponse } from './card-ofx-import.types.js';
 
@@ -96,14 +96,54 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
     expect((await preview(account, FILE)).lines.map((l) => l.status)).toEqual(['reconciled', 'reconciled', 'reconciled', 'payment']);
   });
 
-  it('creates each line once when the same confirm runs three times in parallel', async () => {
-    const { account, cardId } = await setup();
-    const request = requestFrom(await preview(account, FILE));
+  describe('confirms in parallel', () => {
+    // The pg pool holds 10 connections: a confirm that waited for another would hold one each and starve the API.
+    const outcome = (promise: Promise<unknown>) => promise.then((value) => ({ ok: true as const, value }), (error: { statusCode?: number }) => ({ ok: false as const, status: error.statusCode }));
 
-    const results = await Promise.all([confirm(account, request), confirm(account, request), confirm(account, request)]);
+    it('answers 409 at once to a second confirm of the same card, and 15 at the same time neither hang nor create twice', async () => {
+      const { account, cardId } = await setup();
+      const request = requestFrom(await preview(account, FILE));
+      const started = Date.now();
 
-    expect(results.reduce((total, r) => total + r.created, 0)).toBe(3);
-    expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+      const results = await Promise.all(Array.from({ length: 15 }, () => outcome(confirm(account, request))));
+
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(results.filter((r) => r.ok)).toHaveLength(1);
+      expect(results.filter((r) => !r.ok).map((r) => (r.ok ? 0 : r.status))).toEqual(Array(14).fill(409));
+      expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+    });
+
+    it('lets confirms of different cards run together, more of them than the pool has connections', async () => {
+      const cards = await Promise.all(Array.from({ length: 15 }, () => setup()));
+      const requests = await Promise.all(cards.map(async ({ account }) => requestFrom(await preview(account, FILE))));
+      const started = Date.now();
+
+      const results = await Promise.all(cards.map(({ account }, i) => outcome(confirm(account, requests[i]!))));
+
+      expect(Date.now() - started).toBeLessThan(30_000);
+      expect(results.every((r) => r.ok)).toBe(true);
+      for (const { cardId } of cards) expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+    });
+
+    it('frees the card when an import ends, also when it fails', async () => {
+      const { account } = await setup();
+      const p = await preview(account, FILE);
+      const bad = requestFrom(p, { categoryMap: [{ merchant: 'x', type: 'EXPENSE', categoryName: 'SALARY' }] });
+
+      await expect(confirm(account, bad)).rejects.toMatchObject({ statusCode: 400 });
+      expect(await confirm(account, requestFrom(p))).toMatchObject({ created: 3 });
+      expect(await confirm(account, requestFrom(p))).toMatchObject({ created: 0 });
+    });
+
+    it('creates each line once even when the one-at-a-time guard does not hold (another process): the unique ref decides', async () => {
+      const { account, cardId } = await setup();
+      const request = requestFrom(await preview(account, FILE));
+
+      const results = await Promise.all([1, 2, 3, 4].map(() => runConfirm({ account, request })));
+
+      expect(results.reduce((total, r) => total + r.created, 0)).toBe(3);
+      expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(3);
+    });
   });
 
   it('keeps identical lines of one file apart, each with its own ref', async () => {
@@ -130,6 +170,16 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
     ).rejects.toMatchObject({ statusCode: 400 });
     await expect(
       confirm(account, requestFrom(p, { categoryMap: [{ merchant: 'Corner market', type: 'EXPENSE', categoryName: 'CUSTOM:00000000-0000-4000-8000-000000000000' }] })),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    // A malformed custom id is a 400, not a database error.
+    for (const categoryName of ['CUSTOM:abc', 'CUSTOM:', 'CUSTOM:00000000-0000-4000-8000-00000000000g']) {
+      await expect(
+        confirm(account, requestFrom(p, { categoryMap: [{ merchant: 'Corner market', type: 'EXPENSE', categoryName }] })),
+      ).rejects.toMatchObject({ statusCode: 400 });
+    }
+    // A NUL cannot be stored in text: refused before anything is written.
+    await expect(
+      confirm(account, requestFrom(p, { lines: requestFrom(p).lines.map((l, i) => (i === 0 ? { ...l, memo: `${l.memo}\u0000` } : l)) })),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(await prisma.transaction.count({ where: { accountId: cardId } })).toBe(0);
   });
@@ -203,6 +253,23 @@ describe.skipIf(!enabled)('card invoice confirm on Postgres', { timeout: 60_000 
       await prisma.transaction.update({ where: { id: hand.id }, data: { amount: 61 } });
       expect((await link(hand.id)).skipped).toEqual([{ ref: market.ref, cause: 'link-refused' }]);
       expect(await prisma.transactionExternalRef.count({ where: { householdId } })).toBe(0);
+    });
+
+    it('rechecks under the row lock that the row still fits the line (direction, amount and date), whatever was offered', async () => {
+      const { account, cardId, householdId } = await setup();
+      const p = await preview(account, FILE);
+      const market = p.lines.find((l) => l.memo === 'Corner market')!;
+      const statementLine = { ...requestFrom(p).lines.find((l) => l.ref === market.ref)! };
+      const fits = await typed(householdId, cardId, 60, '2025-11-12');
+      const wrongDate = await typed(householdId, cardId, 60, '2025-11-20');
+      const wrongAmount = await typed(householdId, cardId, 61, '2025-11-12');
+      const income = await typed(householdId, cardId, 60, '2025-11-12', { type: 'INCOME', categoryName: 'OTHER_INCOME' });
+
+      for (const row of [wrongDate, wrongAmount, income]) {
+        expect(await linkLine(account, statementLine, row.id, row.id)).toBe('link-refused');
+      }
+      expect(await prisma.transactionExternalRef.count({ where: { householdId } })).toBe(0);
+      expect(await linkLine(account, statementLine, fits.id, fits.id)).toBe('linked');
     });
 
     it('does not offer a row that already stands for another line', async () => {

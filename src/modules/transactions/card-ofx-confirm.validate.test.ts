@@ -4,7 +4,7 @@ vi.mock('../../shared/db/prisma.js', () => ({ prisma: {} }));
 vi.mock('./transactions.service.js', () => ({ createTransaction: vi.fn() }));
 
 const { validateConfirmLines } = await import('./card-ofx-confirm.service.js');
-const { parseCardOfx } = await import('./parsers/ofx-card.parser.js');
+const { cardOfxRef, parseCardOfx } = await import('./parsers/ofx-card.parser.js');
 
 // Invented data only.
 const trn = (date: string, amount: string, fitid: string, memo: string) =>
@@ -78,6 +78,17 @@ describe('validateConfirmLines', () => {
       const lines = parsed();
       change(lines);
       expect(() => validateConfirmLines(lines)).toThrow(expect.objectContaining({ statusCode: 400 }));
+    }
+  });
+
+  it('refuses a NUL in the text of a line even when its ref is consistent with it', () => {
+    for (const field of ['memo', 'fitid'] as const) {
+      const lines = parsed();
+      const line = lines[0]!;
+      line[field] = `${line[field]}\u0000`;
+      if (field === 'memo') line.merchant = line.memo;
+      line.ref = cardOfxRef(line.fitid, line.memo, -line.amount, line.date);
+      expect(() => validateConfirmLines(lines), field).toThrow(expect.objectContaining({ statusCode: 400, message: expect.stringContaining('text') }));
     }
   });
 });

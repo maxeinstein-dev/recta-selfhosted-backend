@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { BadRequestError, ForbiddenError } from '../../shared/errors/app-error.js';
+import { BadRequestError, ConflictError, ForbiddenError } from '../../shared/errors/app-error.js';
 import { errorHandler } from '../../shared/errors/error-handler.js';
 import { requireEditor } from '../../shared/middleware/authorization.middleware.js';
 import { buildCardOfxPreview, resolveCardAccount } from './card-ofx-import.service.js';
@@ -231,6 +231,15 @@ describe('POST /transactions/import/card-ofx/confirm', () => {
 
     expect(res.statusCode).toBe(403);
     expect(mockedConfirm).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 when an import of the card is already running', async () => {
+    mockedConfirm.mockRejectedValue(new ConflictError('An import of this card invoice is already running'));
+
+    const res = await confirm(confirmBody());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ success: false, error: { code: 'CONFLICT' } });
   });
 
   it('answers 400 when the account is not a credit card', async () => {
