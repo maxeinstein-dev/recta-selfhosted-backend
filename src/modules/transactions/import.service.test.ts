@@ -81,19 +81,11 @@ describe('parseImportBuffer (pure, no DB)', () => {
 });
 
 describe('dedup pure helpers (DB-free)', () => {
-  it('getDayRange covers exactly the calendar day of the row', () => {
-    const { start, end } = getDayRange(new Date(2024, 0, 15, 14, 30, 0));
+  it('getDayRange is the single UTC day the row is stored on, not a span reaching into the next day', () => {
+    const { start, end } = getDayRange(new Date(Date.UTC(2024, 0, 15, 17, 30, 0)));
 
-    expect(start.getFullYear()).toBe(2024);
-    expect(start.getMonth()).toBe(0);
-    expect(start.getDate()).toBe(15);
-    expect(start.getHours()).toBe(0);
-    expect(end.getHours()).toBe(23);
-    expect(end.getMinutes()).toBe(59);
-    // Same instant belongs to the range
-    const instant = new Date(2024, 0, 15, 14, 30, 0).getTime();
-    expect(start.getTime()).toBeLessThanOrEqual(instant);
-    expect(end.getTime()).toBeGreaterThanOrEqual(instant);
+    expect(start.toISOString()).toBe('2024-01-15T00:00:00.000Z');
+    expect(end.toISOString()).toBe('2024-01-15T00:00:00.000Z');
   });
 
   it('amountsEqual tolerates float noise but not real cent differences', () => {

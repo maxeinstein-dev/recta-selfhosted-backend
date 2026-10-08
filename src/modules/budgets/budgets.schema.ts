@@ -37,7 +37,8 @@ export type CreateBudgetInput = z.infer<typeof createBudgetSchema>;
  */
 export const updateBudgetSchema = z.object({
   monthlyLimit: z.coerce.number().positive('Monthly limit must be positive').optional(),
-  month: z.coerce.date().optional(),
+  // Same parsing as on create: 'YYYY-MM-DD' is a local day (z.coerce.date read it as UTC midnight, the evening before)
+  month: localDateSchema.optional(),
   type: categoryTypeEnum.optional(),
 });
 

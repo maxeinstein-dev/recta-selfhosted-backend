@@ -382,9 +382,8 @@ async function loadCardContext(
     .sort((a, b) => compareText(a.date, b.date) || compareText(a.sourceRef ?? '', b.sourceRef ?? ''));
 
   const days = lines.map((l) => l.date).sort();
-  const legacyStart = parseLocalDateString(days[0]!);
-  const legacyEnd = parseLocalDateString(days[days.length - 1]!);
-  legacyEnd.setHours(23, 59, 59, 999);
+  const legacyStart = utcDay(days[0]!);
+  const legacyEnd = utcDay(days[days.length - 1]!);
   const legacy = storedRows(
     await prisma.transaction.findMany({
       where: { householdId, accountId: card.id, sourceRef: null, date: { gte: legacyStart, lte: legacyEnd } },
@@ -445,8 +444,7 @@ async function loadCardContext(
   // Only inside the statement's own period (boundary days included): the lines of one plan (purchase, discount, refund)
   // share a FITID across statements, so the same FITID elsewhere in time is not the same line.
   if (tokens.length > 0 && period) {
-    const periodRange = { gte: parseLocalDateString(period.start), lte: parseLocalDateString(period.end) };
-    periodRange.lte.setHours(23, 59, 59, 999);
+    const periodRange = { gte: utcDay(period.start), lte: utcDay(period.end) };
     const sameFitid = await prisma.transactionExternalRef.findMany({
       where: { householdId, OR: tokens.map((t) => ({ ref: { startsWith: `ofx:${t}:` } })) },
       select: { ref: true, transactionId: true },
@@ -454,13 +452,13 @@ async function loadCardContext(
     vanished.push(...groupRefs(sameFitid, await rowsByIds(Array.from(new Set(sameFitid.map((r) => r.transactionId))), periodRange)));
   }
   // What the warning lists: rows strictly inside the statement's period (the boundary days belong to two statements).
+  // Both bounds are UTC days, the ones a @db.Date column holds: a local 23:59:59.999 end reached one day further.
   const gone: CardContext['vanished'] = [];
   if (period) {
-    const first = parseLocalDateString(period.start);
-    first.setDate(first.getDate() + 1);
-    const last = parseLocalDateString(period.end);
-    last.setDate(last.getDate() - 2);
-    last.setHours(23, 59, 59, 999);
+    const first = utcDay(period.start);
+    first.setUTCDate(first.getUTCDate() + 1);
+    const last = utcDay(period.end);
+    last.setUTCDate(last.getUTCDate() - 2);
     const inside = await prisma.transaction.findMany({
       where: { householdId, accountId: card.id, attachmentUrl: null, date: { gte: first, lte: last } },
       select: CARD_ROW_SELECT,
@@ -1483,8 +1481,7 @@ async function createFutureInstallments(ctx: CreateContext, proposal: ReconcileP
 
 /** Card purchases marked paid around the previous invoice, before its payment is undone (see applyPayment). */
 async function paidPurchasesUpTo(householdId: string, cardId: string, invoiceMonth: MaxFinMonth, until: Date): Promise<string[]> {
-  const end = parseLocalDateString(storedDateString(until));
-  end.setHours(23, 59, 59, 999);
+  const end = utcDay(storedDateString(until));
   const rows = await prisma.transaction.findMany({
     where: {
       householdId,

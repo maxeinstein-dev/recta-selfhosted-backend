@@ -24,42 +24,6 @@ export function createDate(year: number, month: number, day: number, hours = 0, 
 }
 
 /**
- * Get start of day in UTC-3
- */
-export function startOfDay(date: Date): Date {
-  const year = date.getFullYear();
-  const month = date.getMonth() + 1;
-  const day = date.getDate();
-  return createDate(year, month, day, 0, 0, 0, 0);
-}
-
-/**
- * Get end of day in UTC-3
- */
-export function endOfDay(date: Date): Date {
-  const year = date.getFullYear();
-  const month = date.getMonth() + 1;
-  const day = date.getDate();
-  return createDate(year, month, day, 23, 59, 59, 999);
-}
-
-/**
- * Get start of month in UTC-3
- */
-export function startOfMonth(year: number, month: number): Date {
-  return createDate(year, month, 1, 0, 0, 0, 0);
-}
-
-/**
- * Get end of month in UTC-3
- */
-export function endOfMonth(year: number, month: number): Date {
-  // Get last day of month
-  const lastDay = new Date(year, month, 0).getDate();
-  return createDate(year, month, lastDay, 23, 59, 59, 999);
-}
-
-/**
  * Parse a date string (YYYY-MM-DD) and create a date in UTC-3
  * The date is interpreted as local time in UTC-3
  */

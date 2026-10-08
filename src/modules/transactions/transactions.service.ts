@@ -4,6 +4,8 @@ import { NotFoundError, BadRequestError, ForbiddenError, ConflictError } from '.
 import {
   createPaginatedResponse,
   buildPaginationArgs,
+  parseMonthFilter,
+  utcDayString,
 } from '../../shared/utils/pagination.js';
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
@@ -1812,8 +1814,9 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
   
   // Parse month (YYYY-MM) to start and end dates
   const [year, monthNum] = targetMonth.split('-').map(Number);
-  const monthStart = new Date(year, monthNum - 1, 1);
-  const monthEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
+  // First and last day as 'YYYY-MM-DD' text: a Date parameter is compared as an instant, so a local-time bound
+  // counted the first day of the next month (and added it to day 1 of the heatmap).
+  const { start: monthStart, end: monthEnd } = parseMonthFilter(targetMonth);
 
   // Get all credit card account IDs to exclude them
   const creditCardAccounts = await prisma.account.findMany({
@@ -1834,8 +1837,8 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
       SUM(ABS(amount))::text as amount
     FROM "transactions"
     WHERE "household_id" = ${householdId}::uuid
-      AND date >= ${monthStart}
-      AND date <= ${monthEnd}
+      AND date >= ${utcDayString(monthStart)}::date
+      AND date <= ${utcDayString(monthEnd)}::date
       AND type = 'EXPENSE'
       AND (
         "account_id" IS NULL 
@@ -2203,8 +2206,6 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
 
   // Parse month
   const [year, monthNum] = month.split('-').map(Number);
-  const monthStart = new Date(year, monthNum - 1, 1);
-  const monthEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
   const monthKey = `${year}-${monthNum - 1}`;
   const technicalIdentifier = `invoice_pay:${accountId}:${monthKey}`;
 

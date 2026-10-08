@@ -79,6 +79,18 @@ import {
 // Account resolution
 // ---------------------------------------------------------------------------
 
+
+/**
+ * Inclusive UTC-midnight bounds, for a @db.Date column, of the local calendar days of two parsed-row instants (rows are
+ * built at local midnight). A local 23:59:59.999 end bound is the next day in UTC behind UTC and matched its rows.
+ */
+export function localDaysAsUtcRange(firstMs: number, lastMs: number): { start: Date; end: Date } {
+  const day = (ms: number) => {
+    const d = new Date(ms);
+    return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  };
+  return { start: day(firstMs), end: day(lastMs) };
+}
 export interface ResolvedAccount {
   id: string;
   name: string;
@@ -561,10 +573,7 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
   const legacyByKey = new Map<string, string>();
   const times = parsed.rows.map((r) => r.date.getTime());
   if (times.length > 0) {
-    const start = new Date(Math.min(...times));
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(Math.max(...times));
-    end.setHours(23, 59, 59, 999);
+    const { start, end } = localDaysAsUtcRange(Math.min(...times), Math.max(...times));
     const legacy = await prisma.transaction.findMany({
       where: { householdId, accountId: { in: accountIds }, sourceRef: null, date: { gte: start, lte: end } },
       select: { id: true, accountId: true, date: true, amount: true, description: true, type: true },

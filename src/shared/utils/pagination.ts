@@ -70,18 +70,24 @@ export const monthFilterSchema = z.object({
 });
 
 /**
- * Parse month string to date range
+ * 'YYYY-MM-DD' of a Date read as a UTC day: the day a `@db.Date` column holds for that instant.
+ * The driver truncates a Date bound to its UTC date and Prisma returns `@db.Date` values as UTC midnight, so
+ * every date-only bound has to be a UTC-midnight Date, whatever time zone the process runs in.
+ */
+export function utcDayString(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * Parse a 'YYYY-MM' month into its first and last day as UTC-midnight Dates, to filter `@db.Date` columns with
+ * `gte: start, lte: end` (both days inclusive). Local-time bounds (the last day at 23:59:59.999) are wrong behind
+ * UTC: in America/Sao_Paulo that instant is already the first day of the next month in UTC, so the driver
+ * truncated it to that day and every month list and total also counted the first day of the following month.
  */
 export function parseMonthFilter(month: string): { start: Date; end: Date } {
   const [year, monthNum] = month.split('-').map(Number);
-  const start = new Date(year!, monthNum! - 1, 1);
-  const end = new Date(year!, monthNum!, 0, 23, 59, 59, 999);
+  const start = new Date(Date.UTC(year!, monthNum! - 1, 1));
+  // Day 0 of the next month is the last day of this one
+  const end = new Date(Date.UTC(year!, monthNum!, 0));
   return { start, end };
 }
-
-
-
-
-
-
-
