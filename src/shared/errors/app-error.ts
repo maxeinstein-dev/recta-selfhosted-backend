@@ -134,6 +134,16 @@ export class RateLimitError extends AppError {
   }
 }
 
+/** 429 with a retry delay: the error handler sends it as the Retry-After header. */
+export class TooManyRequestsError extends AppError {
+  constructor(
+    message: string = 'Too many requests, try again later',
+    public readonly retryAfterSeconds: number = 60
+  ) {
+    super(message, 429, 'TOO_MANY_REQUESTS');
+  }
+}
+
 
 
 

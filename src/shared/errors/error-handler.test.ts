@@ -1,16 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 
-import { BadRequestError } from './app-error.js';
+import { BadRequestError, TooManyRequestsError } from './app-error.js';
 import { errorHandler } from './error-handler.js';
 
 function run(error: Error | FastifyError) {
   const send = vi.fn();
   const status = vi.fn(() => ({ send }));
-  const reply = { status } as unknown as FastifyReply;
+  const header = vi.fn();
+  const reply = { status, header } as unknown as FastifyReply;
   const request = { log: { error: vi.fn() } } as unknown as FastifyRequest;
   errorHandler(error, request, reply);
-  return { status, send };
+  return { status, send, header };
 }
 
 function fastifyError(statusCode: number, code: string, message: string): FastifyError {
@@ -43,6 +44,14 @@ describe('errorHandler', () => {
 
     expect(status).toHaveBeenCalledWith(429);
     expect(send.mock.calls[0]?.[0]).toMatchObject({ error: { code: 'TOO_MANY_REQUESTS' } });
+  });
+
+  it('answers a TooManyRequestsError with 429 and the Retry-After header', () => {
+    const { status, send, header } = run(new TooManyRequestsError('slow down', 90));
+
+    expect(status).toHaveBeenCalledWith(429);
+    expect(header).toHaveBeenCalledWith('Retry-After', '90');
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ success: false, error: { code: 'TOO_MANY_REQUESTS', message: 'slow down' } });
   });
 
   it('reports a database unique violation (Prisma P2002) as a 409 conflict instead of a 500', () => {
