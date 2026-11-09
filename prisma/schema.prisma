@@ -47,6 +47,8 @@ model User {
   notifications            Notification[]
   transactionSplits        TransactionSplit[]
   people                   Person[]
+  capturedNotifications    CapturedNotification[]
+  deviceTokens             DeviceToken[]
 
   @@map("users")
 }
@@ -78,6 +80,9 @@ model Household {
   recurringTransactions RecurringTransaction[]
   people                Person[]
   settlements           Settlement[]
+  capturedNotifications CapturedNotification[]
+  deviceTokens          DeviceToken[]
+  captureAccountRules   CaptureAccountRule[]
 
   @@map("households")
 }
@@ -185,6 +190,7 @@ model Account {
   relatedTransactions   Transaction[]          @relation("TransactionRelatedAccount")
   recurringTransactions RecurringTransaction[]
   savingsGoals          SavingsGoal[]
+  captureAccountRules   CaptureAccountRule[]
 
   // Indexes
   @@index([householdId])
@@ -305,6 +311,7 @@ model Transaction {
   externalRefs          TransactionExternalRef[] // Linhas externas (ex.: OFX da fatura) que esta transação já representa
   shares                TransactionShare[] // Partes de outras pessoas (despesas compartilhadas, sem exigir conta de usuário)
   settlement            Settlement? // Acerto de pessoa ao qual esta transação está vinculada
+  capturedNotifications CapturedNotification[] // Notificações do banco que originaram esta transação
 
   // Indexes for common queries
   @@index([householdId])
@@ -655,4 +662,82 @@ model Notification {
   @@index([type])
   @@index([createdAt])
   @@map("notifications")
+}
+
+// ============================================================================
+// NOTIFICATION CAPTURES (Android app)
+// ============================================================================
+
+enum CaptureStatus {
+  PENDING
+  CONFIRMED
+  DISMISSED
+  IGNORED
+}
+
+// Raw text of a bank push notification sent by the Android app. Stored as received (parsing comes later and only
+// fills `parsed`). `dedupKey` = sha1(package | postedAt to the minute | title | text): unique per household, so a
+// retry or a double submit of the same notification is a no-op.
+model CapturedNotification {
+  id            String        @id @default(uuid()) @db.Uuid
+  householdId   String        @map("household_id") @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  package       String        @db.VarChar(150)
+  title         String?       @db.VarChar(300)
+  text          String        @db.VarChar(2000)
+  postedAt      DateTime      @map("posted_at") @db.Timestamptz(3)
+  dedupKey      String        @map("dedup_key") @db.VarChar(40)
+  status        CaptureStatus @default(PENDING)
+  parsed        Json?
+  parserVersion Int?          @map("parser_version")
+  transactionId String?       @map("transaction_id") @db.Uuid
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // Relations
+  household   Household    @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@unique([householdId, dedupKey])
+  @@index([householdId, status, postedAt])
+  @@map("captured_notifications")
+}
+
+// Long-lived, revocable credential of one device, limited to POST /captures. Only the SHA-256 of the token is stored;
+// the plain token (`rdt_...`) is shown once, when the device is created.
+model DeviceToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  householdId String    @map("household_id") @db.Uuid
+  name        String    @db.VarChar(100)
+  tokenHash   String    @unique @map("token_hash") @db.VarChar(64)
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(3)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Relations
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// Which Recta account receives each kind of capture of an app (e.g. Nubank card purchase -> Nubank card account).
+model CaptureAccountRule {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  package     String   @db.VarChar(150)
+  kind        String   @db.VarChar(30)
+  accountId   String   @map("account_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // Relations
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, package, kind])
+  @@map("capture_account_rules")
 }
