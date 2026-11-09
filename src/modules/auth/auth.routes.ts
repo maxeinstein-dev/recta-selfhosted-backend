@@ -8,7 +8,7 @@ import { getOrCreatePersonalHousehold } from '../households/households.service.j
 import { processReferralCode } from '../users/referrals.service.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { env, isLocalAuth } from '../../shared/config/env.js';
-import { login, register } from './local.service.js';
+import { PASSWORD_MAX_BYTES, discardRegisteredUser, login, register } from './local.service.js';
 import { UnauthorizedError } from '../../shared/errors/index.js';
 
 /**
@@ -49,10 +49,16 @@ const credentialsBodySchema = {
   type: 'object',
   required: ['email', 'password'],
   properties: {
-    email: { type: 'string', format: 'email' },
-    password: { type: 'string', minLength: 8 },
+    // The email format and the 72-byte password limit are checked by local.service (zod), after the email is
+    // trimmed and lowercased; the lengths here are the cheap upper bounds (a character is at least one byte).
+    email: { type: 'string', maxLength: 254 },
+    password: { type: 'string', minLength: 8, maxLength: PASSWORD_MAX_BYTES },
   },
 } as const;
+
+// Credential routes are the one place a password can be guessed, so they get their own, tighter limit per IP
+// (the global limit is far higher). Behind a reverse proxy, trustProxy makes the IP the proxy's X-Forwarded-For.
+const credentialsRateLimit = { rateLimit: { max: 10, timeWindow: '1 minute' } } as const;
 
 export async function authRoutes(app: FastifyInstance) {
   /**
@@ -77,7 +83,7 @@ export async function authRoutes(app: FastifyInstance) {
                 properties: {
                   id: { type: 'string', format: 'uuid' },
                   email: { type: 'string', format: 'email' },
-                  firebaseUid: { type: 'string' },
+                  firebaseUid: { type: ['string', 'null'] },
                   createdAt: { type: 'string', format: 'date-time' },
                   households: {
                     type: 'array',
@@ -238,6 +244,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post(
     '/register',
     {
+      config: credentialsRateLimit,
       schema: {
         description: 'Register a new user with email and password. Only available when AUTH_MODE=local.',
         tags: ['Auth'],
@@ -258,8 +265,10 @@ export async function authRoutes(app: FastifyInstance) {
             },
           },
           400: errorResponseSchema,
+          403: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          429: errorResponseSchema,
         },
       },
     },
@@ -271,10 +280,26 @@ export async function authRoutes(app: FastifyInstance) {
         });
       }
 
+      if (!env.AUTH_ALLOW_REGISTRATION) {
+        return reply.code(403).send({
+          success: false,
+          error: { code: 'REGISTRATION_DISABLED', message: 'Registration is disabled on this server' },
+        });
+      }
+
       const body = request.body as { email: string; password: string };
       const user = await register(body.email, body.password);
 
-      const household = await getOrCreatePersonalHousehold(user.id, user.email);
+      // The household helper does not take a transaction, so undo the registration if it fails: a user without a
+      // household could sign in but could not use the app, and could never register again (the email is taken).
+      let household;
+      try {
+        household = await getOrCreatePersonalHousehold(user.id, user.email);
+      } catch (error) {
+        // Best effort: if the cleanup fails too, the original error is the one worth reporting.
+        await discardRegisteredUser(user.id).catch(() => undefined);
+        throw error;
+      }
 
       return reply.code(201).send({
         success: true,
@@ -294,6 +319,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post(
     '/login',
     {
+      config: credentialsRateLimit,
       schema: {
         description: 'Login with email and password. Only available when AUTH_MODE=local.',
         tags: ['Auth'],
@@ -315,6 +341,7 @@ export async function authRoutes(app: FastifyInstance) {
           },
           401: errorResponseSchema,
           404: errorResponseSchema,
+          429: errorResponseSchema,
         },
       },
     },
@@ -360,6 +387,7 @@ export async function authRoutes(app: FastifyInstance) {
                 properties: {
                   authMode: { type: 'string', enum: ['local', 'firebase'] },
                   firebaseWebApiKey: { type: ['string', 'null'] },
+                  registrationEnabled: { type: 'boolean' },
                 },
               },
             },
@@ -373,6 +401,7 @@ export async function authRoutes(app: FastifyInstance) {
         data: {
           authMode: env.AUTH_MODE,
           firebaseWebApiKey: env.AUTH_FIREBASE_WEB_API_KEY ?? null,
+          registrationEnabled: !isLocalAuth || env.AUTH_ALLOW_REGISTRATION,
         },
       });
     }

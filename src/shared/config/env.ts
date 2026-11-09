@@ -37,7 +37,12 @@ const envSchema = z.object({
   // Auth mode (A3: AUTH_MODE=local support)
   AUTH_MODE: z.enum(['local', 'firebase']).default('firebase'),
   AUTH_JWT_SECRET: z.string().min(32).optional(),
-  AUTH_TOKEN_TTL_HOURS: z.coerce.number().default(720),
+  AUTH_TOKEN_TTL_HOURS: z.coerce.number().positive().max(24 * 365).default(720),
+  // Set to 'false' to close sign-ups once the instance has its users (POST /auth/register then answers 403)
+  AUTH_ALLOW_REGISTRATION: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
   AUTH_REQUIRE_EMAIL_VERIFICATION: z
     .enum(['true', 'false'])
     .default('false')
