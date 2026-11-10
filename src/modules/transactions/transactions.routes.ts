@@ -23,6 +23,8 @@ import {
   monthlyRecapQuerySchema,
   heatmapQuerySchema,
 } from './transactions.schema.js';
+import { getCreditCardCommitment } from './credit-card-commitment.js';
+import { creditCardCommitmentParamsSchema, creditCardCommitmentQuerySchema } from './credit-card-commitment.schema.js';
 import { updateTransactionSplitSchema } from './transaction-splits.schema.js';
 import * as transactionsService from './transactions.service.js';
 import { assertUpdateKeepsShares } from '../people/shares.service.js';
@@ -630,6 +632,53 @@ export async function transactionRoutes(app: FastifyInstance) {
         data: invoice.data,
         pagination: invoice.pagination,
       });
+    }
+  );
+
+  /**
+   * GET /transactions/credit-cards/:accountId/commitment
+   * The card's next invoices side by side (already posted, still expected from recurrences) against the income
+   * expected for each month. Read-only.
+   */
+  app.get<{ Params: { accountId: string } }>(
+    '/credit-cards/:accountId/commitment',
+    {
+      schema: {
+        description: 'Expected total of the next invoices of a credit card, compared with the expected income',
+        tags: ['Transactions'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['accountId'],
+          properties: { accountId: { type: 'string', format: 'uuid' } },
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            householdId: { type: 'string', format: 'uuid' },
+            months: { type: 'integer', minimum: 1, maximum: 12 },
+            from: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
+          },
+        },
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: { type: 'object', additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { accountId } = creditCardCommitmentParamsSchema.parse(request.params);
+      const query = creditCardCommitmentQuerySchema.parse(request.query);
+      const householdId = query.householdId || (await ensurePersonalHousehold(request));
+      await requireHouseholdMember(request, householdId);
+
+      const data = await getCreditCardCommitment(accountId, householdId, { months: query.months, from: query.from });
+      return reply.send({ success: true, data });
     }
   );
 
