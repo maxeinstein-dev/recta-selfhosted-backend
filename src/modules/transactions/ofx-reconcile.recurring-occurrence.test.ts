@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { reconcileCardOfx, type ReconcileInput, type StoredCardRow } from './ofx-reconcile.js';
+import { reconcileCardOfx, type ReconcileInput, type RecurrenceOccurrence, type StoredCardRow } from './ofx-reconcile.js';
 import { cardOfxLineType, cardOfxRef, classifyCardOfxLine, installmentFromMemo, merchantFromMemo, type CardOfxStatementLine } from './parsers/ofx-card.parser.js';
 
 /**
@@ -19,13 +19,19 @@ function occurrence(overrides: Partial<StoredCardRow>): StoredCardRow {
   return {
     id: 'job-occurrence', description: 'Seguro Alfa', amount: 90, type: 'EXPENSE', date: '2026-10-05', sourceRef: null,
     notes: 'Auto-generated from recurring transaction: rec-1 on 2026-10-05T01:00:00.000Z', paid: true,
-    installmentId: null, installmentNumber: null, totalInstallments: null, ...overrides,
+    installmentId: null, installmentNumber: null, totalInstallments: null, recurringTransactionId: 'rec-1', ...overrides,
   };
 }
 
-function run(lines: CardOfxStatementLine[], legacy: StoredCardRow[]) {
+/** The occurrence as the service loads it for the recurrence step: with the names of the recurrence that generated it. */
+function recurrence(row: StoredCardRow, names: string[] = ['Seguro Alfa']): RecurrenceOccurrence {
+  return { row, names };
+}
+
+function run(lines: CardOfxStatementLine[], legacy: StoredCardRow[], recurrenceRows?: RecurrenceOccurrence[]) {
   const input: ReconcileInput = {
     lines, sheetRows: [], futures: [], legacy, knownRefs: new Map(), linkedTransactionIds: new Set(), planNumbers: new Map(), paymentReference: null,
+    ...(recurrenceRows ? { recurrenceRows } : {}),
   };
   return reconcileCardOfx(input);
 }
@@ -36,18 +42,23 @@ describe('statement OFX after the recurrence job generated the occurrence', () =
     expect(result.lines[0]).toMatchObject({ status: 'reconciled', transactionId: 'job-occurrence', reconciledBy: 'legacy' });
   });
 
-  // CURRENT BEHAVIOUR, NOT DESIRED: the legacy rule is an exact key (day, cents, type, description). A bank line carries
-  // the bank's name, the real amount and the purchase day, so it never pairs and the statement creates a second charge.
-  // Recorded here so that fixing it (pairing through the recurrence name and aliases) turns this test red on purpose.
-  it('does NOT pair when the bank uses another name, amount or day (known gap, not fixed in this batch)', () => {
-    const result = run([line('f1', 'Pg *Seguro Alfa Conecta', -87.4, '2026-10-03')], [occurrence({})]);
+  it('pairs through an alias of the recurrence when the bank uses another name, amount and day', () => {
+    const row = occurrence({});
+    const result = run([line('f1', 'Pg *Seguro Alfa Conecta', -87.4, '2026-10-03')], [row], [recurrence(row, ['Seguro Alfa', 'Pg Seguro Alfa Conecta'])]);
     expect(result.lines[0]?.status).toBe('proposed');
-    expect(result.lines[0]?.transactionId).toBeNull();
-    expect(result.proposals.map((p) => p.kind)).toEqual(['create']);
+    expect(result.proposals.map((p) => p.kind)).toEqual(['enrich-recurrence']);
+    expect(result.proposals[0]).toMatchObject({ target: { id: 'job-occurrence' }, defaultSelected: true, ambiguous: false });
   });
 
-  it('does not pair even with the same name when only the amount differs (expected amount is a forecast)', () => {
-    const result = run([line('f1', 'Seguro Alfa', -87.4, '2026-10-05')], [occurrence({})]);
+  it('pairs with the same name even when only the amount differs (expected amount is a forecast)', () => {
+    const row = occurrence({});
+    const result = run([line('f1', 'Seguro Alfa', -87.4, '2026-10-05')], [row], [recurrence(row)]);
     expect(result.lines[0]?.status).toBe('proposed');
+    expect(result.proposals.map((p) => p.kind)).toEqual(['enrich-recurrence']);
+  });
+
+  it('keeps the old outcome (a second charge is proposed) when the service found no recurrence occurrence', () => {
+    const result = run([line('f1', 'Pg *Seguro Alfa Conecta', -87.4, '2026-10-03')], [occurrence({})]);
+    expect(result.proposals.map((p) => p.kind)).toEqual(['create']);
   });
 });

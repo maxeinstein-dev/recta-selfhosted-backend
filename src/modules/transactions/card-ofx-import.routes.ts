@@ -140,7 +140,7 @@ export async function cardOfxImportRoutes(app: FastifyInstance) {
   app.post('/import/card-ofx/preview', {
     schema: {
       description:
-        'Preview a credit card invoice OFX import (multipart/form-data: file field `file` (.ofx, max 5MB) + text fields `accountId` (the credit card) and optional `options` (JSON { monthOverride?: { year, month } })). Returns the invoice month (due month, from DTEND and the card due/closing days unless overridden), every OFX line with its status (reconciled, proposed, payment) and group, the reconciliation proposals (enrich-exact, enrich-plan, enrich-sum, enrich-merge, enrich-neighbour, enrich-group, enrich-near, consume-future, create, reversal), the sheet rows left without a line, the previous invoice payment proposal (ok, adjust, create) and the category map of the new purchases. Requires EDITOR+ on the card household.',
+        'Preview a credit card invoice OFX import (multipart/form-data: file field `file` (.ofx, max 5MB) + text fields `accountId` (the credit card) and optional `options` (JSON { monthOverride?: { year, month } })). Returns the invoice month (due month, from DTEND and the card due/closing days unless overridden), every OFX line with its status (reconciled, proposed, payment) and group, the reconciliation proposals (enrich-exact, enrich-plan, enrich-sum, enrich-merge, enrich-neighbour, enrich-group, enrich-near, enrich-recurrence, consume-future, create, reversal), the sheet rows left without a line, the previous invoice payment proposal (ok, adjust, create) and the category map of the new purchases. Requires EDITOR+ on the card household.',
       tags: ['Transactions'],
       security: [{ bearerAuth: [] }],
       consumes: ['multipart/form-data'],

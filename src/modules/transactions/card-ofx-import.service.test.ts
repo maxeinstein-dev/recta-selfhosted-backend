@@ -5,6 +5,7 @@ import {
   fakeServices,
   resetStore,
   seedAccount,
+  seedRecurrence,
   seedRef,
   seedShare,
   seedTransaction,
@@ -24,6 +25,7 @@ import {
   validateConfirmLines,
   type ResolvedCardAccount,
 } from './card-ofx-import.service.js';
+import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
 import type { CardOfxConfirmRequest, CardOfxPreviewResponse, CardOfxProposal } from './card-ofx-import.types.js';
 import type { MaxFinCategoryMapInput } from './maxfin-import.types.js';
 
@@ -40,6 +42,7 @@ vi.mock('./transactions.service.js', async () => {
     undoCreditCardPayment: s.undoCreditCardPayment,
   };
 });
+vi.mock('../recurring-transactions/recurring-follow.js', () => ({ followLastAmountInTx: vi.fn(async () => null) }));
 vi.mock('../categories/categories.service.js', async () => ({
   createCategory: (await import('./__fixtures__/card-ofx-fake-db.js')).fakeServices.createCategory,
 }));
@@ -2050,5 +2053,148 @@ describe('card OFX import: the confirm and the payment classification', () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx([{ fitid: 'rf', date: '20261020', amount: '1.85', memo: 'Estorno' }], { start: '20261002', end: '20261102' }) });
 
     expect(preview.proposals.map((p) => [p.kind, p.defaultSelected, p.reason])).toEqual([['create', true, null]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A recurrence occurrence the job generated before the statement arrived
+// ---------------------------------------------------------------------------
+
+describe('card OFX import: recurrence occurrences', () => {
+  let card: ResolvedCardAccount;
+  const OPTS = { start: '20260203', end: '20260302' }; // due month 2026-03
+  const LINE: Trn[] = [{ fitid: 'r-1', date: '20260212', amount: '-47.90', memo: 'Pg Plano Beta Mensal' }];
+  let occurrence: FakeTransaction;
+
+  const seedOccurrence = (extra: Partial<FakeTransaction> = {}) =>
+    seedTransaction({
+      householdId: HH,
+      accountId: CARD,
+      type: 'EXPENSE',
+      categoryName: 'OTHER_EXPENSES',
+      amount: 50,
+      description: 'Plano Beta',
+      date: '2026-02-10',
+      notes: 'Auto-generated from recurring transaction: rec-1',
+      recurringTransactionId: 'rec-1',
+      ...extra,
+    });
+
+  beforeEach(() => {
+    card = seedCard();
+    seedRecurrence({ id: 'rec-1', householdId: HH, description: 'Plano Beta', aliases: ['Pg Plano Beta Mensal'] });
+    occurrence = seedOccurrence();
+  });
+
+  it('proposes the pairing through the alias, selected, instead of a second charge', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+
+    expect(preview.proposals.map((p) => p.kind)).toEqual(['enrich-recurrence']);
+    expect(proposal(preview, 'enrich-recurrence')).toMatchObject({
+      defaultSelected: true,
+      target: { transactionId: occurrence.id, amount: 50 },
+      result: { date: '2026-02-12', description: 'Pg Plano Beta Mensal' },
+    });
+  });
+
+  it('takes the bank amount, date and memo, keeps the recurrence link, notes the old description and records the ref', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 1, created: 0, skipped: 0 });
+    expect(fakeServices.updateTransaction).toHaveBeenCalledWith(
+      occurrence.id,
+      HH,
+      expect.objectContaining({ amount: 47.9, description: 'Pg Plano Beta Mensal' }),
+      expect.objectContaining({ beforeWrite: expect.any(Function), inTransaction: expect.any(Function) }),
+    );
+    expect(tx(occurrence.id)).toMatchObject({ amount: 47.9, date: '2026-02-12', description: 'Pg Plano Beta Mensal', recurringTransactionId: 'rec-1', sourceRef: null });
+    expect(tx(occurrence.id).notes).toBe('Auto-generated from recurring transaction: rec-1 · Recorrência: Plano Beta 50,00');
+    expect(refsOf(occurrence.id)).toHaveLength(1);
+    expect(store.transactions.filter((t) => t.accountId === CARD)).toHaveLength(1);
+  });
+
+  it('asks the recurrence to follow the new amount inside the same transaction (like editing the occurrence by hand)', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+
+    await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(followLastAmountInTx).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(followLastAmountInTx).mock.calls[0]!.slice(1)).toEqual([
+      expect.objectContaining({ id: occurrence.id, householdId: HH, recurringTransactionId: 'rec-1', amount: 50 }),
+      expect.objectContaining({ amount: 47.9 }),
+    ]);
+  });
+
+  it('importing the same file again changes nothing', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+    await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+    const before = JSON.stringify(store.transactions);
+    const refsBefore = JSON.stringify(store.refs);
+
+    const again = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+    expect(again.proposals).toEqual([]);
+    const second = await confirmCardOfxImport({ request: confirmRequest(again, { payment: null }), account: card });
+
+    expect(second).toMatchObject({ enriched: 0, created: 0 });
+    expect(JSON.stringify(store.transactions)).toBe(before);
+    expect(JSON.stringify(store.refs)).toBe(refsBefore);
+  });
+
+  it('a name without alias still creates the charge, and the occurrence stays as it was', async () => {
+    store.recurrences[0]!.aliases = [];
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+
+    expect(preview.proposals.map((p) => p.kind)).toEqual(['create']);
+    await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+    expect(tx(occurrence.id)).toMatchObject({ amount: 50, date: '2026-02-10', description: 'Plano Beta' });
+  });
+
+  it('ignores an occurrence that has a share, is split, or already carries an external ref', async () => {
+    seedShare(occurrence.id);
+    expect((await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) })).proposals.map((p) => p.kind)).toEqual(['create']);
+    store.shares = [];
+    occurrence.isSplit = true;
+    expect((await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) })).proposals.map((p) => p.kind)).toEqual(['create']);
+    occurrence.isSplit = false;
+    seedRef({ householdId: HH, transactionId: occurrence.id, ref: 'ofx:other:11111111' });
+    expect((await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) })).proposals.map((p) => p.kind)).toEqual(['create']);
+  });
+
+  it('writes nothing when another confirm linked the occurrence first', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+    const impl = fakeServices.updateTransaction.getMockImplementation()!;
+    fakeServices.updateTransaction.mockImplementationOnce(async (...args: Parameters<typeof impl>) => {
+      seedRef({ householdId: HH, transactionId: occurrence.id, ref: 'ofx:rival:33333333' });
+      return impl(...args);
+    });
+
+    const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+
+    expect(result).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(tx(occurrence.id)).toMatchObject({ amount: 50, description: 'Plano Beta' });
+    expect(refsOf(occurrence.id)).toEqual(['ofx:rival:33333333']);
+    expect(followLastAmountInTx).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing when the occurrence changed amount (in cents) or was deleted meanwhile', async () => {
+    const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
+    const impl = fakeServices.updateTransaction.getMockImplementation()!;
+    fakeServices.updateTransaction.mockImplementationOnce(async (...args: Parameters<typeof impl>) => {
+      occurrence.amount = 50.01;
+      return impl(...args);
+    });
+    const changed = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+    expect(changed).toMatchObject({ enriched: 0, skipped: 1 });
+    expect(tx(occurrence.id).amount).toBe(50.01);
+    expect(refsOf(occurrence.id)).toEqual([]);
+
+    occurrence.amount = 50;
+    fakeServices.updateTransaction.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('Transaction not found'), { code: 'NOT_FOUND' });
+    });
+    const gone = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
+    expect(gone).toMatchObject({ enriched: 0, skipped: 1 });
   });
 });

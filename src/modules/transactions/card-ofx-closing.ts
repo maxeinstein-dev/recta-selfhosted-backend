@@ -105,7 +105,7 @@ export function computeClosing(input: ClosingInput): CardOfxClosing {
         // An advance payment line is not in the OFX total; the sheet credit it pairs with stays in the card total.
         if (proposal.refs.every((ref) => lineByRef.get(ref)!.kind === 'payment')) advanceIds.add(target.id);
         const cents =
-          proposal.kind === 'enrich-merge' || proposal.kind === 'consume-future' || proposal.kind === 'enrich-near' ? lineNet : signedCents(target.type, target.amount);
+          proposal.kind === 'enrich-merge' || proposal.kind === 'consume-future' || proposal.kind === 'enrich-near' || proposal.kind === 'enrich-recurrence' ? lineNet : signedCents(target.type, target.amount);
         projected.set(target.id, { cents, date: proposal.result!.date, ofSheetOnly: false });
         for (const row of proposal.absorbed) projected.delete(row.id);
       }

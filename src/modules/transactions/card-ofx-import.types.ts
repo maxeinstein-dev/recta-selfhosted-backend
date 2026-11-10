@@ -39,7 +39,7 @@ export interface CardOfxLine {
   group: string | null;
 }
 
-export type CardOfxProposalKind = 'enrich-exact' | 'enrich-plan' | 'enrich-sum' | 'enrich-merge' | 'enrich-neighbour' | 'enrich-group' | 'enrich-near' | 'consume-future' | 'create' | 'reversal' | 'advance-payment';
+export type CardOfxProposalKind = 'enrich-exact' | 'enrich-plan' | 'enrich-sum' | 'enrich-merge' | 'enrich-neighbour' | 'enrich-group' | 'enrich-near' | 'enrich-recurrence' | 'consume-future' | 'create' | 'reversal' | 'advance-payment';
 
 export interface CardOfxTransactionRef {
   transactionId: string;
