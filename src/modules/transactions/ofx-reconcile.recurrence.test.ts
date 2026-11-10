@@ -43,14 +43,27 @@ const kinds = (r: ReturnType<typeof run>) => r.proposals.map((p) => p.kind);
 const shift = (base: string, days: number) => new Date(Date.parse(`${base}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 
 describe('reconcile step 6f: recurrence occurrences', () => {
-  it('pairs the same name with another amount and day; the result carries the bank date and memo, and the old description goes to the notes', () => {
+  it('pairs the same name with another amount and day; the result carries the bank date, the occurrence keeps its description and the notes get the bank name and the old amount', () => {
     const r = run([line('a', 'Plano Beta', -47.9, '2026-10-12')], [occ('o1')]);
     expect(kinds(r)).toEqual(['enrich-recurrence']);
     expect(r.proposals[0]).toMatchObject({
       target: { id: 'o1' }, defaultSelected: true, ambiguous: false, reason: null, tieBroken: false,
-      result: { date: '2026-10-12', description: 'Plano Beta', notesAppend: 'Recorrência: Plano Beta 50,00' },
+      result: { date: '2026-10-12', description: 'Plano Beta', notesAppend: 'Banco: Plano Beta (valor anterior 50,00)' },
     });
     expect(r.lines[0]).toMatchObject({ status: 'proposed', transactionId: null });
+  });
+
+  it('keeps the recurrence description, never the bank memo, and writes the bank memo to the notes (an alias line)', () => {
+    const r = run([line('a', 'Pg Plano Beta Mensal', -47.9, '2026-10-12')], [occ('o1', {}, ['Plano Beta', 'Pg Plano Beta Mensal'])]);
+    const result = r.proposals[0]!.result!;
+    expect(result.description).toBe('Plano Beta');
+    expect(result.description).not.toBe('Pg Plano Beta Mensal');
+    expect(result.notesAppend).toBe('Banco: Pg Plano Beta Mensal (valor anterior 50,00)');
+  });
+
+  it('does not record an old amount in the notes when the amount did not change', () => {
+    const r = run([line('a', 'Pg Plano Beta Mensal', -50, '2026-10-12')], [occ('o1', {}, ['Plano Beta', 'Pg Plano Beta Mensal'])]);
+    expect(r.proposals[0]!.result).toMatchObject({ description: 'Plano Beta', notesAppend: 'Banco: Pg Plano Beta Mensal' });
   });
 
   it('pairs through an alias', () => {

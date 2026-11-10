@@ -2093,11 +2093,11 @@ describe('card OFX import: recurrence occurrences', () => {
     expect(proposal(preview, 'enrich-recurrence')).toMatchObject({
       defaultSelected: true,
       target: { transactionId: occurrence.id, amount: 50 },
-      result: { date: '2026-02-12', description: 'Pg Plano Beta Mensal' },
+      result: { date: '2026-02-12', description: 'Plano Beta' },
     });
   });
 
-  it('takes the bank amount, date and memo, keeps the recurrence link, notes the old description and records the ref', async () => {
+  it('takes the bank amount and date, keeps the description and the recurrence link, notes the bank name and the old amount and records the ref', async () => {
     const preview = await buildCardOfxPreview({ account: card, buffer: ofx(LINE, OPTS) });
 
     const result = await confirmCardOfxImport({ request: confirmRequest(preview, { payment: null }), account: card });
@@ -2106,11 +2106,11 @@ describe('card OFX import: recurrence occurrences', () => {
     expect(fakeServices.updateTransaction).toHaveBeenCalledWith(
       occurrence.id,
       HH,
-      expect.objectContaining({ amount: 47.9, description: 'Pg Plano Beta Mensal' }),
+      expect.objectContaining({ amount: 47.9, description: 'Plano Beta' }),
       expect.objectContaining({ beforeWrite: expect.any(Function), inTransaction: expect.any(Function) }),
     );
-    expect(tx(occurrence.id)).toMatchObject({ amount: 47.9, date: '2026-02-12', description: 'Pg Plano Beta Mensal', recurringTransactionId: 'rec-1', sourceRef: null });
-    expect(tx(occurrence.id).notes).toBe('Auto-generated from recurring transaction: rec-1 · Recorrência: Plano Beta 50,00');
+    expect(tx(occurrence.id)).toMatchObject({ amount: 47.9, date: '2026-02-12', description: 'Plano Beta', recurringTransactionId: 'rec-1', sourceRef: null });
+    expect(tx(occurrence.id).notes).toBe('Auto-generated from recurring transaction: rec-1 · Banco: Pg Plano Beta Mensal (valor anterior 50,00)');
     expect(refsOf(occurrence.id)).toHaveLength(1);
     expect(store.transactions.filter((t) => t.accountId === CARD)).toHaveLength(1);
   });

@@ -36,7 +36,7 @@
  *     (`recurringTransactionId`, no sourceRef, not tied to a statement line yet) of the same type whose recurrence name
  *     or alias equals the line's normalized merchant or memo, the statement dated from RECURRENCE_DAYS_LINE_BEFORE days
  *     before to RECURRENCE_DAYS_LINE_AFTER days after the occurrence. The amount is NOT compared (the occurrence holds
- *     the forecast, the line the real charge); the occurrence then takes the line's amount and date. One to one, closest
+ *     the forecast, the line the real charge); the occurrence then takes the line's amount and date and keeps its own description (the bank's name goes to the notes). One to one, closest
  *     date first, then closest amount, then stable order; a line or occurrence with several candidates is ambiguous
  *     (unselected). Runs last of the matching steps, so it only takes lines they left over;
  *  7. the rest of the OFX is new (grouped by FITID, selected in months without sheet rows, when the purchase date is
@@ -1066,10 +1066,12 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
         tieBroken: ambiguous,
         defaultSelected: !ambiguous,
         reason: ambiguous ? 'recurrence-ambiguous' : null,
+        // The occurrence keeps its description (the recurrence's common name); the name the bank gave goes to the
+        // notes, with the forecast amount it replaces when the real one differs.
         result: {
           date: pair.state.line.date,
-          description: pair.state.line.memo,
-          notesAppend: clampText(`Recorrência: ${pair.occ.row.description} ${formatCents(pair.occ.cents)}`, MAX_NOTES_APPEND),
+          description: pair.occ.row.description,
+          notesAppend: recurrenceNote(pair.state.line.memo, pair.occ.cents === pair.state.cents ? null : pair.occ.cents),
         },
       });
     }
@@ -1274,6 +1276,12 @@ function unionRowWords(rows: RowState[]): Set<string> {
 }
 
 /** "36,86" (unsigned). */
+/** Notes of an occurrence paired with a statement line: "Banco: <memo>" and, when the amount changed, "(valor anterior 50,00)". */
+function recurrenceNote(memo: string, previousCents: number | null): string {
+  const suffix = previousCents === null ? '' : ` (valor anterior ${formatCents(previousCents)})`;
+  return `Banco: ${clampText(memo, MAX_NOTES_APPEND - 'Banco: '.length - suffix.length)}${suffix}`;
+}
+
 function formatCents(cents: number): string {
   return formatSigned(cents, false).slice(1);
 }
