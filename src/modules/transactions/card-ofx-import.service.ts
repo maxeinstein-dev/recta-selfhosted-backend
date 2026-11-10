@@ -49,6 +49,9 @@ import {
 import type { MaxFinCategoryMapEntry, MaxFinCategoryMapInput } from './maxfin-import.types.js';
 import { computeClosing } from './card-ofx-closing.js';
 import {
+  NOTIF_DAYS_LINE_AFTER,
+  NOTIF_DAYS_LINE_BEFORE,
+  NOTIF_REF_PREFIX,
   parseGroupId,
   reconcileCardOfx,
   toCents,
@@ -160,6 +163,12 @@ export function formatBRL(amount: number): string {
 /** A date-only bound for @db.Date columns (stored as UTC midnight): the day itself, whatever the server's time zone. */
 function utcDay(date: string): Date {
   return new Date(`${date}T00:00:00.000Z`);
+}
+
+function shiftUtcDay(day: Date, days: number): Date {
+  const shifted = new Date(day);
+  shifted.setUTCDate(shifted.getUTCDate() + days);
+  return shifted;
 }
 
 function formatDay(date: string): string {
@@ -393,13 +402,28 @@ async function loadCardContext(
     }),
   );
 
+  // Transactions confirmed from bank notifications (`notif:<dedupKey>`) on this card, dated within the notification
+  // window of the lines (see NOTIF_DAYS_*): the line is dated from 1 day before to 5 days after the notification.
+  const notifRows = storedRows(
+    await prisma.transaction.findMany({
+      where: {
+        householdId,
+        accountId: card.id,
+        sourceRef: { startsWith: NOTIF_REF_PREFIX },
+        date: { gte: shiftUtcDay(legacyStart, -NOTIF_DAYS_LINE_AFTER), lte: shiftUtcDay(legacyEnd, NOTIF_DAYS_LINE_BEFORE) },
+      },
+      select: CARD_ROW_SELECT,
+      orderBy: [{ date: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+    }),
+  );
+
   // Refs already used: transactions an earlier import created from them, and the external refs table (which
   // also tells which candidate rows already represent OFX lines).
   const createdFromRefs = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: refs } },
     select: { id: true, sourceRef: true },
   });
-  const candidateIds = [...sheetRows, ...neighbourRows, ...futures, ...legacy].map((row) => row.id);
+  const candidateIds = [...sheetRows, ...neighbourRows, ...futures, ...legacy, ...notifRows].map((row) => row.id);
   const externalRefs = await prisma.transactionExternalRef.findMany({
     where: { householdId, OR: [{ ref: { in: refs } }, { transactionId: { in: candidateIds } }] },
     select: { ref: true, transactionId: true },
@@ -517,6 +541,7 @@ async function loadCardContext(
       sheetRows,
       futures,
       legacy,
+      notifRows,
       knownRefs,
       linkedTransactionIds,
       planNumbers,
@@ -1283,6 +1308,36 @@ async function applyEnrichClaimed(householdId: string, cardId: string, proposal:
 }
 
 /**
+ * Enrich a transaction confirmed from a notification: like applyEnrichClaimed (row locked FOR UPDATE, no external ref
+ * yet, still the state the recompute saw, refs recorded in the same database transaction), except that the amount is
+ * compared after the lock, in cents. A double in a `where` on the numeric column can miss the row on a real database
+ * (64.9 does), and the row is locked, so reading it and comparing is just as safe.
+ */
+async function applyEnrichNotification(householdId: string, cardId: string, proposal: ReconcileProposal): Promise<boolean> {
+  const target = proposal.target!;
+  const data = targetData(proposal);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${target.id}::uuid FOR UPDATE`;
+      if ((await tx.transactionExternalRef.count({ where: { transactionId: target.id } })) > 0) throw new MergeConflict();
+      const [row] = await tx.transaction.findMany({
+        where: { id: target.id, householdId, accountId: cardId, type: target.type, paid: target.paid, sourceRef: target.sourceRef },
+        select: { amount: true },
+      });
+      if (!row || toCents(row.amount.toNumber()) !== toCents(target.amount)) throw new MergeConflict();
+      await tx.transaction.update({ where: { id: target.id }, data });
+      await tx.transactionExternalRef.createMany({
+        data: proposal.refs.map((ref) => ({ householdId, transactionId: target.id, ref })),
+      });
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof MergeConflict || isAlreadyTakenOrGone(error)) return false;
+    throw error;
+  }
+}
+
+/**
  * Near amount: the sheet row adopts the BANK amount (a few cents of difference), so the card balance and limit must
  * move by exactly that difference: the update goes through the transaction service, whose transaction claims and
  * locks the row, adjusts the balance, recalculates the card limit — and, through the hook, requires that the row has
@@ -1647,10 +1702,16 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
     switch (proposal.kind) {
       case 'enrich-exact':
       case 'enrich-plan':
-      case 'enrich-sum':
-        if (await applyEnrich(householdId, proposal)) enriched += 1;
+      case 'enrich-sum': {
+        // A transaction confirmed from a notification is claimed under a row lock (no other ref, same state as seen).
+        const fromNotification = (proposal.target?.sourceRef ?? '').startsWith(NOTIF_REF_PREFIX);
+        const applied = fromNotification
+          ? await applyEnrichNotification(householdId, account.id, proposal)
+          : await applyEnrich(householdId, proposal);
+        if (applied) enriched += 1;
         else skipped += 1;
         break;
+      }
       case 'enrich-near':
         if (await applyNear(householdId, account.id, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) enriched += 1;
         else skipped += 1;

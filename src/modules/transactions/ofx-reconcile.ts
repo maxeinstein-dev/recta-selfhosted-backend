@@ -28,6 +28,10 @@
  *  6d. near amount: an unlinked paid sheet row of this month and a left-over line of the same type whose amounts differ
  *     by 1 to 5 cents; unique both ways and (same N/M, or a shared word incl. fuzzy prefix, or an alias) = selected;
  *     the row then adopts the bank amount;
+ *  6e. notification: a left-over purchase or refund line and a transaction confirmed from a bank notification (sourceRef
+ *     `notif:`, not yet tied to a statement line) with the same type and exact amount, the statement dated from 1 day
+ *     before to 5 days after the notification; one to one, closest date first, then words in common. Runs after every
+ *     sheet, legacy and future step so it only takes lines they left over (see NOTIF_DAYS_*);
  *  7. the rest of the OFX is new (grouped by FITID, selected in months without sheet rows, when the purchase date is
  *     before the earliest sheet month stored on the card, or when no sheet row of the month is left over); what is left of
  *     the month's sheet is reported, never deleted;
@@ -134,6 +138,11 @@ export interface ReconcileInput {
    */
   neighbourStatementMonths?: ReadonlySet<string>;
   /**
+   * Transactions confirmed from bank notifications (`notif:<dedupKey>`) on the card, dated within the NOTIF_DAYS_*
+   * window of the file's lines. Optional: without any, step 6e does nothing.
+   */
+  notifRows?: StoredCardRow[];
+  /**
    * Card rows tied to OFX lines (by ref) dated inside this file's date range whose refs are not among its lines: what a
    * re-imported, updated statement no longer lists as it was (removed, or changed amount/date/memo, which changes the
    * ref), within the statement's period. `fitids` are the FITID tokens of their refs. A left-over purchase with the same FITID and installment number
@@ -235,6 +244,17 @@ export const MERGE_MAX_ROWS = 4;
 const MERGE_MAX_MATCHES = 20;
 /** Days apart a neighbour-month row and a bank line may be. */
 export const NEIGHBOUR_MAX_DAYS = 10;
+/**
+ * A card notification is posted when the purchase is made; the statement line is dated the same day or later (a
+ * weekend or a long holiday delays the posting by up to 4 days; 5 leaves one day of slack). A line dated BEFORE the
+ * notification only happens through the time zone: the app derives the transaction day from postedAt (UTC) while the
+ * bank dates the purchase locally, so a purchase after 21:00 in UTC-3 lands one day later in Recta. Hence the line may
+ * be up to NOTIF_DAYS_LINE_AFTER days after the notification's day and NOTIF_DAYS_LINE_BEFORE day before it.
+ */
+export const NOTIF_DAYS_LINE_AFTER = 5;
+export const NOTIF_DAYS_LINE_BEFORE = 1;
+/** Prefix of the sourceRef of a transaction confirmed from a notification capture. */
+export const NOTIF_REF_PREFIX = 'notif:';
 /** Largest amount difference, in cents, the near-amount step accepts (1..5). */
 export const NEAR_MAX_CENTS = 5;
 /** Lines searched per sheet row in the group step (2^12 subsets at most). */
@@ -932,6 +952,45 @@ export function reconcileCardOfx(input: ReconcileInput): ReconcileResult {
     });
   }
 
+  // 6e. Notifications: transactions confirmed from a bank notification and not tied to a statement line yet. Last of
+  // the matching steps on purpose: a line a sheet, legacy or future step wanted is theirs, and a notification only
+  // takes what is left. Same type and exact amount, one to one; the statement line is dated 1 day before to 5 days after
+  // the notification (NOTIF_DAYS_*), closest date first, then words in common. Equal amounts make the pairing a guess,
+  // which is harmless (both sides have the same amount, so the card total is right either way) and flagged tieBroken.
+  const notifs = rowStates(
+    (input.notifRows ?? []).filter((r) => !linked.has(r.id) && (r.sourceRef ?? '').startsWith(NOTIF_REF_PREFIX)),
+  );
+  if (notifs.length > 0) {
+    const pairsNotif: Array<{ row: RowState; state: LineState; days: number; shared: number }> = [];
+    for (const state of lines) {
+      if (state.status !== 'free' || (state.line.kind !== 'purchase' && state.line.kind !== 'refund')) continue;
+      for (const row of notifs) {
+        if (row.used || row.row.type !== state.line.type || row.cents !== state.cents) continue;
+        const after = signedDayDiff(row.row.date, state.line.date);
+        if (after < -NOTIF_DAYS_LINE_BEFORE || after > NOTIF_DAYS_LINE_AFTER) continue;
+        pairsNotif.push({ row, state, days: Math.abs(after), shared: sharedWordCount(row.words, state.words) });
+      }
+    }
+    const notifsOfLine = new Map<LineState, number>();
+    const linesOfNotif = new Map<RowState, number>();
+    for (const { row, state } of pairsNotif) {
+      notifsOfLine.set(state, (notifsOfLine.get(state) ?? 0) + 1);
+      linesOfNotif.set(row, (linesOfNotif.get(row) ?? 0) + 1);
+    }
+    pairsNotif.sort((a, b) => a.days - b.days || b.shared - a.shared || a.row.index - b.row.index || a.state.index - b.state.index);
+    for (const pair of pairsNotif) {
+      if (pair.row.used || pair.state.status !== 'free') continue;
+      propose('enrich-exact', [pair.state], pair.row, {
+        tieBroken: notifsOfLine.get(pair.state)! > 1 || linesOfNotif.get(pair.row)! > 1,
+        result: {
+          date: pair.state.line.date,
+          description: pair.state.line.memo,
+          notesAppend: clampText(`Notificação: ${pair.row.row.description}`, MAX_NOTES_APPEND),
+        },
+      });
+    }
+  }
+
   // 7. The rest of the OFX is new, one proposal per purchase (FITID). Advances left are information only.
   const leftovers = new Map<string, LineState[]>();
   for (const state of lines) {
@@ -1111,6 +1170,12 @@ function isChangedCopy(v: { row: StoredCardRow; fitids: string[] }, state: LineS
 function dayDistance(a: string, b: string): number {
   const toDay = (d: string) => Date.UTC(Number(d.slice(0, 4)), Number(d.slice(5, 7)) - 1, Number(d.slice(8, 10))) / 86_400_000;
   return Math.abs(toDay(a) - toDay(b));
+}
+
+/** Days from `from` to `to` (positive when `to` is later). */
+function signedDayDiff(from: string, to: string): number {
+  const toDay = (d: string) => Date.UTC(Number(d.slice(0, 4)), Number(d.slice(5, 7)) - 1, Number(d.slice(8, 10))) / 86_400_000;
+  return toDay(to) - toDay(from);
 }
 
 function compareIndexes(a: RowState[], b: RowState[]): number {
