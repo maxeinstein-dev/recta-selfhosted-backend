@@ -3,6 +3,7 @@ import { RecurrenceFrequency } from '../../shared/enums/index.js';
 import { localDateSchema } from '../../shared/utils/dateSchema.js';
 import { categoryNameSchema } from '../categories/categories.schema.js';
 import { isValidNonWorkingDay, normalizeNonWorkingDays, OPTIONAL_HOLIDAYS } from './br-calendar.js';
+import { aliasesSchema } from './recurring-aliases.js';
 import { FORECAST_STRATEGIES, MAX_CONSERVATIVE_WINDOW } from './expected-amount.js';
 
 /**
@@ -58,6 +59,7 @@ export const createRecurringTransactionSchema = z.object({
   safetyBusinessDays: safetyBusinessDaysSchema.default(0),
   nonWorkingDays: nonWorkingDaysSchema.default([]),
   optionalHolidays: optionalHolidaysSchema.default([]),
+  aliases: aliasesSchema.default([]),
 });
 
 export type CreateRecurringTransactionInput = z.infer<
@@ -85,6 +87,7 @@ export const updateRecurringTransactionSchema = z.object({
   safetyBusinessDays: safetyBusinessDaysSchema.optional(),
   nonWorkingDays: nonWorkingDaysSchema.optional(),
   optionalHolidays: optionalHolidaysSchema.optional(),
+  aliases: aliasesSchema.optional(),
 });
 
 export type UpdateRecurringTransactionInput = z.infer<

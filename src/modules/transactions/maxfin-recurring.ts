@@ -7,6 +7,7 @@
  */
 import { prisma } from '../../shared/db/prisma.js';
 import { normalizeDescription } from '../recurring-transactions/detect.js';
+import { recurrenceNameKeys } from '../recurring-transactions/recurring-aliases.js';
 import { anchorDayOf, dayString } from '../recurring-transactions/recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from '../recurring-transactions/recurring-follow.js';
 import { forecastBatch, isIncomeCategory, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
@@ -95,7 +96,7 @@ export async function loadRecurringMatcher(
 
   const recurrences = await prisma.recurringTransaction.findMany({
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
-    select: { id: true, accountId: true, description: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true,
+    select: { id: true, accountId: true, description: true, aliases: true, nextRunAt: true, startDate: true, endDate: true, followLastAmount: true, amount: true, competenceOffsetMonths: true,
       householdId: true, categoryName: true, forecastStrategy: true, forecastWindow: true, dailyRate: true, safetyBusinessDays: true, nonWorkingDays: true, optionalHolidays: true },
   });
   // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
@@ -118,21 +119,31 @@ export async function loadRecurringMatcher(
     for (const t of present) if (t.recurringTransactionId) occupied.add(t.recurringTransactionId);
   }
 
-  const pools = new Map<string, RecurringMatch[]>();
-  const push = (accountId: string, description: string | null, match: RecurringMatch) => {
-    const key = normalizeDescription(description);
-    if (!key) return;
-    const id = `${accountId}|${key}`;
-    const list = pools.get(id) ?? [];
-    list.push(match);
-    pools.set(id, list);
+  // A match is keyed by every name its recurrence answers to (description and aliases) but serves one row only.
+  type Slot = { match: RecurringMatch; taken: boolean };
+  const pools = new Map<string, Slot[]>();
+  const push = (accountId: string, names: Set<string>, match: RecurringMatch) => {
+    const slot: Slot = { match, taken: false };
+    for (const key of names) {
+      const id = `${accountId}|${key}`;
+      const list = pools.get(id) ?? [];
+      list.push(slot);
+      pools.set(id, list);
+    }
   };
+  // Aliases of the recurrences that generated the month's transactions (they may not be in the `due` window)
+  const aliasesOf = new Map<string, string[]>(recurrences.map((r) => [r.id, r.aliases ?? []]));
+  const missing = [...new Set(generated.map((t) => t.recurringTransactionId).filter((id): id is string => !!id && !aliasesOf.has(id)))];
+  if (missing.length > 0) {
+    const extra = await prisma.recurringTransaction.findMany({ where: { householdId, id: { in: missing } }, select: { id: true, aliases: true } });
+    for (const r of extra) aliasesOf.set(r.id, r.aliases ?? []);
+  }
 
   [...generated]
     .sort((a, b) => dayString(a.date).localeCompare(dayString(b.date)) || a.id.localeCompare(b.id))
     .forEach((t) => {
       if (!t.accountId || !t.recurringTransactionId) return;
-      push(t.accountId, t.description, {
+      push(t.accountId, recurrenceNameKeys(t.description, aliasesOf.get(t.recurringTransactionId)), {
         kind: 'generated',
         transactionId: t.id,
         recurringId: t.recurringTransactionId,
@@ -149,7 +160,7 @@ export async function loadRecurringMatcher(
       const nextRun = dayString(r.nextRunAt);
       const endDate = r.endDate ? dayString(r.endDate) : null;
       if (endDate && endDate < nextRun) return;
-      push(r.accountId, r.description, {
+      push(r.accountId, recurrenceNameKeys(r.description, r.aliases), {
         kind: 'recurrence',
         transactionId: null,
         recurringId: r.id,
@@ -167,9 +178,11 @@ export async function loadRecurringMatcher(
   return {
     take(accountId, description) {
       const list = pools.get(`${accountId}|${normalizeDescription(description)}`);
-      if (!list || list.length === 0) return undefined;
+      const slot = list?.find((s) => !s.taken);
+      if (!slot) return undefined;
+      slot.taken = true;
       // Generated transactions were pushed first, so they win over recurrences that have not run.
-      return list.shift();
+      return slot.match;
     },
   };
 }
