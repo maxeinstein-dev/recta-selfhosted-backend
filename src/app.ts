@@ -30,6 +30,7 @@ import { notificationRoutes } from './modules/notifications/index.js';
 import { dashboardRoutes } from './modules/dashboard/index.js';
 import { deviceRoutes } from './modules/devices/index.js';
 import { captureRoutes } from './modules/captures/index.js';
+import { buildCommit } from './shared/utils/buildInfo.js';
 import { organizeRoutes, peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
@@ -72,6 +73,7 @@ export async function buildApp(): Promise<FastifyInstance> {
             status: { type: 'string', example: 'ok' },
             timestamp: { type: 'string', format: 'date-time' },
             uptime: { type: 'number', description: 'Server uptime in seconds' },
+            commit: { type: 'string', nullable: true, description: 'Short hash of the deployed commit, when the host provides it' },
           },
         },
       },
@@ -81,6 +83,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       status: 'ok',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
+      commit: buildCommit(),
     });
   });
   console.log('✅ Health check endpoint registered at /health');
