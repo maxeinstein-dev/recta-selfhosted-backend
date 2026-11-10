@@ -28,6 +28,8 @@ import { recurringTransactionRoutes } from './modules/recurring-transactions/ind
 import { feedbackRoutes } from './modules/feedback/index.js';
 import { notificationRoutes } from './modules/notifications/index.js';
 import { dashboardRoutes } from './modules/dashboard/index.js';
+import { deviceRoutes } from './modules/devices/index.js';
+import { captureRoutes } from './modules/captures/index.js';
 import { organizeRoutes, peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
@@ -127,6 +129,8 @@ export async function buildApp(): Promise<FastifyInstance> {
         { name: 'Recurring Transactions', description: 'Recurring transaction endpoints' },
         { name: 'Feedback', description: 'User feedback endpoints' },
         { name: 'People', description: 'People, shared expenses, balances and settlements' },
+        { name: 'Devices', description: 'Device tokens for the Android capture app' },
+        { name: 'Captures', description: 'Raw bank notification intake from the Android app' },
       ],
     },
   });
@@ -320,6 +324,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(feedbackRoutes, { prefix: '/feedback' });
   await app.register(notificationRoutes, { prefix: '/notifications' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });
+  await app.register(deviceRoutes, { prefix: '/devices' });
+  await app.register(captureRoutes, { prefix: '/captures' });
 
   return app;
 }

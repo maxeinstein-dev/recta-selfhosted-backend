@@ -341,6 +341,19 @@ For data that came from the monthly sheet importer, which keeps free-text notes 
 
 To undo the migration `20261005120000_add_people_and_shares` (the shares, settlements and people are lost): `DROP TABLE settlements, transaction_shares, person_aliases, people; DROP TYPE "SettlementDirection", "ShareDirection";`, delete the folder and, if it was applied through Prisma, `npx prisma migrate resolve --rolled-back 20261005120000_add_people_and_shares`.
 
+## Notification captures (Android app intake)
+
+An Android app reads bank push notifications and sends their raw text here. This part only **stores** them; reading amounts out of the text and turning them into transactions comes later. Captures are kept as received (`status` `PENDING`, `parsed` null) in `captured_notifications`.
+
+**Device token.** The app does not use the user's login token (it expires and the background service would stop silently). It uses a device token, `rdt_` + 32 random bytes in base64url, that works **only** on `POST /captures`, is tied to one user and one household, and can be revoked. Only its SHA-256 is stored; the token is shown once, in the response that creates it. A device token is refused by every other route, and a user JWT is refused by `POST /captures`. On each capture the API checks that the token is not revoked and that its user is still an EDITOR or OWNER of the household (401 for an unknown or revoked token, 403 otherwise); `last_used_at` is refreshed at most once a minute.
+
+- `POST /devices` (user login, EDITOR+): body `{ name, householdId? }` (the personal household when omitted). Answers 201 with `{ id, name, householdId, createdAt, token }`. Keep the `token`: it cannot be read again.
+- `GET /devices` (user login): the caller's devices (`id`, `name`, `householdId`, `lastUsedAt`, `revokedAt`, `createdAt`), never the token or its hash.
+- `DELETE /devices/:id` (user login, owner of the device): revokes it. Repeating it is fine and keeps the first `revokedAt`; someone else's device is a 404.
+- `POST /captures` (device token, `Authorization: Bearer rdt_...`): body `{ items: [{ package, title?, text, postedAt }] }`, 1 to 50 items. `package` up to 150 characters, `title` up to 300, `text` 1 to 2000, `postedAt` an ISO 8601 date-time **with** a zone; NUL characters are a 400, and one invalid item rejects the whole request. The household and user come from the token, never from the body. Each item gets `dedupKey = sha1(package | postedAt cut to the minute (UTC ISO) | title or '' | text)`; an item whose key already exists in the household (earlier request, another request at the same time, or earlier in the same batch) is not an error: the answer is always `200 { success: true, data: { results: [{ dedupKey, status: 'created' | 'duplicate' }] } }`, in input order, so the app can retry a whole queue safely. Limited to 120 requests a minute per token.
+
+Migration `20261109120000_add_capture_intake` is additive (three tables and the `CaptureStatus` enum). The third table, `capture_account_rules`, maps an app and a kind of capture to a Recta account; it has no routes yet. To undo it (captures and devices are lost): `DROP TABLE capture_account_rules, captured_notifications, device_tokens; DROP TYPE "CaptureStatus";`, delete the folder and, if it was applied through Prisma, `npx prisma migrate resolve --rolled-back 20261109120000_add_capture_intake`.
+
 ## Project structure
 
 ```

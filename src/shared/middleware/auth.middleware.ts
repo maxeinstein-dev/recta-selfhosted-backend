@@ -61,6 +61,12 @@ export function authMiddleware(options: { requireEmailVerified?: boolean } = {})
       throw new UnauthorizedError('Bearer token required');
     }
 
+    // Device tokens (rdt_...) only work on POST /captures, through their own hook. Refuse them here explicitly
+    // instead of relying on the JWT/Firebase check failing.
+    if (token.startsWith('rdt_')) {
+      throw new InvalidTokenError();
+    }
+
     // Local mode: verify self-signed JWT, skip Firebase and email_verified
     if (isLocalAuth) {
       const payload = verifyJwt(token);
