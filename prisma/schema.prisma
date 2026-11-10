@@ -439,6 +439,9 @@ model RecurringTransaction {
   safetyBusinessDays Int           @default(0) @map("safety_business_days")
   nonWorkingDays String[]          @default([]) @map("non_working_days")
   optionalHolidays String[]        @default([]) @map("optional_holidays")
+  // Other names the bank or the card machine uses for this charge ("Pg *Motoseguro Conecta"): an imported transaction
+  // whose normalized description equals the name or one alias is taken by the recurrence instead of duplicated.
+  aliases      String[]            @default([]) @map("aliases")
   createdAt    DateTime            @default(now()) @map("created_at")
   updatedAt    DateTime            @updatedAt @map("updated_at")
 

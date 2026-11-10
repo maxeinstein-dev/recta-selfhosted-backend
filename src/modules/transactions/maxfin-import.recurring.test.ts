@@ -382,6 +382,31 @@ describe('preview: the sheet takes over a recurrence', () => {
   });
 });
 
+describe('preview: aliases of a recurrence', () => {
+  it('a sheet row named after an alias takes over the recurrence, and serves one row only', async () => {
+    seedRecurrence({ householdId: HH, accountId: BILLS, description: 'Seguro Alfa', amount: 90, nextRunAt: '2026-10-05', aliases: ['Pg *Seguro Alfa Conecta'] });
+    const preview = await previewCsv({ bills: [['Pg *Seguro Alfa Conecta', 'Casa', 87.4], ['Seguro Alfa', 'Casa', 87.4]] });
+    expect(rowNamed(preview, 'Pg *Seguro Alfa Conecta').status).toBe('matches-recurring');
+    expect(rowNamed(preview, 'Seguro Alfa').status).toBe('new');
+  });
+
+  it('a generated occurrence is also found through the alias of its recurrence', async () => {
+    const rec = seedRecurrence({ householdId: HH, accountId: BILLS, description: 'Seguro Alfa', amount: 90, nextRunAt: '2026-11-05', aliases: ['Seguro Alfa Conecta'] });
+    const tx = generated(rec.id, { description: 'Seguro Alfa', amount: 90 });
+    const row = rowNamed(await previewCsv({ bills: [['Seguro Alfa Conecta', 'Casa', 87.4]] }), 'Seguro Alfa Conecta');
+    expect(row).toMatchObject({ status: 'matches-recurring', existingTransactionId: tx.id });
+  });
+
+  it('keeps the rules: an alias does not make an income recurrence, an installment or another account match', async () => {
+    seedRecurrence({ householdId: HH, accountId: DEBIT, description: 'Vale', amount: 600, nextRunAt: '2026-10-25', categoryName: 'SALARY', aliases: ['Vale Alimentacao'] });
+    seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Curso', amount: 100, nextRunAt: '2026-10-05', aliases: ['Curso Online'] });
+    const preview = await previewCsv({ debit: [['Vale Alimentacao', 'Lazer', 23.5]], credit: [['Curso Online 2/6', 'Educação', 100]], bills: [['Curso Online', 'Casa', 100]] });
+    expect(rowNamed(preview, 'Vale Alimentacao', 'debit').status).toBe('new');
+    expect(rowNamed(preview, 'Curso Online 2/6').status).toBe('new');
+    expect(rowNamed(preview, 'Curso Online', 'bills').status).toBe('new');
+  });
+});
+
 describe('confirm: the sheet takes over', () => {
   it('requires replace: true, like replaces-future: without it the row is skipped with a warning and nothing changes', async () => {
     const rec = energyRecurrence();

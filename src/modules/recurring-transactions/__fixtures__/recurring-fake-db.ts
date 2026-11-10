@@ -21,7 +21,7 @@ const SPECS: Record<string, { unique: string[][]; defaults: () => Record<string,
   recurringTransaction: {
     unique: [],
     defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY', competenceOffsetMonths: null,
-      forecastStrategy: 'LAST', forecastWindow: null, dailyRate: null, safetyBusinessDays: 0, nonWorkingDays: [], optionalHolidays: [] }),
+      forecastStrategy: 'LAST', forecastWindow: null, dailyRate: null, safetyBusinessDays: 0, nonWorkingDays: [], optionalHolidays: [], aliases: [] }),
   },
   account: { unique: [], defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING', name: 'Conta' }) },
   category: { unique: [], defaults: () => ({}) },
@@ -331,6 +331,7 @@ export interface SeedRecurrence {
   safetyBusinessDays?: number;
   nonWorkingDays?: string[];
   optionalHolidays?: string[];
+  aliases?: string[];
 }
 
 export function seedRecurrence(data: SeedRecurrence): Row {

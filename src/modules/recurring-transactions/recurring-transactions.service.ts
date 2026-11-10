@@ -9,6 +9,8 @@ import { expectedAmountFor, normalizeStrategy } from './expected-amount.js';
 import { assertForecastConsistent, forecastInputOf, forecastBatch, isIncomeCategory, loadConfirmedHistory, referenceMonthOf } from './recurring-forecast.js';
 import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
+import { normalizeDescription } from './detect.js';
+import { recurrenceNameKeys } from './recurring-aliases.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
 import type {
   CreateRecurringTransactionInput,
@@ -110,6 +112,7 @@ export async function createRecurringTransaction(
     safetyBusinessDays,
     nonWorkingDays,
     optionalHolidays,
+    aliases,
   } = input;
 
   assertForecastConsistent({ forecastStrategy, dailyRate: dailyRate ?? null, frequency });
@@ -153,6 +156,7 @@ export async function createRecurringTransaction(
       safetyBusinessDays,
       nonWorkingDays,
       optionalHolidays,
+      aliases,
     },
     include: {
       account: {
@@ -364,6 +368,7 @@ export async function updateRecurringTransaction(
       ...(input.safetyBusinessDays !== undefined && { safetyBusinessDays: input.safetyBusinessDays }),
       ...(input.nonWorkingDays !== undefined && { nonWorkingDays: input.nonWorkingDays }),
       ...(input.optionalHolidays !== undefined && { optionalHolidays: input.optionalHolidays }),
+      ...(input.aliases !== undefined && { aliases: input.aliases }),
     },
     include: {
       account: {
@@ -544,6 +549,46 @@ export async function executeRecurringTransaction(
           data: { lastRunDate: transactionDate, nextRunAt },
         });
         return { transaction: existing, nextRunAt, skipped: true as boolean };
+      }
+
+      // The month holds no occurrence of this recurrence, but an import may already have brought the charge (sheet,
+      // card statement, notification) without the link. Adopt the oldest such row instead of creating a duplicate:
+      // same household and account, same type, inside the month, unlinked, imported (has a sourceRef; a hand-typed
+      // row is never taken), and a normalized description equal to the recurrence name or one of its aliases. The
+      // amount is not a criterion and the row is not changed apart from the link. The link is conditional (still
+      // unlinked): a writer that does not take this lock cannot be adopted twice, and the next candidate is tried.
+      const names = recurrenceNameKeys(recurring.description, recurring.aliases);
+      if (names.size > 0) {
+        const candidates = await tx.transaction.findMany({
+          where: {
+            householdId,
+            accountId: recurring.accountId,
+            type: transactionType,
+            recurringTransactionId: null,
+            sourceRef: { not: null },
+            date: { gte: start, lt: end },
+          },
+          orderBy: [{ date: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+          select: { id: true, description: true },
+        });
+        for (const candidate of candidates) {
+          if (!names.has(normalizeDescription(candidate.description))) continue;
+          const linked = await tx.transaction.updateMany({
+            where: { id: candidate.id, householdId, recurringTransactionId: null },
+            data: { recurringTransactionId: recurring.id },
+          });
+          if (linked.count !== 1) continue;
+          const adopted = await tx.transaction.findFirst({
+            where: { id: candidate.id, householdId },
+            include: { account: { select: { id: true, name: true, type: true } } },
+          });
+          const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency, anchorDay);
+          await tx.recurringTransaction.update({
+            where: { id: recurringId },
+            data: { lastRunDate: transactionDate, nextRunAt },
+          });
+          return { transaction: adopted!, nextRunAt, skipped: true as boolean };
+        }
       }
     }
 
