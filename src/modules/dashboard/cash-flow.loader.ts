@@ -21,30 +21,70 @@ export interface InvoiceSnapshot {
   forecast: { applicable: boolean; total: number };
 }
 
-export interface InvoiceEventResult {
-  /** Whole cents still to leave the payer account for this invoice; never positive-zero (null = no event). */
+export interface InvoiceSettlement {
+  /** 'YYYY-MM' of the invoice the payment is attributed to (the last one of an overdue group). */
+  month: string;
+  /** Day the payment is due; null when the card has no due day. Before today for the overdue group. */
+  dueDate: string | null;
+  /** Whole cents leaving the payer account; always above one cent. */
   amountCents: number;
   certainty: 'confirmed' | 'estimated';
-  /** Day the payment is due; null when the card has no due day. */
-  dueDate: string | null;
+  overdue: boolean;
+}
+
+/** What one invoice adds to the card's debt on its own: posted, plus the forecast while open, minus what was paid on it. */
+export function invoiceOwnCents(data: InvoiceSnapshot): number {
+  const forecastCents = data.state === 'open' && data.forecast.applicable ? toCents(data.forecast.total) : 0;
+  return toCents(data.statementTotal) + forecastCents - toCents(data.currentPayments);
 }
 
 /**
- * What one invoice takes out of the payer account, or null when it takes nothing:
- * - a paid invoice, an invoice with credit (refunds above purchases) and a one-cent residue generate no event;
- * - closed: what is posted still owed (the debt the invoice route shows for it);
- * - open or future: posted plus what the recurrences will still add before closing, minus what was already paid;
- * - only the FIRST invoice walked carries `outstandingFromPrevious` (debt of older invoices that no later call covers);
- *   the later ones would count it a second time, since the walk gives each of them its own event.
+ * Turns the invoices of ONE card, walked in chronological order, into the payments that leave the payer account.
+ * The debt is carried from one invoice to the next, so credit and debt offset each other:
+ * - the starting debt is the `outstandingFromPrevious` of the FIRST invoice, and only that one. The later invoices carry
+ *   the same figure but it is clamped at zero by the invoice route (it drops a credit) and it repeats invoices the walk
+ *   already adds one by one, so reading it again would count the past twice and lose the credits;
+ * - invoice after invoice the carry grows by the invoice's own amount (`invoiceOwnCents`);
+ * - a paid invoice means the card owes nothing up to it (the route computes that with the earlier invoices): the carry resets;
+ * - invoices due before today are summed together and give at most ONE overdue payment, today, when the net is above one
+ *   cent; a net credit (or a one-cent residue) is not a payment and moves on to the next invoice, reducing its payment;
+ * - any other invoice settles on its own due date when the carry is above one cent, and the carry returns to zero; a
+ *   credit left at the end of the walk pays nothing (it is not income).
  */
-export function invoiceEventOf(data: InvoiceSnapshot, isFirst: boolean): InvoiceEventResult | null {
-  if (data.state === 'paid') return null;
-  const forecastCents = data.state === 'open' && data.forecast.applicable ? toCents(data.forecast.total) : 0;
-  const carriedCents = isFirst ? toCents(data.outstandingFromPrevious) : 0;
-  const amountCents = carriedCents + toCents(data.statementTotal) + forecastCents - toCents(data.currentPayments);
-  // One-cent residues of summed decimals are not a debt (same rule as the invoice route)
-  if (amountCents <= 1) return null;
-  return { amountCents, certainty: data.state === 'open' ? 'estimated' : 'confirmed', dueDate: data.dueDate };
+export function settleInvoices(walk: ReadonlyArray<{ month: string; data: InvoiceSnapshot }>, today: string): InvoiceSettlement[] {
+  const out: InvoiceSettlement[] = [];
+  let carry = walk.length > 0 ? toCents(walk[0]!.data.outstandingFromPrevious) : 0;
+  let overdueLast: { month: string; dueDate: string | null } | null = null;
+
+  const settle = (month: string, dueDate: string | null, certainty: 'confirmed' | 'estimated', overdue: boolean): void => {
+    if (carry > 1) {
+      out.push({ month, dueDate, amountCents: carry, certainty, overdue });
+      carry = 0;
+    } else if (carry >= 0) {
+      carry = 0; // a one-cent residue is not a debt; a credit (below zero) stays for the next invoice
+    }
+  };
+
+  for (const { month, data } of walk) {
+    if (data.state === 'paid') {
+      carry = 0;
+      overdueLast = null;
+      continue;
+    }
+    const overdue = data.dueDate !== null && data.dueDate < today;
+    if (!overdue && overdueLast) {
+      settle(overdueLast.month, overdueLast.dueDate, 'confirmed', true);
+      overdueLast = null;
+    }
+    carry += invoiceOwnCents(data);
+    if (overdue) {
+      overdueLast = { month, dueDate: data.dueDate };
+      continue;
+    }
+    settle(month, data.dueDate, data.state === 'open' ? 'estimated' : 'confirmed', false);
+  }
+  if (overdueLast) settle(overdueLast.month, overdueLast.dueDate, 'confirmed', true);
+  return out;
 }
 
 export interface CashFlowParams {
@@ -224,17 +264,19 @@ async function invoiceEvents(
         : (lastPayerOfCard.get(card.id) && cashIds.has(lastPayerOfCard.get(card.id)!) ? lastPayerOfCard.get(card.id)! : null);
     if (payer && !scopeIds.has(payer)) continue;
 
-    for (let month = firstMonth, first = true; month <= lastMonth; month = addMonthKey(month, 1), first = false) {
+    const walk: Array<{ month: string; data: InvoiceSnapshot }> = [];
+    for (let month = firstMonth; month <= lastMonth; month = addMonthKey(month, 1)) {
       const { data } = await calculateCreditCardInvoice(card.id, month, householdId, { limit: 1 }, { today: todayDate });
-      const result = invoiceEventOf(data, first);
-      if (!result) continue;
+      walk.push({ month, data });
+    }
+    for (const result of settleInvoices(walk, today)) {
       if (result.dueDate === null) {
-        unassigned.push({ accountId: card.id, accountName: card.name, month, dueDate: null, amountCents: result.amountCents, reason: 'no_due_date' });
+        unassigned.push({ accountId: card.id, accountName: card.name, month: result.month, dueDate: null, amountCents: result.amountCents, reason: 'no_due_date' });
         continue;
       }
       if (result.dueDate > end) continue; // due after the period
       if (!payer) {
-        unassigned.push({ accountId: card.id, accountName: card.name, month, dueDate: result.dueDate, amountCents: result.amountCents, reason: 'no_payer_account' });
+        unassigned.push({ accountId: card.id, accountName: card.name, month: result.month, dueDate: result.dueDate, amountCents: result.amountCents, reason: 'no_payer_account' });
         continue;
       }
       events.push({
@@ -243,10 +285,10 @@ async function invoiceEvents(
         amountCents: -result.amountCents,
         source: 'invoice',
         certainty: result.certainty,
-        overdue: result.dueDate < today,
+        overdue: result.overdue,
         sourceId: card.id,
         accountId: payer,
-        invoiceMonth: month,
+        invoiceMonth: result.month,
       });
     }
   }

@@ -14,7 +14,7 @@ vi.mock('../transactions/transactions.service.js', () => ({
   utcToday: () => new Date(Date.UTC(2026, 10, 10)),
 }));
 
-import { loadCashFlow, invoiceEventOf, type InvoiceSnapshot } from './cash-flow.loader.js';
+import { loadCashFlow, settleInvoices, type InvoiceSnapshot } from './cash-flow.loader.js';
 
 // Invented data only. Today is 2026-11-10.
 const TODAY = new Date(Date.UTC(2026, 10, 10));
@@ -104,7 +104,7 @@ function setup(s: Setup = {}) {
     return [];
   });
   invoice.calculate.mockImplementation(async (cardId: string, month: string) => ({
-    data: (s.invoices ?? {})[`${cardId}:${month}`] ?? snap({ state: 'paid' }),
+    data: (s.invoices ?? {})[`${cardId}:${month}`] ?? snap(),
   }));
 }
 
@@ -115,37 +115,107 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe('invoiceEventOf', () => {
-  it('a paid invoice generates no event', () => {
-    expect(invoiceEventOf(snap({ state: 'paid', statementTotal: 500, currentPayments: 0 }), true)).toBeNull();
-  });
+const walkOf = (...items: Array<[string, InvoiceSnapshot]>) => items.map(([month, data]) => ({ month, data }));
+const T = '2026-11-10';
 
-  it('an invoice with credit (refunds above purchases) generates nothing', () => {
-    expect(invoiceEventOf(snap({ statementTotal: -120.5 }), true)).toBeNull();
-    expect(invoiceEventOf(snap({ state: 'open', statementTotal: -20, forecast: { applicable: true, total: 5 } }), false)).toBeNull();
+describe('settleInvoices', () => {
+  it('a paid invoice generates no event', () => {
+    expect(settleInvoices(walkOf(['2026-11', snap({ state: 'paid', statementTotal: 500, currentPayments: 0 })]), T)).toEqual([]);
   });
 
   it('closed: what is still owed, confirmed; partial payments come off', () => {
-    expect(invoiceEventOf(snap({ statementTotal: 800, currentPayments: 300 }), false)).toEqual({ amountCents: 50000, certainty: 'confirmed', dueDate: '2026-11-18' });
+    expect(settleInvoices(walkOf(['2026-11', snap({ statementTotal: 800, currentPayments: 300 })]), T)).toEqual([
+      { month: '2026-11', dueDate: '2026-11-18', amountCents: 50000, certainty: 'confirmed', overdue: false },
+    ]);
   });
 
   it('open: posted plus the forecast, estimated', () => {
-    expect(invoiceEventOf(snap({ state: 'open', statementTotal: 400, forecast: { applicable: true, total: 150.1 } }), false)).toEqual({
-      amountCents: 55010,
-      certainty: 'estimated',
-      dueDate: '2026-11-18',
-    });
+    const out = settleInvoices(walkOf(['2026-12', snap({ state: 'open', statementTotal: 400, forecast: { applicable: true, total: 150.1 }, dueDate: '2026-12-18' })]), T);
+    expect(out).toEqual([{ month: '2026-12', dueDate: '2026-12-18', amountCents: 55010, certainty: 'estimated', overdue: false }]);
   });
 
-  it('only the first invoice of the walk carries the debt of earlier ones', () => {
-    const data = snap({ statementTotal: 800, outstandingFromPrevious: 200 });
-    expect(invoiceEventOf(data, true)?.amountCents).toBe(100000);
-    expect(invoiceEventOf(data, false)?.amountCents).toBe(80000);
+  it('an invoice with credit alone generates nothing, and a credit left at the end pays nothing (no income)', () => {
+    expect(settleInvoices(walkOf(['2026-11', snap({ statementTotal: -120.5 })], ['2026-12', snap({ state: 'open', statementTotal: -20, dueDate: '2026-12-18' })]), T)).toEqual([]);
   });
 
   it('a one-cent residue is not a debt', () => {
-    expect(invoiceEventOf(snap({ statementTotal: 0.01 }), true)).toBeNull();
-    expect(invoiceEventOf(snap({ statementTotal: 0.02 }), true)?.amountCents).toBe(2);
+    expect(settleInvoices(walkOf(['2026-11', snap({ statementTotal: 0.01 })]), T)).toEqual([]);
+    expect(settleInvoices(walkOf(['2026-11', snap({ statementTotal: 0.02 })]), T)).toHaveLength(1);
+  });
+
+  it('the debt from before the walk comes only from the first invoice (the later ones repeat it and would count it twice)', () => {
+    const out = settleInvoices(
+      walkOf(
+        ['2026-11', snap({ statementTotal: 300, outstandingFromPrevious: 200 })],
+        ['2026-12', snap({ statementTotal: 400, outstandingFromPrevious: 200, dueDate: '2026-12-18' })],
+      ),
+      T,
+    );
+    expect(out.map((o) => o.amountCents)).toEqual([50000, 40000]);
+  });
+
+  it('invoices due before today are summed into ONE overdue payment, today', () => {
+    const out = settleInvoices(
+      walkOf(['2026-09', snap({ statementTotal: 300, dueDate: '2026-09-28' })], ['2026-10', snap({ statementTotal: 200, dueDate: '2026-10-28' })], ['2026-11', snap({ statementTotal: 50 })]),
+      T,
+    );
+    expect(out).toEqual([
+      { month: '2026-10', dueDate: '2026-10-28', amountCents: 50000, certainty: 'confirmed', overdue: true },
+      { month: '2026-11', dueDate: '2026-11-18', amountCents: 5000, certainty: 'confirmed', overdue: false },
+    ]);
+  });
+
+  it('a credit and a debt among the overdue invoices offset each other: no phantom overdue payment', () => {
+    // previous invoice closed at 500 with 400 paid (100 left); the next had a 100 refund, was paid in full and is also overdue
+    const out = settleInvoices(
+      walkOf(
+        ['2026-09', snap({ statementTotal: 500, currentPayments: 400, dueDate: '2026-10-05' })],
+        ['2026-10', snap({ statementTotal: 200, currentPayments: 300, outstandingFromPrevious: 100, dueDate: '2026-10-28' })],
+      ),
+      T,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('same case where the second invoice is not marked paid by the route: the credit still cancels the debt', () => {
+    const out = settleInvoices(
+      walkOf(
+        ['2026-09', snap({ statementTotal: 500, currentPayments: 400, dueDate: '2026-10-05' })],
+        ['2026-10', snap({ statementTotal: -100, outstandingFromPrevious: 100, dueDate: '2026-10-28' })],
+      ),
+      T,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('a paid invoice right after an overdue one settles it (no phantom overdue payment even if the second is due later)', () => {
+    const out = settleInvoices(
+      walkOf(['2026-10', snap({ statementTotal: 500, currentPayments: 400, dueDate: '2026-11-05' })], ['2026-11', snap({ state: 'paid', statementTotal: 200, currentPayments: 300, outstandingFromPrevious: 100 })]),
+      T,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('a net credit of the overdue group is carried and reduces the next invoice payment', () => {
+    const out = settleInvoices(
+      walkOf(['2026-10', snap({ statementTotal: -100, dueDate: '2026-10-28' })], ['2026-11', snap({ statementTotal: 300 })]),
+      T,
+    );
+    expect(out).toEqual([{ month: '2026-11', dueDate: '2026-11-18', amountCents: 20000, certainty: 'confirmed', overdue: false }]);
+  });
+
+  it('a credit is carried across future invoices until a debt uses it', () => {
+    const out = settleInvoices(
+      walkOf(['2026-11', snap({ statementTotal: -50 })], ['2026-12', snap({ state: 'open', statementTotal: 120, dueDate: '2026-12-18', forecast: { applicable: true, total: 30 } })]),
+      T,
+    );
+    expect(out.map((o) => [o.month, o.amountCents])).toEqual([['2026-12', 10000]]);
+  });
+
+  it('a card without a due day keeps the chain and surfaces the payment with a null due date', () => {
+    expect(settleInvoices(walkOf(['2026-11', snap({ statementTotal: 700, dueDate: null })]), T)).toEqual([
+      { month: '2026-11', dueDate: null, amountCents: 70000, certainty: 'confirmed', overdue: false },
+    ]);
   });
 });
 
@@ -394,6 +464,35 @@ describe('loadCashFlow: invoices', () => {
     // 2026-10 .. 2027-05 = 8 months
     expect(invoice.calculate).toHaveBeenCalledTimes(8);
     expect(invoice.calculate.mock.calls[0]).toEqual([CARD_A, '2026-10', HH, { limit: 1 }, { today: TODAY }]);
+  });
+
+  it('credit and debt of different invoices offset each other: no phantom overdue invoice (card owes nothing)', async () => {
+    // Invented: last month's invoice closed at 500 with 400 paid (100 left, overdue); this month's had a 100 refund and was
+    // paid in full (statement 200, paid 300): the route flags it paid because the card owes nothing in total.
+    setup({
+      accounts: cards,
+      invoices: {
+        [`${CARD_A}:2026-10`]: snap({ statementTotal: 500, currentPayments: 400, dueDate: '2026-11-05' }),
+        [`${CARD_A}:2026-11`]: snap({ state: 'paid', statementTotal: 200, currentPayments: 300, outstandingFromPrevious: 100, dueDate: '2026-11-28' }),
+      },
+    });
+    const out = await run({ days: 60 });
+    expect(flat(out)).toEqual([]);
+    expect(out.summary.endingBalance).toBe(1000);
+  });
+
+  it('the overdue invoices become one payment today and a later credit is not income', async () => {
+    setup({
+      accounts: cards,
+      invoices: {
+        [`${CARD_A}:2026-10`]: snap({ statementTotal: 300, dueDate: '2026-11-03' }),
+        [`${CARD_A}:2026-11`]: snap({ statementTotal: 200, dueDate: '2026-11-05' }),
+        [`${CARD_A}:2026-12`]: snap({ state: 'open', statementTotal: -900, dueDate: '2026-12-18' }),
+      },
+    });
+    const out = await run({ days: 60 });
+    expect(flat(out).map((e) => [e.date, e.amount, e.overdue])).toEqual([['2026-11-10', -500, true]]);
+    expect(out.summary.totalInflow).toBe(0);
   });
 
   it('an inactive linked account falls back to the last payment', async () => {
