@@ -9,7 +9,7 @@ import { prisma } from '../../shared/db/prisma.js';
 import { normalizeDescription } from '../recurring-transactions/detect.js';
 import { anchorDayOf, dayString } from '../recurring-transactions/recurring-dates.js';
 import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from '../recurring-transactions/recurring-follow.js';
-import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
+import { forecastBatch, isIncomeCategory, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
 import type { MaxFinInstallment, MaxFinSectionKey } from './parsers/maxfin.types.js';
 
 export type RecurringMatch =
@@ -101,7 +101,12 @@ export async function loadRecurringMatcher(
   // A recurrence whose next run is farther than today + 31 days is not this month's charge yet (same limit as
   // followLastAmountInTx): a sheet of a far future month must not consume it.
   const limit = plusDays(now, FOLLOW_LOOKAHEAD_DAYS);
-  const due = recurrences.filter((r) => inMonth(dayString(r.nextRunAt), monthKey) && dayString(r.nextRunAt) <= limit);
+  const inWindow = recurrences.filter((r) => inMonth(dayString(r.nextRunAt), monthKey) && dayString(r.nextRunAt) <= limit);
+  // Only expense rows are matched (eligibleForRecurring), so an INCOME recurrence is never a candidate: a salary or
+  // allowance and an expense paid from the same account can share a description, and the expense must not consume the
+  // income's occurrence. A recurrence carries no type of its own: its category decides, as when it runs.
+  const income = await Promise.all(inWindow.map((r) => isIncomeCategory(prisma, householdId, r.categoryName)));
+  const due = inWindow.filter((_, i) => !income[i]);
   // The amount a recurrence is EXPECTED to carry for the month the occurrence counts for (its strategy decides), not the stored one
   const expected = await forecastBatch(prisma, due);
   const occupied = new Set<string>();
