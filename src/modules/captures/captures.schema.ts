@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import { localDateSchema } from '../../shared/utils/dateSchema.js';
+import { categoryNameSchema } from '../categories/categories.schema.js';
+import { competenceMonthSchema } from '../transactions/transactions.schema.js';
 
 export const MAX_CAPTURE_ITEMS = 50;
 
@@ -21,3 +24,71 @@ export const createCapturesSchema = z.object({
 
 export type CaptureItemInput = z.infer<typeof captureItemSchema>;
 export type CreateCapturesInput = z.infer<typeof createCapturesSchema>;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Drafts: the web app lists captures, confirms them as transactions, dismisses them and maps apps to accounts.
+// ---------------------------------------------------------------------------------------------------------------
+
+export const CAPTURE_STATUSES = ['PENDING', 'CONFIRMED', 'DISMISSED', 'IGNORED'] as const;
+export const CAPTURE_KINDS = ['CARD_PURCHASE', 'PIX_OUT', 'PIX_IN', 'REFUND', 'SAVINGS_MOVE'] as const;
+export const MAX_ACCOUNT_RULES = 100;
+
+export type CaptureStatusValue = (typeof CAPTURE_STATUSES)[number];
+export type CaptureKind = (typeof CAPTURE_KINDS)[number];
+
+const householdQuery = { householdId: z.string().uuid().optional() }; // omitted: the personal household
+
+export const captureIdParamSchema = z.object({ id: z.string().uuid() });
+
+export const listCapturesQuerySchema = z.object({
+  ...householdQuery,
+  status: z.enum(CAPTURE_STATUSES).default('PENDING'),
+  cursor: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+export const countCapturesQuerySchema = z.object({
+  ...householdQuery,
+  status: z.enum(CAPTURE_STATUSES).default('PENDING'),
+});
+
+export const captureActionQuerySchema = z.object(householdQuery);
+
+/**
+ * What the client may correct when it confirms a capture. A subset of createTransactionSchema on purpose: only plain
+ * INCOME/EXPENSE rows (no transfers, allocations, splits, recurrences, installments) and no sourceRef, which the
+ * server sets from the capture. Unknown keys are a 400 instead of being dropped, so nothing the user typed is lost.
+ */
+export const confirmCaptureSchema = z.object({
+  type: z.enum(['INCOME', 'EXPENSE']).optional(),
+  accountId: z.string().uuid(),
+  categoryName: categoryNameSchema,
+  amount: z.coerce.number().positive('Amount must be positive'),
+  description: z.string().max(255).optional(),
+  date: localDateSchema,
+  notes: z.string().max(1000).optional(),
+  paid: z.boolean().default(true),
+  competenceMonth: competenceMonthSchema.nullish(),
+}).strict();
+
+export const accountRuleSchema = z.object({
+  package: z.string().min(1, 'package is required').max(150).refine(noNul, NUL_MESSAGE),
+  kind: z.enum(CAPTURE_KINDS),
+  accountId: z.string().uuid(),
+}).strict();
+
+export const replaceAccountRulesSchema = z.object({
+  rules: z.array(accountRuleSchema).max(MAX_ACCOUNT_RULES, `At most ${MAX_ACCOUNT_RULES} rules`),
+}).strict().superRefine((body, ctx) => {
+  const seen = new Set<string>();
+  body.rules.forEach((rule, index) => {
+    const key = JSON.stringify([rule.package, rule.kind]);
+    if (seen.has(key)) {
+      ctx.addIssue({ code: 'custom', path: ['rules', index], message: `Duplicate rule for package "${rule.package}" and kind ${rule.kind}` });
+    }
+    seen.add(key);
+  });
+});
+
+export type ConfirmCaptureInput = z.infer<typeof confirmCaptureSchema>;
+export type AccountRuleInput = z.infer<typeof accountRuleSchema>;
