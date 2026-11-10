@@ -247,6 +247,21 @@ describe('preview: the sheet takes over a recurrence', () => {
     expect(rowNamed(preview, 'Curso 2/6').status).toBe('new');
   });
 
+  it('never takes over an INCOME recurrence: an expense row with the same name on the same account is new', async () => {
+    // Invented: a meal allowance received on the account, and a meal paid from the same account under the same name.
+    seedRecurrence({ householdId: HH, accountId: DEBIT, description: 'Vale', amount: 600, nextRunAt: '2026-10-25', categoryName: 'SALARY' });
+    const preview = await previewCsv({ debit: [['Vale', 'Lazer', 23.5]] });
+    expect(rowNamed(preview, 'Vale', 'debit')).toMatchObject({ status: 'new', existingTransactionId: null });
+    expect(preview.totals).toMatchObject({ matchesRecurring: 0, new: 1 });
+  });
+
+  it('never takes over a recurrence of a custom INCOME category either', async () => {
+    fakePrisma.category.create({ data: { id: 'cat-income', householdId: HH, type: 'INCOME', name: 'Benefícios' } });
+    seedRecurrence({ householdId: HH, accountId: DEBIT, description: 'Vale', amount: 600, nextRunAt: '2026-10-25', categoryName: 'CUSTOM:cat-income' });
+    const preview = await previewCsv({ debit: [['Vale', 'Lazer', 23.5]] });
+    expect(rowNamed(preview, 'Vale', 'debit').status).toBe('new');
+  });
+
   it('takes over a PAID generated occurrence (a card occurrence is generated paid) so the sheet never double-counts', async () => {
     const rec = seedRecurrence({ householdId: HH, accountId: CREDIT, description: 'Streaming', amount: 20, nextRunAt: '2026-11-03' });
     const tx = generated(rec.id, { accountId: CREDIT, description: 'Streaming', amount: 20, date: '2026-10-03', paid: true });
