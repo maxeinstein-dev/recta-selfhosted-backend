@@ -48,14 +48,18 @@ import {
 } from './maxfin-import.service.js';
 import type { MaxFinCategoryMapEntry, MaxFinCategoryMapInput } from './maxfin-import.types.js';
 import { computeClosing } from './card-ofx-closing.js';
+import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
 import {
   NOTIF_DAYS_LINE_AFTER,
   NOTIF_DAYS_LINE_BEFORE,
   NOTIF_REF_PREFIX,
+  RECURRENCE_DAYS_LINE_AFTER,
+  RECURRENCE_DAYS_LINE_BEFORE,
   parseGroupId,
   reconcileCardOfx,
   toCents,
   type ReconcileProposal,
+  type RecurrenceOccurrence,
   type ReconcileResult,
   type StoredCardRow,
 } from './ofx-reconcile.js';
@@ -334,6 +338,46 @@ export async function loadEarliestSheetMonth(householdId: string, cardId: string
   return earliest;
 }
 
+/**
+ * Occurrences a recurrence generated on the card (no sourceRef, recurrence link, no attachment, not split, no share or
+ * settlement: its amount is about to change), dated so that a line of the file is within the RECURRENCE_DAYS_* window,
+ * with the names (description and aliases) of the recurrence that generated each. Rows whose recurrence is gone are left out.
+ */
+async function loadRecurrenceOccurrences(householdId: string, cardId: string, start: Date, end: Date): Promise<RecurrenceOccurrence[]> {
+  const records = await prisma.transaction.findMany({
+    where: {
+      householdId,
+      accountId: cardId,
+      sourceRef: null,
+      attachmentUrl: null,
+      recurringTransactionId: { not: null },
+      date: { gte: shiftUtcDay(start, -RECURRENCE_DAYS_LINE_AFTER), lte: shiftUtcDay(end, RECURRENCE_DAYS_LINE_BEFORE) },
+    },
+    select: CARD_ROW_SELECT,
+    orderBy: [{ date: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+  });
+  const kept = records.filter((r: CardRowRecord) => !r.isSplit && r.recurringTransactionId);
+  const rows = storedRows(kept);
+  const recurrenceOf = new Map(kept.map((r: CardRowRecord) => [r.id, r.recurringTransactionId!] as const));
+  // The recurrence link is not a merge blocker here: only shares and settlements are.
+  for (const row of rows) {
+    row.mergeBlocked = false;
+    row.recurringTransactionId = recurrenceOf.get(row.id) ?? null;
+  }
+  await markMergeBlocked(rows);
+  const free = rows.filter((row) => !row.mergeBlocked);
+  if (free.length === 0) return [];
+  const recurrences = await prisma.recurringTransaction.findMany({
+    where: { householdId, id: { in: [...new Set(free.map((row) => row.recurringTransactionId!))] } },
+    select: { id: true, description: true, aliases: true },
+  });
+  const byId = new Map<string, { description: string | null; aliases: string[] }>(recurrences.map((r: { id: string; description: string | null; aliases: string[] }) => [r.id, r] as const));
+  return free.flatMap((row) => {
+    const recurrence = byId.get(row.recurringTransactionId!);
+    return recurrence ? [{ row, names: [recurrence.description ?? '', ...(recurrence.aliases ?? [])] }] : [];
+  });
+}
+
 async function loadCardContext(
   card: ResolvedCardAccount,
   month: MaxFinMonth,
@@ -417,13 +461,15 @@ async function loadCardContext(
     }),
   );
 
+  const recurrenceRows = await loadRecurrenceOccurrences(householdId, card.id, legacyStart, legacyEnd);
+
   // Refs already used: transactions an earlier import created from them, and the external refs table (which
   // also tells which candidate rows already represent OFX lines).
   const createdFromRefs = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: refs } },
     select: { id: true, sourceRef: true },
   });
-  const candidateIds = [...sheetRows, ...neighbourRows, ...futures, ...legacy, ...notifRows].map((row) => row.id);
+  const candidateIds = [...sheetRows, ...neighbourRows, ...futures, ...legacy, ...notifRows, ...recurrenceRows.map((o) => o.row)].map((row) => row.id);
   const externalRefs = await prisma.transactionExternalRef.findMany({
     where: { householdId, OR: [{ ref: { in: refs } }, { transactionId: { in: candidateIds } }] },
     select: { ref: true, transactionId: true },
@@ -542,6 +588,7 @@ async function loadCardContext(
       futures,
       legacy,
       notifRows,
+      recurrenceRows,
       knownRefs,
       linkedTransactionIds,
       planNumbers,
@@ -870,6 +917,12 @@ export async function buildCardOfxPreview(params: BuildCardOfxPreviewParams): Pr
   }
   if (result.mergeBudgetExhausted) {
     warnings.push('A busca por linhas da planilha que somam uma compra do banco foi interrompida por excesso de combinações: algumas compras ficaram sem proposta de mesclagem.');
+  }
+  const heldRecurrences = result.proposals.filter((p) => p.kind === 'enrich-recurrence' && !p.defaultSelected);
+  if (heldRecurrences.length > 0) {
+    warnings.push(
+      `${heldRecurrences.length} pareamento(s) com lançamento gerado por recorrência vieram desmarcados (mais de uma linha ou lançamento possível): confira antes de aplicar.`,
+    );
   }
   const heldLinks = result.proposals.filter((p) => (p.kind === 'enrich-neighbour' || p.kind === 'enrich-group' || p.kind === 'enrich-near') && !p.defaultSelected);
   if (heldLinks.length > 0) {
@@ -1379,6 +1432,53 @@ async function applyNear(householdId: string, cardId: string, proposal: Reconcil
   }
 }
 
+/**
+ * A recurrence occurrence (generated by the job, no sourceRef) takes the real charge of the statement line: its amount
+ * and date go through the transaction service (it keeps its description, the bank's name goes to the notes), whose transaction locks the row and moves the card balance
+ * by the difference of a paid row, and the recurrence follows the new amount when it asks to (the same rule as editing
+ * the occurrence by hand). In the same database transaction, after the lock: the row must still exist on the card, be
+ * the state the recompute saw (type, paid flag, no sourceRef, still tied to the same recurrence, amount equal in
+ * cents), have no external ref at all and no share or settlement; then the line's refs are recorded.
+ * False when any of that fails: nothing is written.
+ */
+async function applyEnrichRecurrence(householdId: string, cardId: string, proposal: ReconcileProposal, bankAmount: number): Promise<boolean> {
+  const target = proposal.target!;
+  const data = targetData(proposal);
+  try {
+    await updateTransaction(
+      target.id,
+      householdId,
+      { amount: bankAmount, description: data.description, date: data.date, notes: data.notes },
+      {
+        beforeWrite: async (tx) => {
+          const [row] = await tx.transaction.findMany({
+            where: { id: target.id, householdId, accountId: cardId, type: target.type, paid: target.paid, sourceRef: null },
+            select: { amount: true, recurringTransactionId: true },
+          });
+          if (!row || row.recurringTransactionId !== (target.recurringTransactionId ?? null)) throw new MergeConflict();
+          if (toCents(row.amount.toNumber()) !== toCents(target.amount)) throw new MergeConflict();
+          if ((await tx.transactionExternalRef.count({ where: { transactionId: target.id } })) > 0) throw new MergeConflict();
+          await lockRowsOrThrowIfLinked(tx, [target.id]);
+          await tx.transactionExternalRef.createMany({
+            data: proposal.refs.map((ref) => ({ householdId, transactionId: target.id, ref })),
+          });
+        },
+        inTransaction: async (tx) => {
+          await followLastAmountInTx(
+            tx,
+            { id: target.id, householdId, recurringTransactionId: target.recurringTransactionId ?? null, date: parseLocalDateString(target.date), amount: target.amount },
+            { amount: bankAmount, date: data.date },
+          );
+        },
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof MergeConflict || error instanceof LinkedRowError || isAlreadyTakenOrGone(error) || isNotFound(error) || (error as { statusCode?: number })?.statusCode === 409) return false;
+    throw error;
+  }
+}
+
 /** Enrich a sheet row (exact, plan or sum). */
 async function applyEnrich(householdId: string, proposal: ReconcileProposal): Promise<boolean> {
   return claimAndUpdate(householdId, proposal, targetData(proposal));
@@ -1714,6 +1814,10 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
       }
       case 'enrich-near':
         if (await applyNear(householdId, account.id, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) enriched += 1;
+        else skipped += 1;
+        break;
+      case 'enrich-recurrence':
+        if (await applyEnrichRecurrence(householdId, account.id, proposal, lineByRef.get(proposal.refs[0]!)!.amount)) enriched += 1;
         else skipped += 1;
         break;
       case 'enrich-neighbour':

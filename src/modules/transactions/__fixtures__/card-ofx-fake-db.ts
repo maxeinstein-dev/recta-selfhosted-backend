@@ -25,7 +25,16 @@ export interface FakeTransaction {
   installmentId: string | null;
   installmentNumber: number | null;
   totalInstallments: number | null;
+  recurringTransactionId?: string | null;
+  isSplit?: boolean;
   createdAt: number;
+}
+
+export interface FakeRecurrence {
+  id: string;
+  householdId: string;
+  description: string | null;
+  aliases: string[];
 }
 
 export interface FakeExternalRef {
@@ -60,9 +69,10 @@ interface Store {
   refs: FakeExternalRef[];
   accounts: FakeAccount[];
   categories: FakeCategory[];
+  recurrences: FakeRecurrence[];
 }
 
-export const store: Store = { shares: [], settlements: [], transactions: [], refs: [], accounts: [], categories: [] };
+export const store: Store = { shares: [], settlements: [], transactions: [], refs: [], accounts: [], categories: [], recurrences: [] };
 let sequence = 0;
 
 function nextId(prefix: string): string {
@@ -77,6 +87,7 @@ export function resetStore(): void {
   store.refs = [];
   store.accounts = [];
   store.categories = [];
+  store.recurrences = [];
   sequence = 0;
 }
 
@@ -222,6 +233,7 @@ function snapshot(): Store {
     refs: store.refs.map((r) => ({ ...r })),
     accounts: store.accounts.map((a) => ({ ...a })),
     categories: store.categories.map((c) => ({ ...c })),
+    recurrences: store.recurrences.map((c) => ({ ...c, aliases: [...c.aliases] })),
   };
 }
 
@@ -293,6 +305,11 @@ export const fakePrisma = {
   category: {
     findMany: vi.fn((args: { where?: Where }) =>
       lazy(() => store.categories.filter((c) => matches(c as unknown as Record<string, unknown>, args.where)).map((c) => ({ ...c }))),
+    ),
+  },
+  recurringTransaction: {
+    findMany: vi.fn((args: { where?: Where }) =>
+      lazy(() => store.recurrences.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r, aliases: [...r.aliases] }))),
     ),
   },
   $queryRaw: vi.fn(async () => []),
@@ -367,7 +384,7 @@ export const fakeServices = {
     if (store.transactions.length === before) throw prismaError('NOT_FOUND', 'Transaction not found');
     store.refs = store.refs.filter((r) => r.transactionId !== id);
   }),
-  updateTransaction: vi.fn(async (id: string, householdId: string, input: Record<string, unknown>, options?: { beforeWrite?: (tx: unknown) => Promise<void> }) => {
+  updateTransaction: vi.fn(async (id: string, householdId: string, input: Record<string, unknown>, options?: { beforeWrite?: (tx: unknown) => Promise<void>; inTransaction?: (tx: unknown) => Promise<void> }) => {
     const t = store.transactions.find((row) => row.id === id && row.householdId === householdId);
     if (!t) throw prismaError('NOT_FOUND', 'Transaction not found');
     const saved = snapshot();
@@ -378,6 +395,7 @@ export const fakeServices = {
       throw error;
     }
     updateData(t, input);
+    await options?.inTransaction?.(fakePrisma);
     return { ...t };
   }),
   /** Records the payment; marks the card's unpaid purchases of the invoice period as paid (like step 8 of the real one). */
@@ -450,4 +468,9 @@ export function seedCategory(data: Omit<FakeCategory, 'id'> & { id?: string }): 
   const category = { id: data.id ?? nextId('cat'), ...data };
   store.categories.push(category);
   return category;
+}
+
+export function seedRecurrence(data: FakeRecurrence): FakeRecurrence {
+  store.recurrences.push(data);
+  return data;
 }
