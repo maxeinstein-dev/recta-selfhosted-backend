@@ -117,7 +117,7 @@ beforeEach(() => {
 
 describe('invoiceEventOf', () => {
   it('a paid invoice generates no event', () => {
-    expect(invoiceEventOf(snap({ state: 'paid', statementTotal: 500, currentPayments: 500 }), true)).toBeNull();
+    expect(invoiceEventOf(snap({ state: 'paid', statementTotal: 500, currentPayments: 0 }), true)).toBeNull();
   });
 
   it('an invoice with credit (refunds above purchases) generates nothing', () => {
