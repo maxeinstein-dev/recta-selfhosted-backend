@@ -89,3 +89,15 @@ export interface DashboardOverviewResponse {
     daysInMonth: number;
   };
 }
+
+/**
+ * Projected cash flow query: `accountId` is one cash account (omit it for all of them), `days` the length of the
+ * period after today (1 to 180, default 90).
+ */
+export const cashFlowQuerySchema = z.object({
+  householdId: z.string().uuid().optional(),
+  accountId: z.string().uuid().optional(),
+  days: z.coerce.number().int().min(1).max(180).default(90),
+});
+
+export type CashFlowQuery = z.infer<typeof cashFlowQuerySchema>;

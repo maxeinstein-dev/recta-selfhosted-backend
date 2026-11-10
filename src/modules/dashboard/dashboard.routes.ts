@@ -4,7 +4,8 @@ import {
   requireHouseholdMember,
   ensurePersonalHousehold,
 } from '../../shared/middleware/authorization.middleware.js';
-import { dashboardOverviewQuerySchema } from './dashboard.schema.js';
+import { cashFlowQuerySchema, dashboardOverviewQuerySchema } from './dashboard.schema.js';
+import { loadCashFlow } from './cash-flow.loader.js';
 import * as dashboardService from './dashboard.service.js';
 
 export async function dashboardRoutes(app: FastifyInstance) {
@@ -160,5 +161,109 @@ export async function dashboardRoutes(app: FastifyInstance) {
       success: true,
       data,
     });
+  });
+
+  /**
+   * GET /dashboard/cash-flow
+   * Balance of the cash accounts day by day from today, from what is already known (pending entries, recurrence
+   * occurrences not yet generated, invoice payments on their due dates). Read-only.
+   */
+  const eventSchema = {
+    type: 'object',
+    properties: {
+      date: { type: 'string' },
+      description: { type: 'string' },
+      amount: { type: 'number' },
+      source: { type: 'string', enum: ['pending', 'recurrence', 'invoice'] },
+      certainty: { type: 'string', enum: ['confirmed', 'expected', 'estimated'] },
+      overdue: { type: 'boolean' },
+      originalDate: { type: ['string', 'null'] },
+      sourceId: { type: 'string' },
+      accountId: { type: 'string' },
+      invoiceMonth: { type: ['string', 'null'] },
+    },
+  };
+  app.get('/cash-flow', {
+    schema: {
+      description: 'Projected cash flow of the cash accounts, day by day, from known events only',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          householdId: { type: 'string', format: 'uuid' },
+          accountId: { type: 'string', format: 'uuid' },
+          days: { type: 'integer', minimum: 1, maximum: 180 },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean' },
+            data: {
+              type: 'object',
+              properties: {
+                currency: { type: ['string', 'null'] },
+                period: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' }, days: { type: 'integer' } } },
+                startingBalance: { type: 'number' },
+                days: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      date: { type: 'string' },
+                      events: { type: 'array', items: eventSchema },
+                      inflow: { type: 'number' },
+                      outflow: { type: 'number' },
+                      net: { type: 'number' },
+                      endBalance: { type: 'number' },
+                    },
+                  },
+                },
+                summary: {
+                  type: 'object',
+                  properties: {
+                    lowestBalance: { type: 'object', properties: { date: { type: 'string' }, amount: { type: 'number' } } },
+                    firstNegativeDate: { type: ['string', 'null'] },
+                    endingBalance: { type: 'number' },
+                    balanceAfterDays: {
+                      type: 'array',
+                      items: { type: 'object', properties: { days: { type: 'integer' }, date: { type: 'string' }, balance: { type: 'number' } } },
+                    },
+                    totalInflow: { type: 'number' },
+                    totalOutflow: { type: 'number' },
+                    eventCount: { type: 'integer' },
+                    estimatedCount: { type: 'integer' },
+                    overdueCount: { type: 'integer' },
+                  },
+                },
+                unassignedInvoices: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      accountId: { type: 'string' },
+                      accountName: { type: 'string' },
+                      month: { type: 'string' },
+                      dueDate: { type: ['string', 'null'] },
+                      amount: { type: 'number' },
+                      reason: { type: 'string', enum: ['no_payer_account', 'no_due_date'] },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = cashFlowQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+
+    const data = await loadCashFlow({ householdId, accountId: query.accountId, days: query.days });
+    return reply.send({ success: true, data });
   });
 }

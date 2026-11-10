@@ -1,0 +1,317 @@
+import { prisma } from '../../shared/db/prisma.js';
+import { BadRequestError, NotFoundError } from '../../shared/errors/index.js';
+import { addMonthKey } from '../transactions/credit-card-commitment.js';
+import { projectRecurrence, toCents, type ForecastRecurrence, type InvoiceState } from '../transactions/credit-card-invoice-forecast.js';
+import { calculateCreditCardInvoice, utcToday } from '../transactions/transactions.service.js';
+import { dayString, localDate } from '../recurring-transactions/recurring-dates.js';
+import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
+import { addDays, buildCashFlow, type CashFlowEventInput, type CashFlowProjection, type UnassignedInvoiceInput } from './cash-flow.js';
+
+/** Account types the projection is about: where the household's money sits. Cards and investments are left out. */
+const CASH_TYPES = ['CHECKING', 'SAVINGS', 'CASH'] as const;
+const INVOICE_PAYMENT_PREFIX = 'invoice_pay:';
+
+/** The part of `calculateCreditCardInvoice(...).data` the projection reads. */
+export interface InvoiceSnapshot {
+  statementTotal: number;
+  outstandingFromPrevious: number;
+  currentPayments: number;
+  state: InvoiceState;
+  dueDate: string | null;
+  forecast: { applicable: boolean; total: number };
+}
+
+export interface InvoiceSettlement {
+  /** 'YYYY-MM' of the invoice the payment is attributed to (the last one of an overdue group). */
+  month: string;
+  /** Day the payment is due; null when the card has no due day. Before today for the overdue group. */
+  dueDate: string | null;
+  /** Whole cents leaving the payer account; always above one cent. */
+  amountCents: number;
+  certainty: 'confirmed' | 'estimated';
+  overdue: boolean;
+}
+
+/** What one invoice adds to the card's debt on its own: posted, plus the forecast while open, minus what was paid on it. */
+export function invoiceOwnCents(data: InvoiceSnapshot): number {
+  const forecastCents = data.state === 'open' && data.forecast.applicable ? toCents(data.forecast.total) : 0;
+  return toCents(data.statementTotal) + forecastCents - toCents(data.currentPayments);
+}
+
+/**
+ * Turns the invoices of ONE card, walked in chronological order, into the payments that leave the payer account.
+ * The debt is carried from one invoice to the next, so credit and debt offset each other:
+ * - the starting debt is the `outstandingFromPrevious` of the FIRST invoice, and only that one. The later invoices carry
+ *   the same figure but it is clamped at zero by the invoice route (it drops a credit) and it repeats invoices the walk
+ *   already adds one by one, so reading it again would count the past twice and lose the credits;
+ * - invoice after invoice the carry grows by the invoice's own amount (`invoiceOwnCents`);
+ * - a paid invoice means the card owes nothing up to it (the route computes that with the earlier invoices): the carry resets;
+ * - invoices due before today are summed together and give at most ONE overdue payment, today, when the net is above one
+ *   cent; a net credit (or a one-cent residue) is not a payment and moves on to the next invoice, reducing its payment;
+ * - any other invoice settles on its own due date when the carry is above one cent, and the carry returns to zero; a
+ *   credit left at the end of the walk pays nothing (it is not income).
+ */
+export function settleInvoices(walk: ReadonlyArray<{ month: string; data: InvoiceSnapshot }>, today: string): InvoiceSettlement[] {
+  const out: InvoiceSettlement[] = [];
+  let carry = walk.length > 0 ? toCents(walk[0]!.data.outstandingFromPrevious) : 0;
+  let overdueLast: { month: string; dueDate: string | null } | null = null;
+
+  const settle = (month: string, dueDate: string | null, certainty: 'confirmed' | 'estimated', overdue: boolean): void => {
+    if (carry > 1) {
+      out.push({ month, dueDate, amountCents: carry, certainty, overdue });
+      carry = 0;
+    } else if (carry >= 0) {
+      carry = 0; // a one-cent residue is not a debt; a credit (below zero) stays for the next invoice
+    }
+  };
+
+  for (const { month, data } of walk) {
+    if (data.state === 'paid') {
+      carry = 0;
+      overdueLast = null;
+      continue;
+    }
+    const overdue = data.dueDate !== null && data.dueDate < today;
+    if (!overdue && overdueLast) {
+      settle(overdueLast.month, overdueLast.dueDate, 'confirmed', true);
+      overdueLast = null;
+    }
+    carry += invoiceOwnCents(data);
+    if (overdue) {
+      overdueLast = { month, dueDate: data.dueDate };
+      continue;
+    }
+    settle(month, data.dueDate, data.state === 'open' ? 'estimated' : 'confirmed', false);
+  }
+  if (overdueLast) settle(overdueLast.month, overdueLast.dueDate, 'confirmed', true);
+  return out;
+}
+
+export interface CashFlowParams {
+  householdId: string;
+  accountId?: string;
+  days: number;
+  today?: Date;
+}
+
+/**
+ * Loads what the projection needs and builds it. One account, or all the active cash accounts of the household (a
+ * transfer between two of them is always paid, so it never shows as a pending entry and adds up to zero in the set).
+ * Queries are per kind, never per day: accounts, pending entries, recurrences (+ the occurrences already generated),
+ * the last payment of each card, and one invoice calculation per card and month of the period.
+ */
+export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProjection & { currency: string | null }> {
+  const { householdId, days } = params;
+  const today = dayString(params.today ?? utcToday());
+  const end = addDays(today, days);
+  const endUtc = new Date(Date.UTC(Number(end.slice(0, 4)), Number(end.slice(5, 7)) - 1, Number(end.slice(8, 10))));
+
+  const accounts = await prisma.account.findMany({ where: { householdId, isActive: true } });
+  const isCash = (a: (typeof accounts)[number]) => (CASH_TYPES as readonly string[]).includes(a.type);
+
+  let scope = accounts.filter(isCash);
+  if (params.accountId) {
+    const chosen = accounts.find((a) => a.id === params.accountId);
+    if (!chosen) throw new NotFoundError('Account');
+    if (!isCash(chosen)) throw new BadRequestError('The projection is for cash accounts (checking, savings or cash), not cards or investments');
+    scope = [chosen];
+  }
+  const currencies = new Set(scope.map((a) => a.currency));
+  if (currencies.size > 1) {
+    throw new BadRequestError('The cash accounts use different currencies: ask for one account (accountId)');
+  }
+  const scopeIds = new Set(scope.map((a) => a.id));
+  const startingBalanceCents = scope.reduce((sum, a) => sum + toCents(a.balance.toNumber()), 0);
+
+  const events: CashFlowEventInput[] = [];
+  const unassignedInvoices: UnassignedInvoiceInput[] = [];
+
+  if (scope.length > 0) {
+    events.push(...(await pendingEvents(householdId, [...scopeIds], endUtc, today)));
+    events.push(...(await recurrenceEvents(householdId, [...scopeIds], today, end)));
+    const invoices = await invoiceEvents(householdId, accounts, scopeIds, today, end);
+    events.push(...invoices.events);
+    unassignedInvoices.push(...invoices.unassigned);
+  }
+
+  const projection = buildCashFlow({ startingBalanceCents, today, days, events, unassignedInvoices });
+  return { currency: scope[0]?.currency ?? null, ...projection };
+}
+
+/**
+ * Pending (unpaid) income and expense entries of the accounts. Dated before today they are due now (overdue, moved to
+ * today by the builder). A pending invoice payment dated after today is left out: the invoice calculation ignores a
+ * payment dated in the future, so the invoice event already carries that money.
+ */
+async function pendingEvents(householdId: string, accountIds: string[], endUtc: Date, today: string): Promise<CashFlowEventInput[]> {
+  const rows = await prisma.transaction.findMany({
+    where: { householdId, paid: false, accountId: { in: accountIds }, type: { in: ['INCOME', 'EXPENSE'] }, date: { lte: endUtc } },
+    orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
+  });
+  const events: CashFlowEventInput[] = [];
+  for (const t of rows) {
+    const date = dayString(t.date);
+    if (t.attachmentUrl?.startsWith(INVOICE_PAYMENT_PREFIX) && date > today) continue;
+    const cents = toCents(t.amount.toNumber());
+    events.push({
+      date,
+      description: t.description?.trim() || t.categoryName || '',
+      amountCents: t.type === 'INCOME' ? cents : -cents,
+      source: 'pending',
+      certainty: 'confirmed',
+      overdue: date < today,
+      sourceId: t.id,
+      accountId: t.accountId!,
+    });
+  }
+  return events;
+}
+
+/**
+ * Occurrences the recurrences of the accounts have not generated yet, up to the end of the period. The date walk is the
+ * one of the invoice forecast (`projectRecurrence`), with an open start: occurrences before today (a stale recurrence
+ * the job has not caught up with) all count today, as overdue. A month that already holds a transaction of the
+ * recurrence (generated, or adopted from an import) is not counted again.
+ */
+async function recurrenceEvents(householdId: string, accountIds: string[], today: string, end: string): Promise<CashFlowEventInput[]> {
+  const rows = await prisma.recurringTransaction.findMany({ where: { householdId, isActive: true, accountId: { in: accountIds } } });
+  if (rows.length === 0) return [];
+  const batch = await forecastBatch(prisma, rows);
+
+  // Transactions of these recurrences from the first month still to walk (the earliest scheduled run) to the end month
+  const firstDay = rows.map((r) => dayString(r.nextRunAt)).reduce((min, d) => (d < min ? d : min));
+  const from = new Date(Date.UTC(Number(firstDay.slice(0, 4)), Number(firstDay.slice(5, 7)) - 1, 1));
+  const until = new Date(Date.UTC(Number(end.slice(0, 4)), Number(end.slice(5, 7)), 1));
+  const existing = await prisma.transaction.findMany({
+    where: { householdId, recurringTransactionId: { in: rows.map((r) => r.id) }, date: { gte: from, lt: until } },
+    select: { recurringTransactionId: true, date: true },
+  });
+  const generated = new Set<string>();
+  for (const t of existing) {
+    if (!t.recurringTransactionId) continue;
+    const d = dayString(t.date);
+    generated.add(`${t.recurringTransactionId}:${d}`);
+    generated.add(`${t.recurringTransactionId}:${d.slice(0, 7)}`);
+  }
+
+  const events: CashFlowEventInput[] = [];
+  for (const r of rows) {
+    const strategy = r.forecastStrategy ?? 'LAST';
+    // Estimated: it follows the last value or reads the history; fixed and per-business-day amounts are expected
+    const estimated = (r.followLastAmount && strategy === 'LAST') || strategy === 'CONSERVATIVE';
+    const rec: ForecastRecurrence = {
+      id: r.id,
+      description: r.description,
+      categoryName: r.categoryName,
+      amount: r.amount.toNumber(),
+      frequency: r.frequency,
+      startDate: r.startDate,
+      endDate: r.endDate,
+      nextRunAt: r.nextRunAt,
+      followLastAmount: estimated,
+      amountOn: (day: string) => batch.expected(r, referenceMonthOf(localDate(day), r.competenceOffsetMonths)).amount,
+      sign: 1,
+    };
+    const sign = batch.isIncome(r) ? 1 : -1;
+    const staleNext = dayString(r.nextRunAt) < today;
+    const items = projectRecurrence(rec, { windowStart: '0001-01-01', windowEnd: end }, today, generated);
+    items.forEach((item, index) => {
+      events.push({
+        date: item.date,
+        description: item.description,
+        amountCents: sign * toCents(item.amount),
+        source: 'recurrence',
+        certainty: item.followsLastAmount ? 'estimated' : 'expected',
+        // Non-monthly stale recurrences are dated today by the walk, but their first run was due earlier
+        overdue: item.date < today || (staleNext && index === 0),
+        sourceId: r.id,
+        accountId: r.accountId,
+      });
+    });
+  }
+  return events;
+}
+
+/**
+ * The payment of each card invoice on its due date, from the account that pays it: the card's linked account; else the
+ * account the card's latest invoice payment came from; else nobody (listed apart, never in the balance). Cards paid by
+ * an account outside the projection are skipped without calculating them.
+ */
+async function invoiceEvents(
+  householdId: string,
+  accounts: Array<{ id: string; name: string; type: string; linkedAccountId: string | null }>,
+  scopeIds: ReadonlySet<string>,
+  today: string,
+  end: string,
+): Promise<{ events: CashFlowEventInput[]; unassigned: UnassignedInvoiceInput[] }> {
+  const cards = accounts.filter((a) => a.type === 'CREDIT');
+  const events: CashFlowEventInput[] = [];
+  const unassigned: UnassignedInvoiceInput[] = [];
+  if (cards.length === 0) return { events, unassigned };
+
+  const cashIds = new Set(accounts.filter((a) => (CASH_TYPES as readonly string[]).includes(a.type)).map((a) => a.id));
+  const lastPayerOfCard = await lastPayers(householdId, cards.map((c) => c.id), today);
+  const todayDate = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10))));
+
+  // The newest invoice is already closed in the month before today's; the walk ends in the month of the period end
+  const firstMonth = addMonthKey(today.slice(0, 7), -1);
+  const lastMonth = end.slice(0, 7);
+
+  for (const card of cards) {
+    const payer =
+      card.linkedAccountId && cashIds.has(card.linkedAccountId)
+        ? card.linkedAccountId
+        : (lastPayerOfCard.get(card.id) && cashIds.has(lastPayerOfCard.get(card.id)!) ? lastPayerOfCard.get(card.id)! : null);
+    if (payer && !scopeIds.has(payer)) continue;
+
+    const walk: Array<{ month: string; data: InvoiceSnapshot }> = [];
+    for (let month = firstMonth; month <= lastMonth; month = addMonthKey(month, 1)) {
+      const { data } = await calculateCreditCardInvoice(card.id, month, householdId, { limit: 1 }, { today: todayDate });
+      walk.push({ month, data });
+    }
+    for (const result of settleInvoices(walk, today)) {
+      if (result.dueDate === null) {
+        unassigned.push({ accountId: card.id, accountName: card.name, month: result.month, dueDate: null, amountCents: result.amountCents, reason: 'no_due_date' });
+        continue;
+      }
+      if (result.dueDate > end) continue; // due after the period
+      if (!payer) {
+        unassigned.push({ accountId: card.id, accountName: card.name, month: result.month, dueDate: result.dueDate, amountCents: result.amountCents, reason: 'no_payer_account' });
+        continue;
+      }
+      events.push({
+        date: result.dueDate, // before today: the builder moves it to today and marks it overdue
+        description: `Fatura ${card.name}`,
+        amountCents: -result.amountCents,
+        source: 'invoice',
+        certainty: result.certainty,
+        overdue: result.overdue,
+        sourceId: card.id,
+        accountId: payer,
+        invoiceMonth: result.month,
+      });
+    }
+  }
+  return { events, unassigned };
+}
+
+/** Account each card's most recent invoice payment (dated up to today) came out of. */
+async function lastPayers(householdId: string, cardIds: string[], today: string): Promise<Map<string, string>> {
+  const todayDate = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10))));
+  const rows = await prisma.transaction.findMany({
+    where: {
+      householdId,
+      OR: cardIds.map((id) => ({ attachmentUrl: { startsWith: `${INVOICE_PAYMENT_PREFIX}${id}:` } })),
+      accountId: { not: null },
+      date: { lte: todayDate },
+    },
+    orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    select: { accountId: true, attachmentUrl: true },
+  });
+  const result = new Map<string, string>();
+  for (const row of rows) {
+    const cardId = cardIds.find((id) => row.attachmentUrl?.startsWith(`${INVOICE_PAYMENT_PREFIX}${id}:`));
+    if (cardId && !result.has(cardId)) result.set(cardId, row.accountId!);
+  }
+  return result;
+}
