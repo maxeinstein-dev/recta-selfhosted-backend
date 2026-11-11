@@ -412,3 +412,93 @@ describe('FGTS birthday withdrawal', () => {
     expect(second.balanceCents).toBeGreaterThan(0);
   });
 });
+
+describe('includePast (year calendar)', () => {
+  const year = { from: '2026-01-01', to: '2026-12-31', today: '2026-08-15' };
+  const vacation = (over: Record<string, unknown>) => ({ id: 'vac-1', sellDays: 0, items: [], ...over });
+  const withBirthday = (withdrawals: EmploymentData['fgts']['withdrawals'] = []): EmploymentData =>
+    base({
+      admissionDate: '2025-02-10',
+      vacations: [vacation({ start: '2026-03-02' }), vacation({ start: '2026-10-05', id: 'vac-2' })],
+      fgts: { balance: null, withdrawals, modes: [{ startDate: '2025-02-10', mode: 'birthday', birthdayMonth: 5 }] },
+    });
+
+  it('without the flag the result is the same as before, with no past field', () => {
+    const plain = buildPayrollEvents(withBirthday(), year);
+    const explicit = buildPayrollEvents(withBirthday(), { ...year, includePast: false });
+    expect(explicit).toEqual(plain);
+    expect(JSON.stringify(explicit)).toBe(JSON.stringify(plain));
+    expect(JSON.stringify(plain)).not.toContain('"past"');
+    expect(plain.thirteenth.map((t) => t.installment)).toEqual([2]);
+    expect(plain.vacations.map((v) => v.id)).toEqual(['vac-2']);
+  });
+
+  it('returns the past 13th installment and vacation, marked past, next to the future ones', () => {
+    const ev = buildPayrollEvents(withBirthday(), { ...year, includePast: true });
+    expect(ev.thirteenth.map((t) => [t.installment, t.date, t.past])).toEqual([
+      [1, '2026-06-30', true],
+      [2, '2026-12-20', false],
+    ]);
+    expect(ev.vacations.map((v) => [v.id, v.past])).toEqual([
+      ['vac-1', true],
+      ['vac-2', false],
+    ]);
+    // The past ones carry the same value the future calculation gives (recalculated, not invented).
+    const noToday = buildPayrollEvents(withBirthday(), { from: year.from, to: year.to });
+    expect(ev.thirteenth[0]!.netCents).toBe(noToday.thirteenth[0]!.netCents);
+    expect(ev.vacations[0]!.netCents).toBe(noToday.vacations[0]!.netCents);
+  });
+
+  it('an event dated today is not past', () => {
+    const ev = buildPayrollEvents(base(), { from: '2026-01-01', to: '2026-12-31', today: '2026-12-20', includePast: true });
+    expect(ev.thirteenth.map((t) => [t.installment, t.past])).toEqual([
+      [1, true],
+      [2, false],
+    ]);
+  });
+
+  it('respects the requested period', () => {
+    const ev = buildPayrollEvents(withBirthday(), { from: '2026-07-01', to: '2026-12-31', today: '2026-08-15', includePast: true });
+    expect(ev.thirteenth.map((t) => t.installment)).toEqual([2]);
+    expect(ev.vacations.map((v) => v.id)).toEqual(['vac-2']);
+  });
+
+  it('a past birthday withdrawal comes only from the record, with its real amount', () => {
+    const recorded = withBirthday([{ date: '2026-05-08', amountCents: 123456, kind: 'birthday' }]);
+    const ev = buildPayrollEvents(recorded, { ...year, includePast: true });
+    expect(ev.birthdayWithdrawals).toEqual([
+      { year: 2026, date: '2026-05-08', amountCents: 123456, source: 'recorded', balanceCents: 0, tableId: null, past: true },
+    ]);
+    // Another kind of withdrawal is not a birthday withdrawal, and nothing recorded means nothing returned.
+    const other = withBirthday([{ date: '2026-05-08', amountCents: 5000, kind: 'other' }]);
+    expect(buildPayrollEvents(other, { ...year, includePast: true }).birthdayWithdrawals).toEqual([]);
+    expect(buildPayrollEvents(withBirthday(), { ...year, includePast: true }).birthdayWithdrawals).toEqual([]);
+    // Outside the period it is left out; without the flag it is never returned.
+    expect(buildPayrollEvents(recorded, { ...year, from: '2026-06-01', includePast: true }).birthdayWithdrawals).toEqual([]);
+    expect(buildPayrollEvents(recorded, year).birthdayWithdrawals).toEqual([]);
+  });
+
+  it('keeps the future forecast, marked not past, beside a recorded past withdrawal of an earlier year', () => {
+    const recorded = withBirthday([{ date: '2025-05-09', amountCents: 40000, kind: 'birthday' }]);
+    const ev = buildPayrollEvents(recorded, { from: '2025-01-01', to: '2027-12-31', today: '2026-08-15', includePast: true });
+    expect(ev.birthdayWithdrawals.map((b) => [b.date, b.source, b.past])).toEqual([
+      ['2025-05-09', 'recorded', true],
+      ['2027-05-07', 'table', false],
+    ]);
+  });
+
+  it('cash flow and card income (extraPayrollEvents) ignore the flag: nothing past, same events', () => {
+    const data = withBirthday([{ date: '2026-05-08', amountCents: 123456, kind: 'birthday' }]);
+    const a = extraPayrollEvents(data, year);
+    const b = extraPayrollEvents(data, { ...year, includePast: true });
+    expect(b).toEqual(a);
+    expect(a.every((e) => e.date >= year.today)).toBe(true);
+  });
+
+  it('the salary list and the FGTS forecast do not change with the flag', () => {
+    const a = buildPayrollEvents(withBirthday(), year);
+    const b = buildPayrollEvents(withBirthday(), { ...year, includePast: true });
+    expect(b.salary).toEqual(a.salary);
+    expect(b.fgts).toEqual(a.fgts);
+  });
+});

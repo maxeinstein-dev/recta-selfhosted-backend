@@ -160,6 +160,29 @@ describe('employment owner and calendar', () => {
   });
 });
 
+describe('events: includePast', () => {
+  type Out = { employments: Array<{ thirteenth: Array<{ installment: number; past?: boolean; net: number }> }> };
+  const row = () => employmentRow({ salaries: [{ id: 's', amount: dec(3000), startDate: utc('2025-01-10') }] });
+
+  it('without the flag the past 13th installment stays out and nothing carries past; with it both come back, in reais', async () => {
+    db.employment.findMany.mockResolvedValue([row()]);
+    const range = { from: '2026-01-01', to: '2026-12-31' };
+    const plain = (await getHouseholdEvents(HH, range, '2026-08-15')) as Out;
+    expect(plain.employments[0]!.thirteenth.map((t) => t.installment)).toEqual([2]);
+    expect(JSON.stringify(plain)).not.toContain('"past"');
+    const off = await getHouseholdEvents(HH, { ...range, includePast: false }, '2026-08-15');
+    expect(JSON.stringify(off)).toBe(JSON.stringify(plain));
+
+    const full = (await getHouseholdEvents(HH, { ...range, includePast: true }, '2026-08-15')) as Out;
+    expect(full.employments[0]!.thirteenth.map((t) => [t.installment, t.past])).toEqual([
+      [1, true],
+      [2, false],
+    ]);
+    expect(full.employments[0]!.thirteenth[0]!.net).toBeGreaterThan(0);
+    expect(full.employments[0]!.thirteenth[0]!.net).toBeLessThan(10000);
+  });
+});
+
 describe('items: calculation mode', () => {
   const create = (body: Record<string, unknown>) =>
     items.create(HH, EMP, { name: 'Meal voucher', kind: 'EARNING', inInssBase: false, inIrrfBase: false, inFgtsBase: false, calcMode: 'FIXED_MONTHLY', ...body });

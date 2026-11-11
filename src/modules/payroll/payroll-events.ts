@@ -104,6 +104,12 @@ export interface EventOptions {
   to: string;
   today?: string;
   tables?: PayrollTableSet;
+  /**
+   * Also return the 13th installments and vacations dated before `today` (marked `past: true`, the others `past: false`)
+   * and the birthday withdrawals already recorded in the period (real amount, `source: 'recorded'`). Default false: the
+   * result is exactly the forecast. Without `today` there is no past, so nothing changes.
+   */
+  includePast?: boolean;
 }
 
 /** The entry in force on `day`: the one with the latest start date not after it. */
@@ -212,6 +218,8 @@ export interface ThirteenthEvent {
   netCents: number;
   estimated: boolean;
   thirteenth: Thirteenth;
+  /** Only with `includePast`: true when the date is before `today`. */
+  past?: boolean;
 }
 
 export interface VacationEvent {
@@ -222,6 +230,8 @@ export interface VacationEvent {
   /** Dates assumed from the month alone, or a table projected from an old one. */
   estimated: boolean;
   vacation: Vacation;
+  /** Only with `includePast`: true when the payment date is before `today`. */
+  past?: boolean;
 }
 
 function thirteenthOfYear(data: EmploymentData, year: number, tables?: PayrollTableSet): Thirteenth | null {
@@ -284,11 +294,13 @@ export interface BirthdayForecast {
   /** 5th business day of the birthday month. */
   date: string;
   amountCents: number;
-  /** 'table': official table over the estimated balance; 'informed': the amount on the mode record. */
-  source: 'table' | 'informed';
+  /** 'table': official table over the estimated balance; 'informed': the amount on the mode record; 'recorded': a real withdrawal already registered (only with `includePast`). */
+  source: 'table' | 'informed' | 'recorded';
   /** Estimated balance the table was applied to (0 when informed). */
   balanceCents: number;
   tableId: string | null;
+  /** Only with `includePast`: true for a recorded withdrawal dated before `today`. */
+  past?: boolean;
 }
 
 export interface FgtsForecast {
@@ -436,10 +448,12 @@ export function buildFgtsForecast(
 
 /** Salary, 13th, vacation, birthday withdrawal and FGTS events of the period. See the module comment for the rules. */
 export function buildPayrollEvents(data: EmploymentData, options: EventOptions): PayrollEvents {
-  const { from, to, today, tables } = options;
+  const { from, to, today, tables, includePast = false } = options;
   const alive = (day: string) => !data.endDate || day <= data.endDate;
   const inRange = (day: string) => day >= from && day <= to;
-  const notPast = (day: string) => today === undefined || day >= today;
+  const isPast = (day: string) => today !== undefined && day < today;
+  const notPast = (day: string) => includePast || !isPast(day);
+  const mark = <T extends object>(event: T, day: string): T => (includePast ? { ...event, past: isPast(day) } : event);
 
   const salary: SalaryEvent[] = [];
   for (let c = addMonths(monthOf(from), -1); c <= addMonths(monthOf(to), -1); c = addMonths(c, 1)) {
@@ -453,10 +467,10 @@ export function buildPayrollEvents(data: EmploymentData, options: EventOptions):
     if (!t) continue;
     const estimated = t.warnings.length > 0;
     if (inRange(t.first.date) && notPast(t.first.date) && alive(t.first.date)) {
-      thirteenth.push({ year, installment: 1, date: t.first.date, netCents: t.first.amountCents, estimated, thirteenth: t });
+      thirteenth.push(mark({ year, installment: 1, date: t.first.date, netCents: t.first.amountCents, estimated, thirteenth: t }, t.first.date));
     }
     if (inRange(t.second.date) && notPast(t.second.date) && alive(t.second.date)) {
-      thirteenth.push({ year, installment: 2, date: t.second.date, netCents: t.second.netCents, estimated, thirteenth: t });
+      thirteenth.push(mark({ year, installment: 2, date: t.second.date, netCents: t.second.netCents, estimated, thirteenth: t }, t.second.date));
     }
   }
   thirteenth.sort((a, b) => a.date.localeCompare(b.date));
@@ -464,12 +478,20 @@ export function buildPayrollEvents(data: EmploymentData, options: EventOptions):
   const vacations: VacationEvent[] = [];
   for (const v of data.vacations) {
     const e = vacationOf(data, v, tables);
-    if (e && inRange(e.paymentDate) && notPast(e.paymentDate) && alive(e.paymentDate)) vacations.push(e);
+    if (e && inRange(e.paymentDate) && notPast(e.paymentDate) && alive(e.paymentDate)) vacations.push(mark(e, e.paymentDate));
   }
   vacations.sort((a, b) => a.paymentDate.localeCompare(b.paymentDate));
 
   const { birthday, ...fgts } = buildFgtsForecast(data, monthOf(from), monthOf(to), today, tables);
-  const birthdayWithdrawals = birthday.filter((b) => inRange(b.date));
+  const birthdayWithdrawals = birthday.filter((b) => inRange(b.date)).map((b) => mark(b, b.date));
+  if (includePast && today !== undefined) {
+    // A past year is never recalculated: only what was really withdrawn, with the amount registered.
+    for (const w of data.fgts.withdrawals) {
+      if (w.kind !== 'birthday' || w.amountCents <= 0 || !isPast(w.date) || !inRange(w.date)) continue;
+      birthdayWithdrawals.push({ year: Number(w.date.slice(0, 4)), date: w.date, amountCents: w.amountCents, source: 'recorded', balanceCents: 0, tableId: null, past: true });
+    }
+    birthdayWithdrawals.sort((a, b) => a.date.localeCompare(b.date));
+  }
   return { employmentId: data.employmentId, salary, thirteenth, vacations, birthdayWithdrawals, fgts, benefits: benefitEvents(data, from, to) };
 }
 
@@ -520,7 +542,8 @@ export interface ExtraPayrollEvent {
 
 /** The 13th, vacation and birthday-withdrawal events as plain dated amounts (what the cash flow and the card commitment consume). */
 export function extraPayrollEvents(data: EmploymentData, options: EventOptions): ExtraPayrollEvent[] {
-  const ev = buildPayrollEvents(data, options);
+  // Cash flow and card income only want what is still to come: the past flag never applies here.
+  const ev = buildPayrollEvents(data, { ...options, includePast: false });
   const id = data.employmentId;
   const out: ExtraPayrollEvent[] = [
     ...ev.thirteenth.map(

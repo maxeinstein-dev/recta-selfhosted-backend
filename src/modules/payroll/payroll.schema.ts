@@ -239,13 +239,20 @@ const simulationCommon = {
 export const simulateNetSchema = z.object({ gross: money, ...simulationCommon });
 export const simulateGrossSchema = z.object({ targetNet: positiveMoney, ...simulationCommon });
 
+/** Optional boolean of a query string ('true'/'1'/'false'/'0'); absent stays undefined (= false). */
+const queryFlag = z.preprocess((value) => {
+  if (value === 'true' || value === '1' || value === true) return true;
+  if (value === 'false' || value === '0' || value === false) return false;
+  return value;
+}, z.boolean().optional());
+
 const MAX_RANGE_DAYS = 366 * 5;
 export const eventsQuerySchema = z
-  .object({ householdId: uuid.optional(), from: dayString.optional(), to: dayString.optional() })
+  .object({ householdId: uuid.optional(), from: dayString.optional(), to: dayString.optional(), includePast: queryFlag })
   .refine((v) => !v.from || !v.to || v.from <= v.to, { message: 'from must not be after to' })
   .refine((v) => !v.from || !v.to || (Date.parse(v.to) - Date.parse(v.from)) / 86_400_000 <= MAX_RANGE_DAYS, { message: 'The period is too long (5 years at most)' });
 export const eventsHouseholdQuerySchema = z
-  .object({ householdId: uuid, personId: uuid.optional(), from: dayString.optional(), to: dayString.optional() })
+  .object({ householdId: uuid, personId: uuid.optional(), from: dayString.optional(), to: dayString.optional(), includePast: queryFlag })
   .refine((v) => !v.from || !v.to || v.from <= v.to, { message: 'from must not be after to' })
   .refine((v) => !v.from || !v.to || (Date.parse(v.to) - Date.parse(v.from)) / 86_400_000 <= MAX_RANGE_DAYS, { message: 'The period is too long (5 years at most)' });
 
