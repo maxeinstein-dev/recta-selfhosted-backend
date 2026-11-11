@@ -1,6 +1,9 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
 import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
+import { formatDay } from '../payroll/payroll-dates.js';
+import { extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
+import { loadPayrollLinks } from '../payroll/payroll.links.js';
 import { fromCents, toCents, type InvoiceState } from './credit-card-invoice-forecast.js';
 import { calculateCreditCardInvoice, utcToday } from './transactions.service.js';
 
@@ -91,19 +94,39 @@ export function buildCommitment(
  * Income expected per month, in cents, from the household's active MONTHLY income recurrences (their forecast strategy
  * decides the amount). A recurrence counts from the month of its next run to the month of its end date. Other
  * frequencies are left out: this is a reference line for the card, not a cash-flow projection.
+ * An employment linked to a salary recurrence replaces that recurrence's amount with the calculated net paid in the
+ * month, and adds the 13th, vacation and FGTS birthday withdrawal of the month they fall in (nothing is filtered by
+ * today: it is the income of the month). Without a linked employment the result is the one of the recurrences alone.
  */
 export async function expectedIncomeByMonth(householdId: string, months: readonly string[]): Promise<Map<string, number>> {
   const result = new Map<string, number>(months.map((m) => [m, 0]));
+  const payroll = await loadPayrollLinks(householdId);
   const rows = await prisma.recurringTransaction.findMany({ where: { householdId, isActive: true, frequency: 'MONTHLY' } });
-  if (rows.length === 0) return result;
-  const batch = await forecastBatch(prisma, rows);
-  for (const row of rows) {
-    if (!batch.isIncome(row)) continue;
-    const first = dayString(row.nextRunAt).slice(0, 7);
-    const last = row.endDate ? dayString(row.endDate).slice(0, 7) : null;
-    for (const month of months) {
-      if (month < first || (last && month > last)) continue;
-      result.set(month, (result.get(month) ?? 0) + toCents(batch.expected(row, month).amount));
+  if (rows.length > 0) {
+    const batch = await forecastBatch(prisma, rows);
+    for (const row of rows) {
+      if (!batch.isIncome(row)) continue;
+      const first = dayString(row.nextRunAt).slice(0, 7);
+      const last = row.endDate ? dayString(row.endDate).slice(0, 7) : null;
+      const link = payroll.find((l) => l.recurringTransactionId === row.id);
+      for (const month of months) {
+        if (month < first || (last && month > last)) continue;
+        const calc = link ? salaryPaidInMonth(link.data, month) : null;
+        result.set(month, (result.get(month) ?? 0) + (calc ? calc.netCents : toCents(batch.expected(row, month).amount)));
+      }
+    }
+  }
+  // 13th, vacations and birthday withdrawals of the employments that feed an active salary recurrence
+  if (payroll.length > 0 && months.length > 0) {
+    const sorted = [...months].sort();
+    const from = `${sorted[0]}-01`;
+    const to = formatDay(Number(sorted[sorted.length - 1]!.slice(0, 4)), Number(sorted[sorted.length - 1]!.slice(5, 7)), 31);
+    for (const link of payroll) {
+      if (!link.recurrenceActive) continue;
+      for (const e of extraPayrollEvents(link.data, { from, to })) {
+        const month = e.date.slice(0, 7);
+        if (result.has(month)) result.set(month, (result.get(month) ?? 0) + e.netCents);
+      }
     }
   }
   return result;

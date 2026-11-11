@@ -5,7 +5,8 @@
  * Read-only by design: nothing here creates an entry or touches a balance.
  */
 
-export type CashFlowSource = 'pending' | 'recurrence' | 'invoice';
+/** 'payroll': 13th, vacation and FGTS birthday withdrawal forecast by an employment (never a recorded entry). */
+export type CashFlowSource = 'pending' | 'recurrence' | 'payroll' | 'invoice';
 export type CashFlowCertainty = 'confirmed' | 'expected' | 'estimated';
 
 /** An event as the loader hands it over: dates are 'YYYY-MM-DD', the amount is signed whole cents (income +, outflow -). */
@@ -17,7 +18,7 @@ export interface CashFlowEventInput {
   certainty: CashFlowCertainty;
   /** True when the loader already knows the event was due before today (it is also derived from `date`). */
   overdue?: boolean;
-  /** Id of the pending entry, of the recurrence, or of the card (invoices). */
+  /** Id of the pending entry, of the recurrence, of the employment (payroll) or of the card (invoices). */
   sourceId: string;
   /** The cash account the event moves. */
   accountId: string;
@@ -113,7 +114,7 @@ export function addDays(day: string, n: number): string {
   return `${String(d.getUTCFullYear()).padStart(4, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-const SOURCE_ORDER: Record<CashFlowSource, number> = { pending: 0, recurrence: 1, invoice: 2 };
+const SOURCE_ORDER: Record<CashFlowSource, number> = { pending: 0, recurrence: 1, payroll: 2, invoice: 3 };
 
 /**
  * Builds the projection. An event dated before today is moved to today and marked overdue (the money is still due, and

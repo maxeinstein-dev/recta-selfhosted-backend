@@ -24,3 +24,50 @@ export function diffDays(from: string, to: string): number {
   const b = parseDay(to);
   return Math.round((Date.UTC(b.year, b.month - 1, b.day) - Date.UTC(a.year, a.month - 1, a.day)) / 86_400_000);
 }
+
+/** Day of the week of a day: 0 = Sunday ... 6 = Saturday. */
+export function weekdayOf(day: string): number {
+  const d = parseDay(day);
+  return new Date(Date.UTC(d.year, d.month - 1, d.day)).getUTCDay();
+}
+
+/**
+ * The day itself when it is a weekday, else the Friday before (Saturday -1, Sunday -2). Holidays are NOT considered:
+ * the module has no holiday calendar.
+ */
+export function previousBusinessDay(day: string): string {
+  const w = weekdayOf(day);
+  if (w === 6) return addDays(day, -1);
+  if (w === 0) return addDays(day, -2);
+  return day;
+}
+
+export function lastDayOfMonth(month: string): string {
+  const m = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!m) throw new Error(`Invalid month: ${month}`);
+  return formatDay(Number(m[1]), Number(m[2]), 31);
+}
+
+/** 'YYYY-MM' + n months. */
+export function addMonths(month: string, n: number): string {
+  const index = Number(month.slice(0, 4)) * 12 + (Number(month.slice(5, 7)) - 1) + n;
+  return `${String(Math.floor(index / 12)).padStart(4, '0')}-${String((index % 12) + 1).padStart(2, '0')}`;
+}
+
+/**
+ * The n-th business day (Monday to Friday, no holidays) of the month 'YYYY-MM', as 'YYYY-MM-DD'.
+ * @throws when n is not 1..20 (every month has at least 20 weekdays).
+ */
+export function nthBusinessDay(month: string, n: number): string {
+  if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('n must be 1..20.');
+  const m = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!m) throw new Error(`Invalid month: ${month}`);
+  let count = 0;
+  for (let d = 1; d <= 31; d++) {
+    const day = formatDay(Number(m[1]), Number(m[2]), d);
+    if (Number(day.slice(8, 10)) !== d) break; // past the end of the month
+    const w = weekdayOf(day);
+    if (w !== 0 && w !== 6 && ++count === n) return day;
+  }
+  throw new Error('unreachable');
+}
