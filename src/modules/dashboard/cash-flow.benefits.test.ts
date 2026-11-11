@@ -6,7 +6,6 @@ const db = vi.hoisted(() => ({
   recurringTransaction: { findMany: vi.fn() },
   category: { findMany: vi.fn() },
   employment: { findMany: vi.fn() },
-  person: { findFirst: vi.fn() },
 }));
 
 vi.mock('../../shared/db/prisma.js', () => ({ prisma: db }));
@@ -28,9 +27,6 @@ const SAV = '00000000-0000-4000-8000-000000000002';
 const REC = '00000000-0000-4000-8000-0000000000a1';
 const REC_MEAL = '00000000-0000-4000-8000-0000000000a2';
 const EMP = '00000000-0000-4000-8000-0000000000e1';
-const EMP2 = '00000000-0000-4000-8000-0000000000e2';
-const ANA = '00000000-0000-4000-8000-0000000000b1';
-const BIA = '00000000-0000-4000-8000-0000000000b2';
 
 const account = (id: string) => ({ id, householdId: HH, name: id === CHK ? 'Checking' : 'Savings', type: 'CHECKING', balance: dec(1000), currency: 'BRL', isActive: true, linkedAccountId: null });
 
@@ -79,7 +75,6 @@ const mealItem = (over: Record<string, unknown> = {}) => ({
 const employment = (over: Record<string, unknown> = {}) => ({
   id: EMP,
   householdId: HH,
-  personId: ANA,
   regime: 'CLT',
   employer: 'Acme',
   admissionDate: utc('2025-01-10'),
@@ -109,18 +104,16 @@ const employment = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-function setup(s: { recurrences?: unknown[]; employments?: Array<Record<string, unknown>>; personExists?: boolean } = {}) {
+function setup(s: { recurrences?: unknown[]; employments?: Array<Record<string, unknown>> } = {}) {
   db.account.findMany.mockResolvedValue([account(CHK), account(SAV)]);
   db.recurringTransaction.findMany.mockResolvedValue(s.recurrences ?? []);
   db.category.findMany.mockResolvedValue([]);
   db.transaction.findMany.mockResolvedValue([]);
   const rows = s.employments ?? [];
-  // Like the real query: only the employments of the person asked for
-  db.employment.findMany.mockImplementation(async (args: { where: { personId?: string } }) => rows.filter((r) => !args.where.personId || r.personId === args.where.personId));
-  db.person.findFirst.mockResolvedValue(s.personExists === false ? null : { id: ANA });
+  db.employment.findMany.mockResolvedValue(rows);
 }
 
-const run = (over: { personId?: string; accountId?: string } = {}) => loadCashFlow({ householdId: HH, days: 90, today: TODAY, ...over });
+const run = (over: { accountId?: string } = {}) => loadCashFlow({ householdId: HH, days: 90, today: TODAY, ...over });
 const flat = (out: Awaited<ReturnType<typeof run>>) => out.days.flatMap((d) => d.events);
 const cents = (n: number) => Math.round(n * 100);
 
@@ -193,58 +186,5 @@ describe('benefit linked to a recurrence: the occurrence takes the calculated va
     setup({ recurrences: [meal], employments: [employment()] });
     const rec = flat(await run()).filter((e) => e.source === 'recurrence');
     expect(rec.map((e) => e.amount)).toEqual([700, 700, 700]);
-  });
-});
-
-describe('filter by person', () => {
-  const salaryRec = recurrence();
-  const otherRec = recurrence({ id: REC_MEAL, description: 'Side income', amount: dec(500), nextRunAt: utc('2026-11-28') });
-  const anaJob = employment({ recurringTransactionId: REC, recurringTransaction: { id: REC, accountId: CHK, isActive: true } });
-  const biaJob = employment({ id: EMP2, personId: BIA, items: [mealItem({ id: 'item-bia', values: [{ id: 'v9', amount: dec(20), startDate: utc('2026-01-01') }] })] });
-
-  it('without the filter everything is summed, as before', async () => {
-    setup({ recurrences: [salaryRec, otherRec], employments: [anaJob, biaJob] });
-    const out = await run();
-    expect(db.person.findFirst).not.toHaveBeenCalled();
-    const events = flat(out);
-    expect(events.some((e) => e.sourceId === EMP2 && e.source === 'payroll')).toBe(true);
-    expect(events.some((e) => e.sourceId === EMP && e.source === 'payroll')).toBe(true);
-    expect(events.some((e) => e.sourceId === REC_MEAL)).toBe(true);
-    expect(out.startingBalance).toBe(2000);
-    expect(db.transaction.findMany.mock.calls.some(([args]) => args.where.paid === false)).toBe(true);
-  });
-
-  it('with the filter only the employments of that person count: their salary, benefits and extras', async () => {
-    setup({ recurrences: [salaryRec, otherRec], employments: [anaJob, biaJob] });
-    const out = await run({ personId: ANA });
-    const events = flat(out);
-    expect(db.person.findFirst).toHaveBeenCalledWith({ where: { id: ANA, householdId: HH }, select: { id: true } });
-    expect(events.some((e) => e.sourceId === EMP2)).toBe(false); // the other person's benefit
-    expect(events.some((e) => e.sourceId === REC_MEAL)).toBe(false); // a recurrence no employment feeds
-    expect(events.some((e) => e.sourceId === REC && e.source === 'recurrence')).toBe(true);
-    expect(events.some((e) => e.description === '13º salário (2ª parcela)')).toBe(true);
-    expect(events.some((e) => e.source === 'payroll' && e.description === 'Meal voucher' && e.sourceId === EMP)).toBe(true);
-    // pending entries and invoices are not read, the projection starts from zero: it is the person's income
-    expect(db.transaction.findMany.mock.calls.some(([args]) => args.where.paid === false)).toBe(false);
-    expect(out.startingBalance).toBe(0);
-    const sum = events.reduce((s, e) => s + cents(e.amount), 0);
-    expect(cents(out.summary.endingBalance)).toBe(sum);
-  });
-
-  it('the other person gets their own total', async () => {
-    setup({ recurrences: [salaryRec, otherRec], employments: [anaJob, biaJob] });
-    db.person.findFirst.mockResolvedValue({ id: BIA });
-    const events = flat(await run({ personId: BIA }));
-    expect(events.map((e) => [e.sourceId, e.amount])).toEqual([
-      [EMP2, 22 * 20],
-      [EMP2, 20 * 20],
-      [EMP2, 18 * 20],
-    ]);
-  });
-
-  it('a person of another household (or that does not exist) is a 404 and nothing else is read', async () => {
-    setup({ employments: [anaJob], personExists: false });
-    await expect(run({ personId: ANA })).rejects.toMatchObject({ statusCode: 404 });
-    expect(db.account.findMany).not.toHaveBeenCalled();
   });
 });

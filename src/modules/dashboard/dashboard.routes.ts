@@ -193,7 +193,6 @@ export async function dashboardRoutes(app: FastifyInstance) {
         properties: {
           householdId: { type: 'string', format: 'uuid' },
           accountId: { type: 'string', format: 'uuid' },
-          personId: { type: 'string', format: 'uuid' },
           days: { type: 'integer', minimum: 1, maximum: 180 },
         },
       },
@@ -264,7 +263,7 @@ export async function dashboardRoutes(app: FastifyInstance) {
     const householdId = query.householdId || await ensurePersonalHousehold(request);
     await requireHouseholdMember(request, householdId);
 
-    const data = await loadCashFlow({ householdId, accountId: query.accountId, personId: query.personId, days: query.days });
+    const data = await loadCashFlow({ householdId, accountId: query.accountId, days: query.days });
     return reply.send({ success: true, data });
   });
 }

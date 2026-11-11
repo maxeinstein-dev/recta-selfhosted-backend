@@ -6,7 +6,6 @@ import { calculateCreditCardInvoice, utcToday } from '../transactions/transactio
 import { dayString, localDate } from '../recurring-transactions/recurring-dates.js';
 import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
 import { benefitEvents, benefitPaidInMonth, extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
-import { requirePerson } from '../payroll/payroll.service.js';
 import { loadPayrollLinks, type PayrollLink } from '../payroll/payroll.links.js';
 import { addDays, buildCashFlow, type CashFlowEventInput, type CashFlowProjection, type UnassignedInvoiceInput } from './cash-flow.js';
 
@@ -95,13 +94,6 @@ export interface CashFlowParams {
   accountId?: string;
   days: number;
   today?: Date;
-  /**
-   * Only the income of the employments of this person (a person of the household, else 404): the occurrences of the
-   * recurrences their employments feed, their 13th, vacation, birthday withdrawal and own benefit events. Pending
-   * entries, other recurrences and invoice payments are left out and the projection starts from zero, so the totals
-   * are the person's income. Without it, everything is as before.
-   */
-  personId?: string;
 }
 
 /**
@@ -111,8 +103,7 @@ export interface CashFlowParams {
  * the last payment of each card, and one invoice calculation per card and month of the period.
  */
 export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProjection & { currency: string | null }> {
-  const { householdId, days, personId } = params;
-  if (personId) await requirePerson(householdId, personId);
+  const { householdId, days } = params;
   const today = dayString(params.today ?? utcToday());
   const end = addDays(today, days);
   const endUtc = new Date(Date.UTC(Number(end.slice(0, 4)), Number(end.slice(5, 7)) - 1, Number(end.slice(8, 10))));
@@ -132,7 +123,7 @@ export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProj
     throw new BadRequestError('The cash accounts use different currencies: ask for one account (accountId)');
   }
   const scopeIds = new Set(scope.map((a) => a.id));
-  const startingBalanceCents = personId ? 0 : scope.reduce((sum, a) => sum + toCents(a.balance.toNumber()), 0);
+  const startingBalanceCents = scope.reduce((sum, a) => sum + toCents(a.balance.toNumber()), 0);
 
   const events: CashFlowEventInput[] = [];
   const unassignedInvoices: UnassignedInvoiceInput[] = [];
@@ -140,15 +131,13 @@ export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProj
   if (scope.length > 0) {
     // Employments feeding a salary recurrence set the value of its occurrences and add the 13th, vacation and FGTS
     // birthday events. With none, nothing below differs from a household without payroll.
-    const payroll = await loadPayrollLinks(householdId, { personId });
-    if (!personId) events.push(...(await pendingEvents(householdId, [...scopeIds], endUtc, today)));
-    events.push(...(await recurrenceEvents(householdId, [...scopeIds], today, end, payroll, !!personId)));
+    const payroll = await loadPayrollLinks(householdId);
+    events.push(...(await pendingEvents(householdId, [...scopeIds], endUtc, today)));
+    events.push(...(await recurrenceEvents(householdId, [...scopeIds], today, end, payroll)));
     events.push(...payrollEvents(payroll, scopeIds, today, end));
-    if (!personId) {
-      const invoices = await invoiceEvents(householdId, accounts, scopeIds, today, end);
-      events.push(...invoices.events);
-      unassignedInvoices.push(...invoices.unassigned);
-    }
+    const invoices = await invoiceEvents(householdId, accounts, scopeIds, today, end);
+    events.push(...invoices.events);
+    unassignedInvoices.push(...invoices.unassigned);
   }
 
   const projection = buildCashFlow({ startingBalanceCents, today, days, events, unassignedInvoices });
@@ -196,7 +185,6 @@ async function recurrenceEvents(
   today: string,
   end: string,
   payroll: readonly PayrollLink[] = [],
-  onlyPayroll = false,
 ): Promise<CashFlowEventInput[]> {
   const rows = await prisma.recurringTransaction.findMany({ where: { householdId, isActive: true, accountId: { in: accountIds } } });
   if (rows.length === 0) return [];
@@ -241,7 +229,6 @@ async function recurrenceEvents(
     // A benefit paid per business day linked to this recurrence takes the value calculated for the month it pays
     const benefitOwner = link ? undefined : payroll.find((l) => (l.data.benefits ?? []).some((b) => b.recurringTransactionId === r.id));
     const benefit = benefitOwner?.data.benefits?.find((b) => b.recurringTransactionId === r.id);
-    if (onlyPayroll && !link && !benefit) continue;
     const staleNext = dayString(r.nextRunAt) < today;
     const items = projectRecurrence(rec, { windowStart: '0001-01-01', windowEnd: end }, today, generated);
     items.forEach((item, index) => {
