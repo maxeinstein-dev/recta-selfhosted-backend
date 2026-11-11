@@ -5,6 +5,7 @@ const db = vi.hoisted(() => ({
   transaction: { findMany: vi.fn() },
   recurringTransaction: { findMany: vi.fn() },
   category: { findMany: vi.fn() },
+  employment: { findMany: vi.fn() },
 }));
 const invoice = vi.hoisted(() => ({ calculate: vi.fn() }));
 
@@ -97,6 +98,7 @@ function setup(s: Setup = {}) {
   db.account.findMany.mockResolvedValue(s.accounts ?? [account(CHK)]);
   db.recurringTransaction.findMany.mockResolvedValue(s.recurrences ?? []);
   db.category.findMany.mockResolvedValue([]);
+  db.employment.findMany.mockResolvedValue([]); // no employment linked to a recurrence
   db.transaction.findMany.mockImplementation(async (args: { where: Record<string, unknown> }) => {
     if (args.where.paid === false) return s.pending ?? [];
     if (args.where.recurringTransactionId) return s.existing ?? [];

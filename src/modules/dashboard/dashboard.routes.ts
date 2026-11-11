@@ -174,7 +174,7 @@ export async function dashboardRoutes(app: FastifyInstance) {
       date: { type: 'string' },
       description: { type: 'string' },
       amount: { type: 'number' },
-      source: { type: 'string', enum: ['pending', 'recurrence', 'invoice'] },
+      source: { type: 'string', enum: ['pending', 'recurrence', 'payroll', 'invoice'] },
       certainty: { type: 'string', enum: ['confirmed', 'expected', 'estimated'] },
       overdue: { type: 'boolean' },
       originalDate: { type: ['string', 'null'] },
