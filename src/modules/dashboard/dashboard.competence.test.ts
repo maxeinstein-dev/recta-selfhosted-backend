@@ -19,6 +19,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
       findMany: vi.fn(async (args: { where?: Record<string, unknown> }) =>
         store.transactions.filter((r) => matchesWhere(r as Row, args.where)).map(out)),
     },
+    transactionShare: { findMany: vi.fn(async () => []) }, // no shares in these scenarios
     account: { findMany: vi.fn(async () => []) },
     budget: {
       findMany: vi.fn(async () => store.budgets.map((b) => ({ ...b, monthlyLimit: decimal(b.monthlyLimit as number) }))),

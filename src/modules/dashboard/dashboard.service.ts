@@ -1,6 +1,7 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { parseMonthFilter, utcDayString } from '../../shared/utils/pagination.js';
 import { addMonths, effectiveMonthWhere } from '../../shared/utils/competence.js';
+import { deductionCents, loadTheirShares, ownAmountCents, type TheirShare } from '../people/own-share.js';
 import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
 import { AccountType, TransactionType, CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
@@ -51,6 +52,7 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
     recurringTransactionsRaw,
     last6MonthsData,
     last12MonthsData,
+    theirShares,
   ] = await Promise.all([
     // Current month transactions
     prisma.transaction.findMany({
@@ -91,6 +93,8 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
     getMonthlyAggregates(householdId, 6, month, creditCardIds),
     // Last 12 months aggregated data for balance evolution
     getMonthlyAggregates(householdId, 12, month, creditCardIds),
+    // What other people owe on the expenses of the month (one query over the shares only)
+    loadTheirShares(prisma, householdId, { AND: [effectiveMonthWhere(month)] } as never),
   ]);
 
   // Infer transaction type from category for recurring transactions
@@ -117,7 +121,7 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
   const forecast = calculateForecast(previousSummary, recurringTransactions, creditCardIds);
 
   // Calculate category breakdown
-  const categoryBreakdown = calculateCategoryBreakdown(currentMonthTransactions, creditCardIds);
+  const categoryBreakdown = calculateCategoryBreakdown(currentMonthTransactions, creditCardIds, theirShares);
 
   // Monthly comparison (last 6 months)
   const monthlyComparison = formatMonthlyComparison(last6MonthsData);
@@ -137,7 +141,8 @@ export async function getDashboardOverview(query: DashboardOverviewQuery): Promi
     budgets,
     currentMonthTransactions,
     summary,
-    creditCardIds
+    creditCardIds,
+    theirShares
   );
 
   // Heatmap (daily spending)
@@ -303,6 +308,13 @@ function getMonthlyMultiplier(frequency?: string): number {
   }
 }
 
+/** The own share of one expense transaction (|amount| minus what people owe the user on it, floor zero), in reais. */
+function ownExpenseOf(t: { id?: string }, amount: number, theirShares: ReadonlyMap<string, TheirShare>): number {
+  const share = t.id ? theirShares.get(t.id) : undefined;
+  if (!share) return Math.abs(amount);
+  return ownAmountCents(Math.round(Math.abs(amount) * 100), share.theirCents) / 100;
+}
+
 /**
  * Calculate spending by category
  */
@@ -313,10 +325,12 @@ function calculateCategoryBreakdown(
     categoryName: string | null;
     accountId: string | null;
     account: { type: string } | null;
+    id?: string;
   }>,
-  creditCardIds: Set<string>
+  creditCardIds: Set<string>,
+  theirShares: ReadonlyMap<string, TheirShare> = new Map()
 ): CategoryBreakdown[] {
-  const categoryMap = new Map<string, { income: number; expense: number }>();
+  const categoryMap = new Map<string, { income: number; expense: number; ownExpense: number }>();
 
   for (const t of transactions) {
     if (!t.categoryName) continue;
@@ -327,7 +341,7 @@ function calculateCategoryBreakdown(
     const amount = typeof t.amount === 'number' ? t.amount : t.amount.toNumber();
     
     if (!categoryMap.has(t.categoryName)) {
-      categoryMap.set(t.categoryName, { income: 0, expense: 0 });
+      categoryMap.set(t.categoryName, { income: 0, expense: 0, ownExpense: 0 });
     }
 
     const cat = categoryMap.get(t.categoryName)!;
@@ -335,6 +349,7 @@ function calculateCategoryBreakdown(
       cat.income += amount;
     } else if (t.type === TransactionType.EXPENSE) {
       cat.expense += Math.abs(amount);
+      cat.ownExpense += ownExpenseOf(t, amount, theirShares);
     }
   }
 
@@ -343,6 +358,7 @@ function calculateCategoryBreakdown(
       name,
       income: data.income,
       expense: data.expense,
+      ownExpense: data.ownExpense,
       total: data.income - data.expense,
     }))
     .filter(c => c.income !== 0 || c.expense !== 0)
@@ -506,12 +522,16 @@ function calculateBudgetVsRealized(
     categoryName: string | null;
     accountId: string | null;
     account: { type: string } | null;
+    id?: string;
   }>,
   summary: DashboardSummary,
-  creditCardIds: Set<string>
+  creditCardIds: Set<string>,
+  theirShares: ReadonlyMap<string, TheirShare> = new Map()
 ): BudgetVsRealized[] {
   // Calculate spending by category
   const categorySpending = new Map<string, number>();
+  const categoryOwnSpending = new Map<string, number>();
+  let ownTotalExpense = 0;
   const categoryIncome = new Map<string, number>();
 
   for (const t of transactions) {
@@ -524,8 +544,22 @@ function calculateBudgetVsRealized(
 
     if (t.type === TransactionType.EXPENSE) {
       categorySpending.set(t.categoryName, (categorySpending.get(t.categoryName) || 0) + amount);
+      const own = ownExpenseOf(t, amount, theirShares);
+      categoryOwnSpending.set(t.categoryName, (categoryOwnSpending.get(t.categoryName) || 0) + own);
     } else if (t.type === TransactionType.INCOME) {
       categoryIncome.set(t.categoryName, (categoryIncome.get(t.categoryName) || 0) + amount);
+    }
+  }
+
+  if (theirShares.size === 0) {
+    ownTotalExpense = summary.totalExpense;
+  } else {
+    // Same set as calculateSummary (the General budget counts every expense, with or without category)
+    for (const t of transactions) {
+      if (t.type !== TransactionType.EXPENSE) continue;
+      if (t.accountId && creditCardIds.has(t.accountId)) continue;
+      if (t.account && t.account.type === AccountType.CREDIT) continue;
+      ownTotalExpense += ownExpenseOf(t, typeof t.amount === 'number' ? t.amount : t.amount.toNumber(), theirShares);
     }
   }
 
@@ -533,14 +567,17 @@ function calculateBudgetVsRealized(
     const budgeted = typeof budget.monthlyLimit === 'number' ? budget.monthlyLimit : budget.monthlyLimit.toNumber();
     const isExpenseBudget = budget.type === CategoryType.EXPENSE || budget.type === 'EXPENSE';
     let spent: number;
+    let ownSpent: number;
 
     if (budget.categoryName === 'Geral' || budget.categoryName === GENERAL_BUDGET_CATEGORY) {
       // General budget - use total
       spent = isExpenseBudget ? summary.totalExpense : summary.totalIncome;
+      ownSpent = isExpenseBudget ? ownTotalExpense : spent;
     } else {
       spent = isExpenseBudget
         ? (categorySpending.get(budget.categoryName) || 0)
         : (categoryIncome.get(budget.categoryName) || 0);
+      ownSpent = isExpenseBudget ? (categoryOwnSpending.get(budget.categoryName) || 0) : spent;
     }
 
     const percentage = budgeted > 0 ? (spent / budgeted) * 100 : 0;
@@ -553,6 +590,7 @@ function calculateBudgetVsRealized(
       type: (isExpenseBudget ? 'EXPENSE' : 'INCOME') as 'INCOME' | 'EXPENSE',
       budgeted,
       spent,
+      ownSpent,
       remaining,
       percentage: Math.min(percentage, 1000), // Cap at 1000%
       status,

@@ -5,6 +5,7 @@ import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
 import { CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
+import { deductionCents, loadTheirShares } from '../people/own-share.js';
 import type {
   CreateBudgetInput,
   UpdateBudgetInput,
@@ -206,6 +207,11 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
     return getCategoryColor(categoryName as any);
   }
 
+  // What other people owe on the expenses of the period, in one query (only transactions that have shares)
+  const theirShares = householdId && budgets.some((b) => b.type === 'EXPENSE')
+    ? [...(await loadTheirShares(prisma, householdId, periodWhere as Prisma.TransactionWhereInput)).values()]
+    : [];
+
   // Get spending for each budget category
   const budgetSummaries = await Promise.all(
     budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; type: string; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
@@ -242,6 +248,15 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
         }, 0);
       }
 
+      // Own share: the same spending without the parts other people owe back (expense budgets only)
+      const sharedCents =
+        budget.type !== 'EXPENSE'
+          ? 0
+          : theirShares
+              .filter((share) => budget.categoryName === GENERAL_BUDGET_CATEGORY || share.categoryName === budget.categoryName)
+              .reduce((sum, share) => sum + deductionCents(share), 0);
+      const ownSpent = sharedCents === 0 ? spending : Math.max(0, Math.round(spending * 100) - sharedCents) / 100;
+
       const limit = budget.monthlyLimit.toNumber();
       const remaining = limit - spending;
       const percentage = limit > 0 ? (spending / limit) * 100 : 0;
@@ -252,6 +267,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
         categoryColor: categoryColor(budget.categoryName),
         monthlyLimit: limit,
         spending,
+        ownSpent,
         remaining,
         percentage: Math.round(percentage * 100) / 100,
         isOverBudget: spending > limit,
@@ -263,6 +279,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
     budgets: budgetSummaries,
     totalLimit: budgets.reduce((sum: number, b: { monthlyLimit: Prisma.Decimal }) => sum + b.monthlyLimit.toNumber(), 0),
     totalSpending: budgetSummaries.reduce((sum: number, b: { spending: number }) => sum + b.spending, 0),
+    totalOwnSpending: budgetSummaries.reduce((sum: number, b: { ownSpent: number }) => sum + b.ownSpent, 0),
   };
 }
 

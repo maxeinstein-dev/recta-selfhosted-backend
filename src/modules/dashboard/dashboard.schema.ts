@@ -37,6 +37,8 @@ export interface CategoryBreakdown {
   name: string;
   income: number;
   expense: number;
+  /** Expense by the user's own share: each expense minus what other people owe the user on it (never below zero). */
+  ownExpense: number;
   total: number;
 }
 
@@ -63,6 +65,8 @@ export interface BudgetVsRealized {
   type: 'INCOME' | 'EXPENSE';
   budgeted: number;
   spent: number;
+  /** `spent` by the user's own share (expense budgets; equal to `spent` for income budgets and without shares). */
+  ownSpent: number;
   remaining: number;
   percentage: number;
   status: 'ok' | 'warning' | 'exceeded';
