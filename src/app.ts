@@ -31,6 +31,7 @@ import { dashboardRoutes } from './modules/dashboard/index.js';
 import { deviceRoutes } from './modules/devices/index.js';
 import { captureRoutes } from './modules/captures/index.js';
 import { buildCommit } from './shared/utils/buildInfo.js';
+import { payrollRoutes } from './modules/payroll/index.js';
 import { organizeRoutes, peopleRoutes, settlementRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
@@ -321,6 +322,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(peopleRoutes, { prefix: '/people' });
   await app.register(organizeRoutes, { prefix: '/people' });
   await app.register(settlementRoutes, { prefix: '/settlements' });
+  await app.register(payrollRoutes, { prefix: '/payroll' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
   await app.register(recurringTransactionRoutes, { prefix: '/recurring-transactions' });
