@@ -655,18 +655,18 @@ function eventsRange(q: { from?: string; to?: string }, today: string): { from: 
   return { from, to };
 }
 
-export async function getEmploymentEvents(householdId: string, id: string, q: { from?: string; to?: string }, today = todayString()) {
+export async function getEmploymentEvents(householdId: string, id: string, q: { from?: string; to?: string; includePast?: boolean }, today = todayString()) {
   const row = await prisma.employment.findFirst({ where: { id, householdId }, ...full });
   if (!row) throw new NotFoundError('Employment');
   if (row.regime !== 'CLT') throw new BadRequestError('Only CLT employments have a payroll forecast');
   const range = eventsRange(q, today);
-  return moneyDeep({ ...range, today, ...buildPayrollEvents(toEmploymentData(row), { ...range, today }) });
+  return moneyDeep({ ...range, today, ...buildPayrollEvents(toEmploymentData(row), { ...range, today, ...(q.includePast ? { includePast: true } : {}) }) });
 }
 
 /** The events of every active CLT employment of the household, one entry each (each event set carries its employment id). */
-export async function getHouseholdEvents(householdId: string, q: { from?: string; to?: string; personId?: string }, today = todayString()) {
+export async function getHouseholdEvents(householdId: string, q: { from?: string; to?: string; personId?: string; includePast?: boolean }, today = todayString()) {
   if (q.personId) await requirePerson(householdId, q.personId);
   const rows = await prisma.employment.findMany({ where: { householdId, isActive: true, regime: 'CLT', ...(q.personId ? { personId: q.personId } : {}) }, orderBy: { createdAt: 'asc' }, ...full });
   const range = eventsRange(q, today);
-  return moneyDeep({ ...range, today, employments: rows.map((row) => buildPayrollEvents(toEmploymentData(row), { ...range, today })) });
+  return moneyDeep({ ...range, today, employments: rows.map((row) => buildPayrollEvents(toEmploymentData(row), { ...range, today, ...(q.includePast ? { includePast: true } : {}) })) });
 }
