@@ -49,7 +49,8 @@ export type MaxFinRowStatus =
   | 'changed' // same sourceRef already imported with a different amount or paid flag
   | 'replaces-future' // generated future installments of the same plan (from an earlier import) are superseded by this row
   | 'legacy-duplicate' // no sourceRef match, but an identical (account, day, amount, description) exists
-  | 'matches-recurring'; // an expense a recurrence of the same account and description already covers this month: the sheet takes it over (needs replace: true)
+  | 'matches-recurring' // an expense a recurrence of the same account and description already covers this month: the sheet takes it over (needs replace: true)
+  | 'shifted'; // the stored row of this entry is on another line (rows were inserted or removed above): see `realignments`; never importable
 
 export interface MaxFinPreviewRow {
   sourceLine: number;
@@ -147,6 +148,64 @@ export interface MaxFinPreviewTotals {
   skipped: number;
 }
 
+/** One stored transaction a realignment moves to another line (only its sourceRef changes). */
+export interface MaxFinRealignMove {
+  transactionId: string;
+  /** Current sourceRef. */
+  from: string;
+  /** sourceRef after the realignment. */
+  to: string;
+  sheetLine: number;
+  /** The identity was compared with the sheet row; false = it travels with its verified neighbours. */
+  verified: boolean;
+  /** What the sheet row says (echoed back at confirm so the server can check it again); null when not verified. */
+  sheet: {
+    description: string;
+    type: 'INCOME' | 'EXPENSE';
+    amount: number;
+    installment: { number: number; total: number } | null;
+  } | null;
+  /** For display. */
+  storedDescription: string | null;
+  storedAmount: number;
+}
+
+export interface MaxFinRealignRemoved {
+  transactionId: string;
+  from: string;
+  to: string;
+  description: string | null;
+  amount: number;
+}
+
+/**
+ * Proposal to realign a block of rows the sheet moved (rows inserted above: `shift` > 0, removed: `shift` < 0).
+ * Confirming it changes only the `sourceRef` of the transactions listed here (and of their generated future
+ * installments and absorbed-row references); nothing else about them.
+ */
+export interface MaxFinRealignProposal {
+  /** Stable for the same sheet and stored data; echoed back at confirm. */
+  id: string;
+  section: MaxFinSectionKey;
+  kind: 'insertion' | 'removal';
+  shift: number;
+  firstLine: number;
+  lastLine: number;
+  moves: MaxFinRealignMove[];
+  /** Removed rows' transactions (shift < 0): they stay in the ledger and take a line the block vacates. */
+  removed: MaxFinRealignRemoved[];
+  /** Sheet refs of the rows that are new because of the insertion (status new in `rows`). */
+  insertedRefs: string[];
+  /** Ids of proposals that must be applied together with this one. */
+  requires: string[];
+  /** False when ambiguous: the proposal comes unticked and `reason` says why. */
+  defaultSelected: boolean;
+  ambiguous: boolean;
+  reason: string | null;
+  /** Human summary (pt-BR). */
+  detail: string;
+}
+
 export interface MaxFinPreviewResponse {
   month: MaxFinMonth | null;
   /** YYYY-MM or null when the month could not be detected. */
@@ -164,6 +223,8 @@ export interface MaxFinPreviewResponse {
   invoice: MaxFinInvoicePreview | null;
   warnings: string[];
   totals: MaxFinPreviewTotals;
+  /** Blocks of rows the sheet shifted (rows inserted or removed): proposals to realign, see MaxFinRealignProposal. */
+  realignments: MaxFinRealignProposal[];
 }
 
 export type MaxFinCategoryTargetInput =
@@ -200,12 +261,39 @@ export interface MaxFinConfirmRow {
   replace?: boolean;
 }
 
+/**
+ * The decision on a realignment proposal of the preview: send the proposal back as it came, with `apply` true (ticked)
+ * or false (unticked). The server checks it again against the stored data; nothing of a block without a decision is
+ * replaced (its rows are skipped), and a block with `apply: false` stays as it is.
+ */
+export interface MaxFinRealignDecision {
+  id: string;
+  apply: boolean;
+  section: MaxFinSectionKey;
+  shift: number;
+  moves: Array<Pick<MaxFinRealignMove, 'transactionId' | 'from' | 'to' | 'sheetLine' | 'verified' | 'sheet'>>;
+  removed?: Array<Pick<MaxFinRealignRemoved, 'transactionId' | 'from' | 'to'>>;
+  requires?: string[];
+}
+
 export interface MaxFinConfirmRequest {
   month: MaxFinMonth;
   accounts: MaxFinAccountsInput;
   options: MaxFinImportOptions;
   categoryMap: MaxFinCategoryMapInput[];
+  /** May be empty when `realignments` applies one. */
   rows: MaxFinConfirmRow[];
+  /** Decisions on the preview's realignment proposals (optional: clients that predate them never send it). */
+  realignments?: MaxFinRealignDecision[];
+}
+
+export interface MaxFinRealignOutcome {
+  id: string;
+  status: 'applied' | 'already-applied' | 'declined' | 'skipped';
+  /** Transactions whose sourceRef changed. */
+  moved: number;
+  /** pt-BR; why it was skipped, or that it stays pending. */
+  reason: string | null;
 }
 
 export interface MaxFinConfirmResponse {
@@ -221,6 +309,10 @@ export interface MaxFinConfirmResponse {
   createdCategories: Array<{ id: string; name: string; type: 'INCOME' | 'EXPENSE' }>;
   invoicePayment: { transactionId: string; amount: number; date: string } | null;
   ids: string[];
+  /** Transactions whose sourceRef a realignment changed (moves, removed rows and generated installments). */
+  realigned: number;
+  /** One entry per decision received in `realignments` (empty when there was none). */
+  realignments: MaxFinRealignOutcome[];
   /** Non-fatal notices (e.g. invoice payment skipped because one already exists for the month). */
   warnings: string[];
 }

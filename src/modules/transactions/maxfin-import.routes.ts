@@ -95,6 +95,38 @@ export const categoryTargetSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('default') }),
 ]);
 
+const realignInstallmentSchema = z.object({ number: z.number().int().min(1).max(99), total: z.number().int().min(1).max(99) }).nullable();
+
+/** The decision on a realignment proposal of the preview, echoed back (see MaxFinRealignDecision). */
+export const maxfinRealignDecisionSchema = z.object({
+  id: z.string().min(1).max(120),
+  apply: z.boolean(),
+  section: sectionSchema,
+  shift: z.number().int().min(-60).max(60),
+  moves: z
+    .array(
+      z.object({
+        transactionId: uuid,
+        from: z.string().min(1).max(120),
+        to: z.string().min(1).max(120),
+        sheetLine: z.number().int().min(1).max(100_000),
+        verified: z.boolean(),
+        sheet: z
+          .object({
+            description: z.string().max(255),
+            type: typeSchema,
+            amount: z.number().positive().max(1_000_000_000),
+            installment: realignInstallmentSchema,
+          })
+          .nullable(),
+      }),
+    )
+    .min(1)
+    .max(500),
+  removed: z.array(z.object({ transactionId: uuid, from: z.string().min(1).max(120), to: z.string().min(1).max(120) })).max(60).optional(),
+  requires: z.array(z.string().max(120)).max(50).optional(),
+});
+
 export const maxfinConfirmBodySchema = z.object({
   month: maxfinMonthSchema,
   accounts: maxfinAccountsSchema,
@@ -118,8 +150,13 @@ export const maxfinConfirmBodySchema = z.object({
         replace: z.boolean().optional(),
       }),
     )
-    .min(1)
     .max(500),
+  realignments: z.array(maxfinRealignDecisionSchema).max(50).optional(),
+}).superRefine((body, ctx) => {
+  // A confirm needs rows to import, unless it only decides realignments.
+  if (body.rows.length === 0 && (body.realignments?.length ?? 0) === 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.too_small, minimum: 1, type: 'array', inclusive: true, path: ['rows'], message: 'Array must contain at least 1 element(s)' });
+  }
 });
 
 interface MaxFinUpload {
