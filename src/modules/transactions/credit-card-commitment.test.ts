@@ -14,12 +14,15 @@ const invoice = (
   postedCents: number,
   forecastCents: number,
   state: CommitmentInput['state'] = 'open',
+  parts: { installmentCents?: number; recurringCents?: number } = {},
 ): CommitmentInput => ({
   month,
   closingDate: `${month}-03`,
   dueDate: `${month}-10`,
   state,
   postedCents,
+  installmentCents: parts.installmentCents ?? 0,
+  recurringCents: parts.recurringCents ?? 0,
   forecastCents,
 });
 
@@ -52,7 +55,7 @@ describe('buildCommitment', () => {
       incomeShare: 0.25,
     });
     expect(result.months[1]).toMatchObject({ posted: 400, forecast: 250, expectedTotal: 650, incomeShare: 0.13 });
-    expect(result.totals).toEqual({ posted: 1400, forecast: 500, expectedTotal: 1900, expectedIncome: 10000, incomeShare: 0.19 });
+    expect(result.totals).toEqual({ posted: 1400, postedInstallments: 0, postedRecurrences: 0, postedPurchases: 1400, forecast: 500, expectedTotal: 1900, expectedIncome: 10000, incomeShare: 0.19 });
   });
 
   it('sums in whole cents: values that drift in binary still add up exactly', () => {
@@ -89,10 +92,62 @@ describe('buildCommitment', () => {
     expect(result.months[0]).toMatchObject({ closingDate: '2026-05-03', dueDate: '2026-05-10' });
     expect(buildCommitment('card-1', [], new Map()).totals).toEqual({
       posted: 0,
+      postedInstallments: 0,
+      postedRecurrences: 0,
+      postedPurchases: 0,
       forecast: 0,
       expectedTotal: 0,
       expectedIncome: 0,
       incomeShare: null,
+    });
+  });
+
+  describe('posted split into installments, recurrences and purchases', () => {
+    const withParts = buildCommitment(
+      'card-1',
+      [
+        // 1000.00 posted = 600.00 installments + 150.00 recurrences + 250.00 purchases
+        invoice('2026-03', 100000, 25000, 'open', { installmentCents: 60000, recurringCents: 15000 }),
+        // 400.00 posted = 0 installments + 120.00 recurrences + 280.00 purchases (a month without installment)
+        invoice('2026-04', 40000, 0, 'open', { recurringCents: 12000 }),
+        // -30.00 posted = 0 installments + 0 recurrences + -30.00 purchases (a refund only)
+        invoice('2026-05', -3000, 0),
+      ],
+      new Map(),
+    );
+
+    it('the three parts add up to posted in every month and in the totals', () => {
+      for (const m of withParts.months) {
+        expect(m.postedInstallments + m.postedRecurrences + m.postedPurchases).toBeCloseTo(m.posted, 2);
+      }
+      const t = withParts.totals;
+      expect(t.postedInstallments + t.postedRecurrences + t.postedPurchases).toBeCloseTo(t.posted, 2);
+    });
+
+    it('the total does not change: posted and expectedTotal are the same as without the split', () => {
+      const plain = buildCommitment(
+        'card-1',
+        [invoice('2026-03', 100000, 25000), invoice('2026-04', 40000, 0), invoice('2026-05', -3000, 0)],
+        new Map(),
+      );
+      expect(withParts.totals.posted).toBe(plain.totals.posted);
+      expect(withParts.totals.expectedTotal).toBe(plain.totals.expectedTotal);
+      expect(withParts.totals.forecast).toBe(plain.totals.forecast);
+      expect(withParts.months.map((m) => m.posted)).toEqual(plain.months.map((m) => m.posted));
+      expect(withParts.months.map((m) => m.expectedTotal)).toEqual(plain.months.map((m) => m.expectedTotal));
+    });
+
+    it('splits each month and sums the parts in whole cents', () => {
+      expect(withParts.months[0]).toMatchObject({ posted: 1000, postedInstallments: 600, postedRecurrences: 150, postedPurchases: 250 });
+      expect(withParts.months[1]).toMatchObject({ posted: 400, postedInstallments: 0, postedRecurrences: 120, postedPurchases: 280 });
+      expect(withParts.totals).toMatchObject({ posted: 1370, postedInstallments: 600, postedRecurrences: 270, postedPurchases: 500 });
+    });
+
+    it('a month without installments shows zero there and keeps its recurrences and purchases', () => {
+      expect(withParts.months[1]).toMatchObject({ postedInstallments: 0, postedRecurrences: 120, postedPurchases: 280 });
+      const noInstallment = buildCommitment('card-1', [invoice('2026-06', 5000, 0)], new Map());
+      expect(noInstallment.months[0]).toMatchObject({ postedInstallments: 0, postedRecurrences: 0, postedPurchases: 50 });
+      expect(noInstallment.totals.postedInstallments).toBe(0);
     });
   });
 });
