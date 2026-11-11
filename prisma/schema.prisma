@@ -193,6 +193,7 @@ model Account {
   savingsGoals          SavingsGoal[]
   captureAccountRules   CaptureAccountRule[]
   employments           Employment[]
+  employmentItems       EmploymentItem[]
 
   // Indexes
   @@index([householdId])
@@ -452,6 +453,7 @@ model RecurringTransaction {
   account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
   transactions Transaction[]
   employment   Employment?
+  employmentItem EmploymentItem?
 
   // Indexes
   // REGRA DE NEGÓCIO: Índice em nextRunAt para otimizar busca do cronjob
@@ -517,6 +519,7 @@ model Person {
   aliases     PersonAlias[]
   shares      TransactionShare[]
   settlements Settlement[]
+  employments Employment[]
 
   @@index([householdId])
   @@map("people")
@@ -769,6 +772,12 @@ enum PayrollItemKind {
   DEDUCTION
 }
 
+// How an employment item is calculated: a fixed monthly value, or a value per business day of the reference month.
+enum PayrollItemCalc {
+  FIXED_MONTHLY
+  PER_BUSINESS_DAY
+}
+
 // Work regime of the employment. Only CLT has payroll calculation; others can be added later.
 enum EmploymentRegime {
   CLT
@@ -807,11 +816,18 @@ model Employment {
   thirteenthFirstDay     Int                  @default(30) @map("thirteenth_first_day")
   thirteenthSecondMonth  Int                  @default(12) @map("thirteenth_second_month")
   thirteenthSecondDay    Int                  @default(20) @map("thirteenth_second_day")
+  // Owner of the employment (a Person of the household); null on rows created before the owner existed.
+  personId               String?              @map("person_id") @db.Uuid
+  // Holiday calendar: UF and city (null UF = weekends only). Optional days (carnival, Corpus Christi) count as days off when true.
+  holidayUf              String?              @map("holiday_uf") @db.VarChar(2)
+  holidayCity            String?              @map("holiday_city") @db.VarChar(80)
+  optionalHolidaysOff    Boolean              @default(false) @map("optional_holidays_off")
   isActive               Boolean              @default(true) @map("is_active")
   createdAt              DateTime             @default(now()) @map("created_at")
   updatedAt              DateTime             @updatedAt @map("updated_at")
 
   household            Household                  @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  person               Person?                    @relation(fields: [personId], references: [id], onDelete: Restrict)
   account              Account?                   @relation(fields: [accountId], references: [id], onDelete: SetNull)
   recurringTransaction RecurringTransaction?      @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
   salaries             EmploymentSalary[]
@@ -822,6 +838,7 @@ model Employment {
   fgtsWithdrawals      EmploymentFgtsWithdrawal[]
 
   @@index([householdId])
+  @@index([personId])
   @@map("employments")
 }
 
@@ -849,11 +866,22 @@ model EmploymentItem {
   inInssBase   Boolean         @default(false) @map("in_inss_base")
   inIrrfBase   Boolean         @default(false) @map("in_irrf_base")
   inFgtsBase   Boolean         @default(false) @map("in_fgts_base")
+  // PER_BUSINESS_DAY: the value history is the value per day; the fields below apply only to it.
+  calcMode               PayrollItemCalc @default(FIXED_MONTHLY) @map("calc_mode")
+  marginDays             Int             @default(0) @map("margin_days")
+  payDay                 Int?            @map("pay_day")
+  // Reference month minus payment month, in months (1 = paid the month before the days it counts).
+  referenceMonthOffset   Int             @default(0) @map("reference_month_offset")
+  accountId              String?         @map("account_id") @db.Uuid
+  isAvailableCash        Boolean         @default(true) @map("is_available_cash")
+  recurringTransactionId String?         @unique @map("recurring_transaction_id") @db.Uuid
   createdAt    DateTime        @default(now()) @map("created_at")
   updatedAt    DateTime        @updatedAt @map("updated_at")
 
-  employment Employment            @relation(fields: [employmentId], references: [id], onDelete: Cascade)
-  values     EmploymentItemValue[]
+  employment           Employment            @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+  account              Account?              @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  recurringTransaction RecurringTransaction? @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
+  values               EmploymentItemValue[]
 
   @@index([employmentId])
   @@map("employment_items")

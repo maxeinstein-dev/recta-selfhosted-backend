@@ -2,7 +2,8 @@ import { prisma } from '../../shared/db/prisma.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
 import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
 import { formatDay } from '../payroll/payroll-dates.js';
-import { extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
+import { benefitPaidInMonth, extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
+import { requirePerson } from '../payroll/payroll.service.js';
 import { loadPayrollLinks } from '../payroll/payroll.links.js';
 import { fromCents, toCents, type InvoiceState } from './credit-card-invoice-forecast.js';
 import { calculateCreditCardInvoice, utcToday } from './transactions.service.js';
@@ -97,10 +98,15 @@ export function buildCommitment(
  * An employment linked to a salary recurrence replaces that recurrence's amount with the calculated net paid in the
  * month, and adds the 13th, vacation and FGTS birthday withdrawal of the month they fall in (nothing is filtered by
  * today: it is the income of the month). Without a linked employment the result is the one of the recurrences alone.
+ * Benefits paid per business day: a benefit linked to a recurrence replaces that recurrence's amount with the calculated
+ * value of the month it pays; one without a recurrence adds its own value in its payment month. A benefit that is not
+ * available money (`isAvailableCash` false) is never income here.
+ * With `personId` only the income of that person's employments counts (their salary, extras and benefits): recurrences
+ * no employment feeds cannot be attributed to a person and are left out.
  */
-export async function expectedIncomeByMonth(householdId: string, months: readonly string[]): Promise<Map<string, number>> {
+export async function expectedIncomeByMonth(householdId: string, months: readonly string[], filter: { personId?: string } = {}): Promise<Map<string, number>> {
   const result = new Map<string, number>(months.map((m) => [m, 0]));
-  const payroll = await loadPayrollLinks(householdId);
+  const payroll = await loadPayrollLinks(householdId, { personId: filter.personId });
   const rows = await prisma.recurringTransaction.findMany({ where: { householdId, isActive: true, frequency: 'MONTHLY' } });
   if (rows.length > 0) {
     const batch = await forecastBatch(prisma, rows);
@@ -109,10 +115,14 @@ export async function expectedIncomeByMonth(householdId: string, months: readonl
       const first = dayString(row.nextRunAt).slice(0, 7);
       const last = row.endDate ? dayString(row.endDate).slice(0, 7) : null;
       const link = payroll.find((l) => l.recurringTransactionId === row.id);
+      const benefitOwner = link ? undefined : payroll.find((l) => (l.data.benefits ?? []).some((b) => b.recurringTransactionId === row.id));
+      const benefit = benefitOwner?.data.benefits?.find((b) => b.recurringTransactionId === row.id);
+      if (filter.personId && !link && !benefit) continue;
       for (const month of months) {
         if (month < first || (last && month > last)) continue;
         const calc = link ? salaryPaidInMonth(link.data, month) : null;
-        result.set(month, (result.get(month) ?? 0) + (calc ? calc.netCents : toCents(batch.expected(row, month).amount)));
+        const benefitCalc = benefit && benefitOwner ? benefitPaidInMonth(benefitOwner.data, benefit, month) : null;
+        result.set(month, (result.get(month) ?? 0) + (calc ? calc.netCents : benefitCalc ? benefitCalc.amountCents : toCents(batch.expected(row, month).amount)));
       }
     }
   }
@@ -129,6 +139,16 @@ export async function expectedIncomeByMonth(householdId: string, months: readonl
       }
     }
   }
+  // Benefits paid per business day without a recurrence, in the month they are paid
+  for (const link of payroll) {
+    for (const b of link.data.benefits ?? []) {
+      if (b.recurringTransactionId || !b.isAvailableCash) continue;
+      for (const month of months) {
+        const ev = benefitPaidInMonth(link.data, b, month);
+        if (ev) result.set(month, (result.get(month) ?? 0) + ev.amountCents);
+      }
+    }
+  }
   return result;
 }
 
@@ -139,8 +159,9 @@ export async function expectedIncomeByMonth(householdId: string, months: readonl
 export async function getCreditCardCommitment(
   accountId: string,
   householdId: string,
-  options: { months?: number; from?: string; today?: Date } = {},
+  options: { months?: number; from?: string; today?: Date; personId?: string } = {},
 ): Promise<CardCommitment> {
+  if (options.personId) await requirePerson(householdId, options.personId);
   const count = Math.min(12, Math.max(1, options.months ?? 6));
   const today = options.today ?? utcToday();
   const from = options.from ?? dayString(today).slice(0, 7);
@@ -158,5 +179,5 @@ export async function getCreditCardCommitment(
       forecastCents: toCents(data.forecast.total),
     });
   }
-  return buildCommitment(accountId, invoices, await expectedIncomeByMonth(householdId, keys));
+  return buildCommitment(accountId, invoices, await expectedIncomeByMonth(householdId, keys, { personId: options.personId }));
 }

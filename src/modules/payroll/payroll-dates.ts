@@ -31,15 +31,20 @@ export function weekdayOf(day: string): number {
   return new Date(Date.UTC(d.year, d.month - 1, d.day)).getUTCDay();
 }
 
-/**
- * The day itself when it is a weekday, else the Friday before (Saturday -1, Sunday -2). Holidays are NOT considered:
- * the module has no holiday calendar.
- */
-export function previousBusinessDay(day: string): string {
+/** True for a weekday that is not an off day (`isOff`: holidays of the employment calendar; default none). */
+export function isBusinessDay(day: string, isOff?: (day: string) => boolean): boolean {
   const w = weekdayOf(day);
-  if (w === 6) return addDays(day, -1);
-  if (w === 0) return addDays(day, -2);
-  return day;
+  return w !== 0 && w !== 6 && !(isOff?.(day) ?? false);
+}
+
+/**
+ * The day itself when it is a business day, else the closest business day before it. Without `isOff` only weekends
+ * are skipped (Saturday -1, Sunday -2); with it, holidays are skipped too.
+ */
+export function previousBusinessDay(day: string, isOff?: (day: string) => boolean): string {
+  let d = day;
+  while (!isBusinessDay(d, isOff)) d = addDays(d, -1);
+  return d;
 }
 
 export function lastDayOfMonth(month: string): string {
@@ -55,10 +60,11 @@ export function addMonths(month: string, n: number): string {
 }
 
 /**
- * The n-th business day (Monday to Friday, no holidays) of the month 'YYYY-MM', as 'YYYY-MM-DD'.
- * @throws when n is not 1..20 (every month has at least 20 weekdays).
+ * The n-th business day (Monday to Friday, minus the days `isOff` flags) of the month 'YYYY-MM', as 'YYYY-MM-DD'.
+ * @throws when n is not 1..20 (every month has at least 20 weekdays; with holidays 15 would always exist, and the
+ * guard stays at 20 for the calendar-free case).
  */
-export function nthBusinessDay(month: string, n: number): string {
+export function nthBusinessDay(month: string, n: number, isOff?: (day: string) => boolean): string {
   if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('n must be 1..20.');
   const m = /^(\d{4})-(\d{2})$/.exec(month);
   if (!m) throw new Error(`Invalid month: ${month}`);
@@ -66,8 +72,7 @@ export function nthBusinessDay(month: string, n: number): string {
   for (let d = 1; d <= 31; d++) {
     const day = formatDay(Number(m[1]), Number(m[2]), d);
     if (Number(day.slice(8, 10)) !== d) break; // past the end of the month
-    const w = weekdayOf(day);
-    if (w !== 0 && w !== 6 && ++count === n) return day;
+    if (isBusinessDay(day, isOff) && ++count === n) return day;
   }
-  throw new Error('unreachable');
+  throw new Error('That business day does not exist in the month.');
 }

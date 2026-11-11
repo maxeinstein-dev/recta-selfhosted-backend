@@ -5,7 +5,7 @@ import { projectRecurrence, toCents, type ForecastRecurrence, type InvoiceState 
 import { calculateCreditCardInvoice, utcToday } from '../transactions/transactions.service.js';
 import { dayString, localDate } from '../recurring-transactions/recurring-dates.js';
 import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
-import { extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
+import { benefitEvents, benefitPaidInMonth, extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
 import { loadPayrollLinks, type PayrollLink } from '../payroll/payroll.links.js';
 import { addDays, buildCashFlow, type CashFlowEventInput, type CashFlowProjection, type UnassignedInvoiceInput } from './cash-flow.js';
 
@@ -226,17 +226,21 @@ async function recurrenceEvents(
     };
     const sign = batch.isIncome(r) ? 1 : -1;
     const link = payroll.find((l) => l.recurringTransactionId === r.id);
+    // A benefit paid per business day linked to this recurrence takes the value calculated for the month it pays
+    const benefitOwner = link ? undefined : payroll.find((l) => (l.data.benefits ?? []).some((b) => b.recurringTransactionId === r.id));
+    const benefit = benefitOwner?.data.benefits?.find((b) => b.recurringTransactionId === r.id);
     const staleNext = dayString(r.nextRunAt) < today;
     const items = projectRecurrence(rec, { windowStart: '0001-01-01', windowEnd: end }, today, generated);
     items.forEach((item, index) => {
       // A salary recurrence fed by an employment takes the calculated net of the month it pays (raise, month after vacation)
       const calc = link ? salaryPaidInMonth(link.data, item.date.slice(0, 7)) : null;
+      const benefitCalc = benefit && benefitOwner ? benefitPaidInMonth(benefitOwner.data, benefit, item.date.slice(0, 7)) : null;
       events.push({
         date: item.date,
         description: item.description,
-        amountCents: calc ? calc.netCents : sign * toCents(item.amount),
+        amountCents: calc ? calc.netCents : benefitCalc ? benefitCalc.amountCents : sign * toCents(item.amount),
         source: 'recurrence',
-        certainty: calc ? (calc.estimated ? 'estimated' : 'expected') : item.followsLastAmount ? 'estimated' : 'expected',
+        certainty: calc ? (calc.estimated ? 'estimated' : 'expected') : benefitCalc ? 'estimated' : item.followsLastAmount ? 'estimated' : 'expected',
         // Non-monthly stale recurrences are dated today by the walk, but their first run was due earlier
         overdue: item.date < today || (staleNext && index === 0),
         sourceId: r.id,
@@ -249,22 +253,41 @@ async function recurrenceEvents(
 
 /**
  * 13th installments, vacations and FGTS birthday withdrawals of the employments linked to an active salary recurrence,
- * from today on (what already happened is not forecast), on the account that receives them (when it is in the set).
+ * from today on (what already happened is not forecast), on the account that receives them (when it is in the set);
+ * plus the own events of the per-business-day benefits.
  */
 function payrollEvents(links: readonly PayrollLink[], scopeIds: ReadonlySet<string>, today: string, end: string): CashFlowEventInput[] {
   const events: CashFlowEventInput[] = [];
   for (const link of links) {
-    if (!link.recurrenceActive || !scopeIds.has(link.receivingAccountId)) continue;
-    for (const e of extraPayrollEvents(link.data, { from: today, to: end, today })) {
+    const receiving = link.receivingAccountId;
+    if (link.recurrenceActive && receiving && scopeIds.has(receiving)) {
+      for (const e of extraPayrollEvents(link.data, { from: today, to: end, today })) {
+        events.push({
+          date: e.date,
+          description: e.description,
+          amountCents: e.netCents,
+          source: 'payroll',
+          certainty: e.estimated ? 'estimated' : 'expected',
+          overdue: false,
+          sourceId: e.employmentId,
+          accountId: receiving,
+        });
+      }
+    }
+    // Own events of the benefits paid per business day: only the ones that are available money and have no recurrence
+    // (a linked one is already the recurrence's occurrence). Destination: the benefit's account, else the employment's.
+    for (const b of benefitEvents(link.data, today, end, (x) => !x.recurringTransactionId && x.isAvailableCash)) {
+      const accountId = b.accountId ?? link.data.accountId ?? null;
+      if (!accountId || !scopeIds.has(accountId) || b.amountCents === 0) continue;
       events.push({
-        date: e.date,
-        description: e.description,
-        amountCents: e.netCents,
+        date: b.paymentDate,
+        description: b.name,
+        amountCents: b.amountCents,
         source: 'payroll',
-        certainty: e.estimated ? 'estimated' : 'expected',
+        certainty: 'estimated',
         overdue: false,
-        sourceId: e.employmentId,
-        accountId: link.receivingAccountId,
+        sourceId: link.employmentId,
+        accountId,
       });
     }
   }

@@ -29,6 +29,7 @@ const SPECS: Record<string, TableSpec> = {
     defaults: () => ({ source: 'manual', note: null }),
   },
   settlement: { unique: [['transactionId']], parents: { personId: 'person' }, defaults: () => ({ transactionId: null, note: null }) },
+  employment: { unique: [], parents: {}, defaults: () => ({ personId: null }) },
   account: { unique: [], parents: {}, defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING' }) },
   category: { unique: [], parents: {}, defaults: () => ({}) },
 };
@@ -240,6 +241,7 @@ export const fakePrisma = {
   personAlias: table('personAlias'),
   transactionShare: table('transactionShare'),
   settlement: table('settlement'),
+  employment: table('employment'),
   account: table('account'),
   category: table('category'),
   /** The two row-lock reads the module makes (`SELECT ... FOR UPDATE`); no real locking, tests hook the call. */
@@ -374,6 +376,12 @@ export function seedSettlement(data: {
 }): Row {
   const row = build('settlement', { direction: 'RECEIVED', date: '2026-10-05', ...data });
   store.settlement!.push(row);
+  return row;
+}
+
+export function seedEmployment(data: { householdId: string; personId: string | null }): Row {
+  const row = build('employment', data);
+  store.employment!.push(row);
   return row;
 }
 

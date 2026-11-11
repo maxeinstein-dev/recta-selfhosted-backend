@@ -9,6 +9,7 @@ import {
   seedCategory,
   seedPerson,
   seedSettlement,
+  seedEmployment,
   seedShare,
   seedTransaction,
 } from './__fixtures__/people-fake-db.js';
@@ -144,6 +145,19 @@ describe('people: create, list, update, delete', () => {
     expect(await deletePerson(HH, person.id)).toEqual({ deleted: true });
     expect(rowsOf('person')).toHaveLength(0);
     expect(rowsOf('personAlias')).toHaveLength(0);
+  });
+
+  it('refuses to delete a person who owns an employment (409), and still allows deactivating them', async () => {
+    const owner = await createPerson({ householdId: HH, name: 'Bia' });
+    seedEmployment({ householdId: HH, personId: owner.id });
+
+    await expect(deletePerson(HH, owner.id)).rejects.toEqual(error(409, 'employment'));
+    expect(rowsOf('person')).toHaveLength(1);
+    expect(await updatePerson(HH, owner.id, { isActive: false })).toMatchObject({ isActive: false });
+
+    // An employment of somebody else does not block this person
+    const free = await createPerson({ householdId: HH, name: 'Caio' });
+    expect(await deletePerson(HH, free.id)).toEqual({ deleted: true });
   });
 
   it('only deactivates a person that has shares or settlements', async () => {

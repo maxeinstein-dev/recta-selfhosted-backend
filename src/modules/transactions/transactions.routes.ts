@@ -656,6 +656,7 @@ export async function transactionRoutes(app: FastifyInstance) {
           type: 'object',
           properties: {
             householdId: { type: 'string', format: 'uuid' },
+            personId: { type: 'string', format: 'uuid' },
             months: { type: 'integer', minimum: 1, maximum: 12 },
             from: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
           },
@@ -677,7 +678,7 @@ export async function transactionRoutes(app: FastifyInstance) {
       const householdId = query.householdId || (await ensurePersonalHousehold(request));
       await requireHouseholdMember(request, householdId);
 
-      const data = await getCreditCardCommitment(accountId, householdId, { months: query.months, from: query.from });
+      const data = await getCreditCardCommitment(accountId, householdId, { months: query.months, from: query.from, personId: query.personId });
       return reply.send({ success: true, data });
     }
   );
