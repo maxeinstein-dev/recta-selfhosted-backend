@@ -12,8 +12,8 @@
  * - The vacation is paid two days before it starts, moving back to the previous weekday when that lands on a weekend.
  *   Holidays are not considered.
  * - FGTS has no interest or monetary correction here. A deposit counts on the last day of its competence month.
- * - With the birthday mode in force, the withdrawal of the birthday month is forecast on day 1 of that month (the real
- *   window runs to the end of the second following month), valued by the official table over the estimated balance, or
+ * - With the birthday mode in force, the withdrawal of the birthday month is forecast on the 5th business day of that
+ *   month (Monday to Friday, no holidays; the real window runs to the end of the second following month), valued by the official table over the estimated balance, or
  *   by the amount the user informed on the mode record. Always 'estimated'.
  * - Only CLT employments have payroll; the caller must not build data for other regimes.
  */
@@ -25,7 +25,7 @@ import {
   type PayrollMethod,
   type PayrollTableSet,
 } from './payroll-calc.js';
-import { addDays, addMonths, formatDay, lastDayOfMonth, parseDay, previousBusinessDay } from './payroll-dates.js';
+import { addDays, addMonths, formatDay, lastDayOfMonth, nthBusinessDay, parseDay, previousBusinessDay } from './payroll-dates.js';
 import { birthdayWithdrawalCents, selectBirthdayTable } from './payroll-fgts-birthday.js';
 import { computeThirteenth, countThirteenthAvos, type InstallmentSchedule, type Thirteenth } from './payroll-thirteenth.js';
 import { computeVacation, resolveVacationPeriod, vacationDaysInMonth, type Vacation } from './payroll-vacation.js';
@@ -269,7 +269,7 @@ export interface FgtsMonth {
 
 export interface BirthdayForecast {
   year: number;
-  /** Day 1 of the birthday month. */
+  /** 5th business day of the birthday month. */
   date: string;
   amountCents: number;
   /** 'table': official table over the estimated balance; 'informed': the amount on the mode record. */
@@ -358,7 +358,7 @@ function forecastBirthday(
   for (let year = Number(anchor.slice(0, 4)); year <= Number(range.to.slice(0, 4)); year++) {
     const candidates = modes
       .filter((m) => m.mode === 'birthday' && m.birthdayMonth)
-      .map((m) => ({ m, date: formatDay(year, m.birthdayMonth!, 1) }))
+      .map((m) => ({ m, date: nthBusinessDay(`${String(year).padStart(4, '0')}-${String(m.birthdayMonth).padStart(2, '0')}`, 5) }))
       .filter(({ m, date }) => valueInForce(modes, date) === m)
       .sort((a, b) => a.date.localeCompare(b.date));
     for (const { m, date } of candidates) {

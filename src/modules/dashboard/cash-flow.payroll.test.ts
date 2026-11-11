@@ -192,12 +192,12 @@ describe('cash flow with a linked employment', () => {
     expect(amounts[EMP]).toBeGreaterThan(amounts[EMP2]!);
   });
 
-  it('the FGTS birthday withdrawal enters on day 1 of the month, estimated, from the informed amount', async () => {
+  it('the FGTS birthday withdrawal enters on the 5th business day of the month, estimated, from the informed amount', async () => {
     const mode = { id: 'm1', mode: 'BIRTHDAY', birthdayMonth: 1, expectedAmount: dec(800), startDate: utc('2025-01-10') };
     setup({ employments: [employment({ fgtsModes: [mode] })] });
     const events = flat(await run()).filter((e) => e.description === 'Saque-aniversário FGTS');
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ source: 'payroll', date: '2027-01-01', amount: 800, certainty: 'estimated', sourceId: EMP });
+    expect(events[0]).toMatchObject({ source: 'payroll', date: '2027-01-07', amount: 800, certainty: 'estimated', sourceId: EMP });
   });
 
   it('starting balance plus the sum of the events is the ending balance, and nothing is written', async () => {

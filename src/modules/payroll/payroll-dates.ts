@@ -53,3 +53,21 @@ export function addMonths(month: string, n: number): string {
   const index = Number(month.slice(0, 4)) * 12 + (Number(month.slice(5, 7)) - 1) + n;
   return `${String(Math.floor(index / 12)).padStart(4, '0')}-${String((index % 12) + 1).padStart(2, '0')}`;
 }
+
+/**
+ * The n-th business day (Monday to Friday, no holidays) of the month 'YYYY-MM', as 'YYYY-MM-DD'.
+ * @throws when n is not 1..20 (every month has at least 20 weekdays).
+ */
+export function nthBusinessDay(month: string, n: number): string {
+  if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('n must be 1..20.');
+  const m = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!m) throw new Error(`Invalid month: ${month}`);
+  let count = 0;
+  for (let d = 1; d <= 31; d++) {
+    const day = formatDay(Number(m[1]), Number(m[2]), d);
+    if (Number(day.slice(8, 10)) !== d) break; // past the end of the month
+    const w = weekdayOf(day);
+    if (w !== 0 && w !== 6 && ++count === n) return day;
+  }
+  throw new Error('unreachable');
+}

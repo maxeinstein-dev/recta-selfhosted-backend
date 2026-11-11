@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { computeMonthlyPayroll, DEFAULT_PAYROLL_METHOD } from './payroll-calc.js';
-import { previousBusinessDay, weekdayOf } from './payroll-dates.js';
+import { nthBusinessDay, previousBusinessDay, weekdayOf } from './payroll-dates.js';
 import {
   buildPayrollEvents,
   computeCompetence,
@@ -49,6 +49,31 @@ describe('dates', () => {
     expect(paymentDateOfCompetence('2026-03', 5)).toBe('2026-04-05');
     expect(paymentDateOfCompetence('2026-12', 5)).toBe('2027-01-05');
     expect(paymentDateOfCompetence('2026-01', 31)).toBe('2026-02-28');
+  });
+});
+
+describe('nth business day', () => {
+  it('month starting on a Saturday: the first business day is the Monday', () => {
+    expect(weekdayOf('2026-08-01')).toBe(6);
+    expect(nthBusinessDay('2026-08', 1)).toBe('2026-08-03');
+    expect(nthBusinessDay('2026-08', 5)).toBe('2026-08-07');
+  });
+  it('month starting on a Sunday', () => {
+    expect(weekdayOf('2026-02-01')).toBe(0);
+    expect(nthBusinessDay('2026-02', 1)).toBe('2026-02-02');
+    expect(nthBusinessDay('2026-02', 5)).toBe('2026-02-06');
+  });
+  it('month starting on a Monday: the 5th is the Friday of the first week', () => {
+    expect(weekdayOf('2026-06-01')).toBe(1);
+    expect(nthBusinessDay('2026-06', 5)).toBe('2026-06-05');
+  });
+  it('month starting on a Friday skips the weekend', () => {
+    expect(nthBusinessDay('2026-05', 5)).toBe('2026-05-07');
+  });
+  it('refuses a bad n or month', () => {
+    expect(() => nthBusinessDay('2026-05', 0)).toThrow();
+    expect(() => nthBusinessDay('2026-05', 21)).toThrow();
+    expect(() => nthBusinessDay('2026/05', 1)).toThrow();
   });
 });
 
@@ -339,11 +364,11 @@ describe('FGTS birthday withdrawal', () => {
       },
     });
 
-  it('the table is applied over the estimated balance on day 1 of the birthday month', () => {
-    // balance 6.000,00 at Mar 31; April deposit 240,00 (Apr 30) -> 6.240,00 on May 1: 20% + 650,00
+  it('the table is applied over the estimated balance on the 5th business day of the birthday month', () => {
+    // balance 6.000,00 at Mar 31; April deposit 240,00 (Apr 30) -> 6.240,00 on the eve of May 7: 20% + 650,00
     const ev = buildPayrollEvents(withMode(), { from: '2026-04-01', to: '2026-06-30', today: '2026-04-10' });
     expect(ev.birthdayWithdrawals).toEqual([
-      { year: 2026, date: '2026-05-01', amountCents: Math.floor(624000 * 0.2) + 65000, source: 'table', balanceCents: 624000, tableId: 'fgts-birthday-2020' },
+      { year: 2026, date: '2026-05-07', amountCents: Math.floor(624000 * 0.2) + 65000, source: 'table', balanceCents: 624000, tableId: 'fgts-birthday-2020' },
     ]);
     const may = ev.fgts.months.find((m) => m.month === '2026-05')!;
     expect(may.forecastWithdrawalCents).toBe(Math.floor(624000 * 0.2) + 65000);
@@ -352,7 +377,7 @@ describe('FGTS birthday withdrawal', () => {
 
   it('extra events carry it as estimated', () => {
     const e = extraPayrollEvents(withMode(), { from: '2026-04-01', to: '2026-06-30', today: '2026-04-10' });
-    expect(e.map((x) => [x.kind, x.date, x.estimated])).toContainEqual(['fgts_birthday', '2026-05-01', true]);
+    expect(e.map((x) => [x.kind, x.date, x.estimated])).toContainEqual(['fgts_birthday', '2026-05-07', true]);
   });
 
   it('an informed amount overrides the table', () => {
@@ -363,7 +388,7 @@ describe('FGTS birthday withdrawal', () => {
   it('termination mode, a date already past and a recorded birthday withdrawal of the year forecast nothing', () => {
     const range = { from: '2026-04-01', to: '2026-06-30', today: '2026-04-10' };
     expect(buildPayrollEvents(withMode({ modes: [{ startDate: '2026-01-01', mode: 'termination' }] }), range).birthdayWithdrawals).toEqual([]);
-    expect(buildPayrollEvents(withMode(), { ...range, today: '2026-05-02' }).birthdayWithdrawals).toEqual([]);
+    expect(buildPayrollEvents(withMode(), { ...range, today: '2026-05-08' }).birthdayWithdrawals).toEqual([]);
     const recorded = withMode({ withdrawals: [{ date: '2026-05-04', amountCents: 50000, kind: 'birthday' }] });
     expect(buildPayrollEvents(recorded, range).birthdayWithdrawals).toEqual([]);
   });
