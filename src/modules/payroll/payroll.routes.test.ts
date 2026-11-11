@@ -332,6 +332,27 @@ describe('simulation and events', () => {
     expect(m.events).toHaveBeenCalledWith(HH, EMP, expect.objectContaining({ from: '2026-11-01', to: '2027-01-31' }));
   });
 
+  it('events: includePast is an optional boolean, forwarded to both routes, absent by default', async () => {
+    m.find.mockResolvedValue(HH);
+    m.events.mockResolvedValue({ salary: [] } as never);
+    m.householdEvents.mockResolvedValue({ employments: [] } as never);
+    const own = `/payroll/employments/${EMP}/events`;
+    await call('GET', `${own}?from=2026-01-01&to=2026-12-31`);
+    expect(m.events.mock.calls.at(-1)![2]).not.toHaveProperty('includePast', true);
+    expect((await call('GET', `${own}?includePast=true`)).statusCode).toBe(200);
+    expect(m.events.mock.calls.at(-1)![2]).toMatchObject({ includePast: true });
+    expect((await call('GET', `${own}?includePast=0`)).statusCode).toBe(200);
+    expect(m.events.mock.calls.at(-1)![2]).toMatchObject({ includePast: false });
+    expect((await call('GET', `${own}?includePast=maybe`)).statusCode).toBe(400);
+
+    const all = `/payroll/events?householdId=${HH}`;
+    await call('GET', all);
+    expect(m.householdEvents.mock.calls.at(-1)![1]).not.toHaveProperty('includePast', true);
+    expect((await call('GET', `${all}&includePast=true`)).statusCode).toBe(200);
+    expect(m.householdEvents.mock.calls.at(-1)![1]).toMatchObject({ includePast: true });
+    expect((await call('GET', `${all}&includePast=2`)).statusCode).toBe(400);
+  });
+
   it('household events add every active employment (the service decides), member access only', async () => {
     m.householdEvents.mockResolvedValue({ employments: [] } as never);
     const res = await call('GET', `/payroll/events?householdId=${HH}`);

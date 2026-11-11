@@ -17,6 +17,7 @@ vi.mock('../../shared/db/prisma.js', () => ({
         return [];
       }),
     },
+    transactionShare: { findMany: vi.fn(async () => []) }, // no shares in these scenarios
     account: { findMany: vi.fn(async () => []) },
     budget: { findMany: vi.fn(async () => []) },
     recurringTransaction: { findMany: vi.fn(async () => store.rec) },
