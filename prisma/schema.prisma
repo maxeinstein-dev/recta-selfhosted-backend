@@ -83,6 +83,7 @@ model Household {
   capturedNotifications CapturedNotification[]
   deviceTokens          DeviceToken[]
   captureAccountRules   CaptureAccountRule[]
+  employments           Employment[]
 
   @@map("households")
 }
@@ -191,6 +192,7 @@ model Account {
   recurringTransactions RecurringTransaction[]
   savingsGoals          SavingsGoal[]
   captureAccountRules   CaptureAccountRule[]
+  employments           Employment[]
 
   // Indexes
   @@index([householdId])
@@ -449,6 +451,7 @@ model RecurringTransaction {
   household    Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
   account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
   transactions Transaction[]
+  employment   Employment?
 
   // Indexes
   // REGRA DE NEGÓCIO: Índice em nextRunAt para otimizar busca do cronjob
@@ -743,4 +746,215 @@ model CaptureAccountRule {
 
   @@unique([householdId, package, kind])
   @@map("capture_account_rules")
+}
+
+// ============================================================================
+// PAYROLL (CLT employment: salary history, fixed items, vacations, FGTS)
+// Read/forecast only: nothing here creates a transaction or touches a balance.
+// ============================================================================
+
+// DEDUCTION: rate x base minus the band's "parcela a deduzir"; DIRECT: sum of each band's slice x its rate.
+enum PayrollBracketMethod {
+  DEDUCTION
+  DIRECT
+}
+
+enum PayrollRounding {
+  TRUNCATE
+  ROUND
+}
+
+enum PayrollItemKind {
+  EARNING
+  DEDUCTION
+}
+
+// Work regime of the employment. Only CLT has payroll calculation; others can be added later.
+enum EmploymentRegime {
+  CLT
+}
+
+// How the FGTS can be withdrawn: at termination (default) or the yearly birthday withdrawal.
+enum FgtsMode {
+  TERMINATION
+  BIRTHDAY
+}
+
+enum FgtsWithdrawalKind {
+  BIRTHDAY
+  TERMINATION
+  OTHER
+}
+
+model Employment {
+  id                     String               @id @default(uuid()) @db.Uuid
+  householdId            String               @map("household_id") @db.Uuid
+  regime                 EmploymentRegime     @default(CLT)
+  employer               String               @db.VarChar(120)
+  admissionDate          DateTime             @map("admission_date") @db.Date
+  // Last day of the employment; null = still employed.
+  endDate                DateTime?            @map("end_date") @db.Date
+  dependents             Int                  @default(0)
+  // Day of the month the salary is paid; the forecast pays the competence month in this day of the NEXT month.
+  payDay                 Int                  @default(5) @map("pay_day")
+  // Account that receives the money (where it stays available); null = the recurrence's account.
+  accountId              String?              @map("account_id") @db.Uuid
+  // The "Salary" income recurrence this employment feeds (its monthly amount comes from the calculation).
+  recurringTransactionId String?              @unique @map("recurring_transaction_id") @db.Uuid
+  bracketMethod          PayrollBracketMethod @default(DEDUCTION) @map("bracket_method")
+  rounding               PayrollRounding      @default(TRUNCATE)
+  thirteenthFirstMonth   Int                  @default(6) @map("thirteenth_first_month")
+  thirteenthFirstDay     Int                  @default(30) @map("thirteenth_first_day")
+  thirteenthSecondMonth  Int                  @default(12) @map("thirteenth_second_month")
+  thirteenthSecondDay    Int                  @default(20) @map("thirteenth_second_day")
+  isActive               Boolean              @default(true) @map("is_active")
+  createdAt              DateTime             @default(now()) @map("created_at")
+  updatedAt              DateTime             @updatedAt @map("updated_at")
+
+  household            Household                  @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account              Account?                   @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  recurringTransaction RecurringTransaction?      @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
+  salaries             EmploymentSalary[]
+  items                EmploymentItem[]
+  vacations            EmploymentVacation[]
+  fgtsBalances         EmploymentFgtsBalance[]
+  fgtsModes            EmploymentFgtsMode[]
+  fgtsWithdrawals      EmploymentFgtsWithdrawal[]
+
+  @@index([householdId])
+  @@map("employments")
+}
+
+// Gross salary in force from `startDate` until the next entry.
+model EmploymentSalary {
+  id           String   @id @default(uuid()) @db.Uuid
+  employmentId String   @map("employment_id") @db.Uuid
+  amount       Decimal  @db.Decimal(15, 2)
+  startDate    DateTime @map("start_date") @db.Date
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  employment Employment @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+
+  @@unique([employmentId, startDate])
+  @@map("employment_salaries")
+}
+
+// A fixed earning or deduction of the payslip (for instance an allowance outside the tax bases).
+model EmploymentItem {
+  id           String          @id @default(uuid()) @db.Uuid
+  employmentId String          @map("employment_id") @db.Uuid
+  name         String          @db.VarChar(100)
+  kind         PayrollItemKind @default(EARNING)
+  inInssBase   Boolean         @default(false) @map("in_inss_base")
+  inIrrfBase   Boolean         @default(false) @map("in_irrf_base")
+  inFgtsBase   Boolean         @default(false) @map("in_fgts_base")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  employment Employment            @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+  values     EmploymentItemValue[]
+
+  @@index([employmentId])
+  @@map("employment_items")
+}
+
+model EmploymentItemValue {
+  id        String   @id @default(uuid()) @db.Uuid
+  itemId    String   @map("item_id") @db.Uuid
+  amount    Decimal  @db.Decimal(15, 2)
+  startDate DateTime @map("start_date") @db.Date
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  item EmploymentItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, startDate])
+  @@map("employment_item_values")
+}
+
+// A marked vacation: exact start date, or only the month (then 30 days from day 1, estimated).
+model EmploymentVacation {
+  id           String    @id @default(uuid()) @db.Uuid
+  employmentId String    @map("employment_id") @db.Uuid
+  startDate    DateTime? @map("start_date") @db.Date
+  month        String?   @db.VarChar(7) // 'YYYY-MM', only when startDate is null
+  days         Int?
+  sellDays     Int       @default(0) @map("sell_days")
+  note         String?   @db.VarChar(200)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  employment Employment               @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+  items      EmploymentVacationItem[]
+
+  @@index([employmentId])
+  @@map("employment_vacations")
+}
+
+// One-off line paid with a vacation (for instance the advance of a raise).
+model EmploymentVacationItem {
+  id         String          @id @default(uuid()) @db.Uuid
+  vacationId String          @map("vacation_id") @db.Uuid
+  label      String          @db.VarChar(100)
+  amount     Decimal         @db.Decimal(15, 2)
+  kind       PayrollItemKind @default(EARNING)
+  inInssBase Boolean         @default(false) @map("in_inss_base")
+  inIrrfBase Boolean         @default(false) @map("in_irrf_base")
+  inFgtsBase Boolean         @default(false) @map("in_fgts_base")
+
+  vacation EmploymentVacation @relation(fields: [vacationId], references: [id], onDelete: Cascade)
+
+  @@index([vacationId])
+  @@map("employment_vacation_items")
+}
+
+// FGTS balance reported by the user (statement), on a date.
+model EmploymentFgtsBalance {
+  id           String   @id @default(uuid()) @db.Uuid
+  employmentId String   @map("employment_id") @db.Uuid
+  amount       Decimal  @db.Decimal(15, 2)
+  asOfDate     DateTime @map("as_of_date") @db.Date
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  employment Employment @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+
+  @@unique([employmentId, asOfDate])
+  @@map("employment_fgts_balances")
+}
+
+// FGTS withdrawal (birthday or other): only recorded, never forecast.
+model EmploymentFgtsWithdrawal {
+  id           String             @id @default(uuid()) @db.Uuid
+  employmentId String             @map("employment_id") @db.Uuid
+  amount       Decimal            @db.Decimal(15, 2)
+  date         DateTime           @db.Date
+  kind         FgtsWithdrawalKind @default(OTHER)
+  note         String?            @db.VarChar(200)
+  createdAt    DateTime           @default(now()) @map("created_at")
+  updatedAt    DateTime           @updatedAt @map("updated_at")
+
+  employment Employment @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+
+  @@index([employmentId, date])
+  @@map("employment_fgts_withdrawals")
+}
+
+// FGTS withdrawal mode in force from `startDate` (it can change during the contract). For BIRTHDAY the month of the
+// birthday is kept; `expectedAmount` is an optional user-informed forecast of that withdrawal (overrides the table).
+model EmploymentFgtsMode {
+  id             String   @id @default(uuid()) @db.Uuid
+  employmentId   String   @map("employment_id") @db.Uuid
+  mode           FgtsMode
+  birthdayMonth  Int?     @map("birthday_month")
+  expectedAmount Decimal? @map("expected_amount") @db.Decimal(15, 2)
+  startDate      DateTime @map("start_date") @db.Date
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  employment Employment @relation(fields: [employmentId], references: [id], onDelete: Cascade)
+
+  @@unique([employmentId, startDate])
+  @@map("employment_fgts_modes")
 }
