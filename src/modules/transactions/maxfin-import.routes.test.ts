@@ -390,3 +390,53 @@ describe('POST /transactions/import/maxfin/confirm', () => {
     expect(mockedConfirm).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /transactions/import/maxfin/confirm: realignment decisions', () => {
+  const TX = '11111111-1111-4111-8111-111111111111';
+  const TX2 = '22222222-2222-4222-8222-222222222222';
+  const sheet = (description: string, amount: number) => ({ description, type: 'EXPENSE', amount, installment: null });
+  function decision(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'debit:12:1',
+      apply: true,
+      section: 'debit',
+      shift: 1,
+      moves: [
+        { transactionId: TX, from: 'maxfin:2026-03:debit:11', to: 'maxfin:2026-03:debit:12', sheetLine: 12, verified: true, sheet: sheet('Luz', 10) },
+        { transactionId: TX2, from: 'maxfin:2026-03:debit:12', to: 'maxfin:2026-03:debit:13', sheetLine: 13, verified: true, sheet: sheet('Agua', 20) },
+      ],
+      removed: [],
+      requires: [],
+      ...overrides,
+    };
+  }
+
+  it('accepts decisions, and a confirm with no rows when it carries one', async () => {
+    const res = await confirm(confirmBody({ rows: [], realignments: [decision()] }));
+    expect(res.statusCode).toBe(201);
+    expect(mockedConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ request: expect.objectContaining({ rows: [], realignments: [expect.objectContaining({ id: 'debit:12:1', apply: true })] }) }),
+    );
+  });
+
+  it('still rejects an empty confirm, and a confirm without realignments keeps working', async () => {
+    expect((await confirm(confirmBody({ rows: [], realignments: [] }))).statusCode).toBe(400);
+    expect((await confirm(confirmBody())).statusCode).toBe(201);
+  });
+
+  it('rejects malformed decisions before the service runs', async () => {
+    const bad = [
+      decision({ shift: 1000 }),
+      decision({ moves: [] }),
+      decision({ section: 'other' }),
+      decision({ apply: 'yes' }),
+      decision({ moves: [{ transactionId: 'not-a-uuid', from: 'a', to: 'b', sheetLine: 1, verified: false, sheet: null }] }),
+    ];
+    mockedConfirm.mockClear();
+    for (const body of bad) {
+      expect((await confirm(confirmBody({ realignments: [body] }))).statusCode, JSON.stringify(body)).toBe(400);
+    }
+    expect(mockedConfirm).not.toHaveBeenCalled();
+  });
+});
+

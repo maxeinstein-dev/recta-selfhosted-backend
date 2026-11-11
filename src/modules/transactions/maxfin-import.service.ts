@@ -58,6 +58,7 @@ import type {
   MaxFinPreviewOptionsInput,
   MaxFinPreviewResponse,
   MaxFinPreviewRow,
+  MaxFinRealignProposal,
   MaxFinRowStatus,
   MaxFinSectionPreview,
   MaxFinWorkbookOptionsInput,
@@ -68,6 +69,8 @@ import { addMonths as addMonthsKey, monthOfDate } from '../../shared/utils/compe
 import { createTransaction, deleteTransaction, payCreditCardInvoice, updateTransaction } from './transactions.service.js';
 import { addMonthsClamped, localDate } from '../recurring-transactions/recurring-dates.js';
 import { followLastAmountInTx } from '../recurring-transactions/recurring-follow.js';
+import { applyRealignments, blockToProposal, loadMonthContext } from './maxfin-realign.service.js';
+import { compareIdentity, detectRealignments, type RealignSheetRow, type RealignStored } from './maxfin-realign.js';
 import {
   eligibleForRecurring,
   loadRecurringMatcher,
@@ -643,6 +646,33 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     };
   });
 
+  // Rows the sheet moved (rows inserted or removed above them): a realignment proposal instead of a cascade of "changed".
+  const realignments = key && rows.some((r) => r.status === 'changed') ? await previewRealignments(householdId, key, rows, resolved) : [];
+  for (const proposal of realignments) {
+    for (const move of proposal.moves) {
+      const index = rows.findIndex((r) => r.sourceRef === move.to);
+      if (index < 0) continue;
+      rows[index] = {
+        ...rows[index]!,
+        status: 'shifted',
+        statusDetail: `mesmo lançamento que hoje está na linha ${move.from.split(':').pop()}; passa para a linha ${move.sheetLine} ao realinhar`,
+        existingTransactionId: move.transactionId,
+        futureInstallments: 0,
+      };
+    }
+    for (const ref of proposal.insertedRefs) {
+      const index = rows.findIndex((r) => r.sourceRef === ref);
+      if (index < 0) continue;
+      rows[index] = {
+        ...rows[index]!,
+        status: 'new',
+        statusDetail: 'linha inserida na planilha: a linha dela só fica livre depois de realinhar o bloco seguinte',
+        existingTransactionId: null,
+      };
+    }
+    warnings.push(`${proposal.detail}${proposal.ambiguous ? ` Vem desmarcado: ${proposal.reason}.` : ''}`);
+  }
+
   if (mergedCount > 0) {
     const listed = protectedRows.slice(0, 8).join('; ') + (protectedRows.length > 8 ? '; …' : '');
     warnings.push(
@@ -737,7 +767,29 @@ export async function previewFromGrid(params: PreviewFromGridParams): Promise<Ma
     invoice,
     warnings,
     totals,
+    realignments,
   };
+}
+
+/** Blocks of rows the sheet shifted, detected against everything stored for the month (see maxfin-realign.ts). */
+async function previewRealignments(
+  householdId: string,
+  key: string,
+  rows: MaxFinPreviewRow[],
+  resolved: MaxFinAccountsResolved,
+): Promise<MaxFinRealignProposal[]> {
+  const ctx = await loadMonthContext(prisma as unknown as Prisma.TransactionClient, householdId, key);
+  const sheetRows: RealignSheetRow[] = rows.map((r) => ({
+    ref: r.sourceRef,
+    section: r.section,
+    line: r.sourceLine,
+    description: r.description,
+    type: r.type,
+    amount: r.amount,
+    installment: r.installment ? { number: r.installment.number, total: r.installment.total } : null,
+    accountId: resolved[r.section].id,
+  }));
+  return detectRealignments({ monthKey: key, sheetRows, stored: ctx.stored, tombstones: ctx.tombstones }).map(blockToProposal);
 }
 
 export interface BuildPreviewParams {
@@ -1096,18 +1148,75 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
   const options = request.options;
 
   // Everything the client sends is checked before the first write.
-  const rows = validateConfirmRows(request.rows, month);
+  // A confirm that only realigns has no rows to import.
+  const rows = request.rows.length === 0 && (request.realignments?.length ?? 0) > 0 ? [] : validateConfirmRows(request.rows, month);
   const resolved = params.resolved ?? (await resolveMaxFinAccounts(request.accounts));
   const { householdId } = resolved;
   const warnings: string[] = [];
 
   const categories = await buildCategoryResolver(householdId, request.categoryMap);
 
+  // Rows the sheet moved: the decisions on the preview's realignment proposals run first, so that the lines they free
+  // (the inserted rows) and the references they move are what the rest of the confirm sees.
+  const realign = await applyRealignments({
+    householdId,
+    monthKey: key,
+    accountIds: { income: resolved.income.id, bills: resolved.bills.id, credit: resolved.credit.id, debit: resolved.debit.id },
+    decisions: request.realignments,
+  });
+  warnings.push(...realign.warnings);
+
   // Re-check what is already stored at write time (the preview is not trusted).
   const existingRows = await prisma.transaction.findMany({
     where: { householdId, sourceRef: { in: rows.map((r) => r.sourceRef) } },
-    select: { id: true, sourceRef: true, recurringTransactionId: true, competenceMonth: true },
+    select: {
+      id: true,
+      sourceRef: true,
+      recurringTransactionId: true,
+      competenceMonth: true,
+      accountId: true,
+      type: true,
+      amount: true,
+      description: true,
+      installmentNumber: true,
+      totalInstallments: true,
+    },
   });
+  // A request that replaces rows is read for shifts too: sheet rows that are, by identity, the stored rows a few lines up or
+  // down show that the block moved, whoever sent them and whatever the client knows about realignments.
+  let shiftedRefs = new Set<string>();
+  if (rows.some((r) => r.replace && existingRows.some((t) => t.sourceRef === r.sourceRef))) {
+    const ctx = await loadMonthContext(prisma as unknown as Prisma.TransactionClient, householdId, key);
+    const blocks = detectRealignments(
+      {
+        monthKey: key,
+        sheetRows: rows.map((r) => ({
+          ref: r.sourceRef,
+          section: r.section,
+          line: Number(r.sourceRef.slice(r.sourceRef.lastIndexOf(':') + 1)),
+          description: r.description,
+          type: r.type,
+          amount: r.amount,
+          installment: r.installment ? { number: r.installment.number, total: r.installment.total } : null,
+          accountId: resolved[r.section].id,
+        })),
+        stored: ctx.stored,
+        tombstones: ctx.tombstones,
+      },
+      { landing: false },
+    );
+    shiftedRefs = new Set(blocks.flatMap((b) => b.rows.flatMap((m) => [m.from, m.to])));
+  }
+  const sheetRowsSent: RealignSheetRow[] = rows.map((r) => ({
+    ref: r.sourceRef,
+    section: r.section,
+    line: Number(r.sourceRef.slice(r.sourceRef.lastIndexOf(':') + 1)),
+    description: r.description,
+    type: r.type,
+    amount: r.amount,
+    installment: r.installment ? { number: r.installment.number, total: r.installment.total } : null,
+    accountId: resolved[r.section].id,
+  }));
   const existingByRef = new Map(existingRows.map((t) => [t.sourceRef as string, t.id]));
   const links = await loadMergeLinks(
     householdId,
@@ -1155,6 +1264,45 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
       skipped += 1;
       warnings.push(`"${row.description}" não foi substituída: ela já foi conciliada com o OFX ou absorveu outras linhas da planilha.`);
       continue;
+    }
+    // A line of a block left pending is not written at all: its last row would duplicate the purchase stored one line up.
+    if (realign.pendingRefs.has(row.sourceRef)) {
+      skipped += 1;
+      warnings.push(`"${row.description}" ficou pendente: ela faz parte de um bloco de linhas deslocadas que não foi realinhado.`);
+      continue;
+    }
+    // Replacing a stored row with a sheet row that is another purchase: either the row sits in a block the sheet shifted
+    // (a decision on it was not applied) or the stored purchase is on another line of this very request. Never replaced.
+    if (existingId && row.replace) {
+      const stored = existingRows.find((t) => t.id === existingId)!;
+      const asStored: RealignStored = {
+        id: stored.id,
+        ref: row.sourceRef,
+        section: row.section,
+        line: 0,
+        future: null,
+        accountId: stored.accountId ?? null,
+        type: String(stored.type) === 'INCOME' ? 'INCOME' : 'EXPENSE',
+        amount: typeof stored.amount?.toNumber === 'function' ? stored.amount.toNumber() : Number(stored.amount ?? 0),
+        description: stored.description ?? null,
+        notes: null,
+        installment:
+          stored.installmentNumber != null && stored.totalInstallments != null
+            ? { number: stored.installmentNumber, total: stored.totalInstallments }
+            : null,
+        linked: false,
+        mergeTarget: false,
+      };
+      const movedElsewhere = sheetRowsSent.some(
+        (other) => other.section === row.section && other.ref !== row.sourceRef && compareIdentity(other, asStored) === 'match',
+      );
+      if (realign.guardedRefs.has(row.sourceRef) || shiftedRefs.has(row.sourceRef) || movedElsewhere) {
+        skipped += 1;
+        warnings.push(
+          `"${row.description}" não foi substituída: a linha parece deslocada (o lançamento guardado nela está em outra linha da planilha). Resolva o realinhamento do bloco na prévia.`,
+        );
+        continue;
+      }
     }
     const futures =
       row.section === 'credit' && row.installment
@@ -1308,7 +1456,7 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
 
   // Invoice payment for closed months.
   let invoicePayment: MaxFinConfirmResponse['invoicePayment'] = null;
-  if (options.closedMonth && options.payInvoice) {
+  if (rows.length > 0 && options.closedMonth && options.payInvoice) {
     // Purchases minus credits (refunds) imported in this call.
     const amount = invoiceNetAmount(importedCreditRows);
     if (resolved.credit.type !== AccountType.CREDIT) {
@@ -1359,6 +1507,8 @@ export async function confirmMaxFinImport(params: ConfirmParams): Promise<MaxFin
     createdCategories: categories.created,
     invoicePayment,
     ids,
+    realigned: realign.realigned,
+    realignments: realign.outcomes,
     warnings,
   };
 }
