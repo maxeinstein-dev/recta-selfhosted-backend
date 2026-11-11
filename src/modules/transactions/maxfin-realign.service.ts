@@ -119,8 +119,8 @@ export function blockToProposal(block: RealignBlock): MaxFinRealignProposal {
   const count = block.rows.length;
   const detail =
     block.kind === 'insertion'
-      ? `${label}: ${plural(count, 'lançamento está', 'lançamentos estão')} ${plural(lines, 'linha', 'linhas')} abaixo da posição em que foi${count === 1 ? '' : 'ram'} importado${count === 1 ? '' : 's'} (linhas inseridas acima, nas linhas ${block.firstLine - lines}-${block.firstLine - 1}). Realinhar troca só a referência de origem; valores, datas e conciliações não mudam.`
-      : `${label}: ${plural(count, 'lançamento está', 'lançamentos estão')} ${plural(lines, 'linha', 'linhas')} acima da posição em que foi${count === 1 ? '' : 'ram'} importado${count === 1 ? '' : 's'} (linhas removidas acima${block.removed.length > 0 ? `; ${plural(block.removed.length, 'lançamento removido da planilha continua', 'lançamentos removidos da planilha continuam')} no Recta` : ''}). Realinhar troca só a referência de origem; valores, datas e conciliações não mudam.`;
+      ? `${label}: ${plural(count, 'lançamento está', 'lançamentos estão')} ${plural(lines, 'linha', 'linhas')} abaixo da posição em que ${count === 1 ? 'foi importado' : 'foram importados'} (${lines === 1 ? `linha inserida acima, na linha ${block.firstLine - 1}` : `linhas inseridas acima, nas linhas ${block.firstLine - lines} a ${block.firstLine - 1}`}). Realinhar troca só a referência de origem; valores, datas e conciliações não mudam.`
+      : `${label}: ${plural(count, 'lançamento está', 'lançamentos estão')} ${plural(lines, 'linha', 'linhas')} acima da posição em que ${count === 1 ? 'foi importado' : 'foram importados'} (linhas removidas acima${block.removed.length > 0 ? `; ${plural(block.removed.length, 'lançamento removido da planilha continua', 'lançamentos removidos da planilha continuam')} no Recta` : ''}). Realinhar troca só a referência de origem; valores, datas e conciliações não mudam.`;
   return {
     id: block.id,
     section: block.section,
