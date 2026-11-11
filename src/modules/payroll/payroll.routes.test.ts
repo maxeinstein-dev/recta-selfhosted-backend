@@ -42,6 +42,7 @@ const HH = '11111111-1111-4111-8111-111111111111';
 const OTHER_HH = '99999999-9999-4999-8999-999999999999';
 const EMP = '22222222-2222-4222-8222-222222222222';
 const SUB = '33333333-3333-4333-8333-333333333333';
+const PERSON = '55555555-5555-4555-8555-555555555555';
 const VAL = '44444444-4444-4444-8444-444444444444';
 const AUTH = { authorization: 'Bearer test' };
 
@@ -81,7 +82,7 @@ function call(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?
   return app.inject({ method, url, payload: payload as never, headers });
 }
 
-const employmentBody = { householdId: HH, employer: 'Acme', admissionDate: '2025-01-10' };
+const employmentBody = { householdId: HH, personId: PERSON, employer: 'Acme', admissionDate: '2025-01-10' };
 const SUBS: Array<{ path: string; body: unknown }> = [
   { path: 'salaries', body: { amount: 3000, startDate: '2025-01-10' } },
   { path: 'items', body: { name: 'Allowance', value: { amount: 100, startDate: '2025-01-10' } } },
@@ -203,6 +204,36 @@ describe('employment', () => {
     );
   });
 
+  it('the owner is required on creation and has to be a uuid', async () => {
+    const { personId: _omit, ...withoutOwner } = employmentBody;
+    expect((await call('POST', '/payroll/employments', withoutOwner)).statusCode).toBe(400);
+    expect((await call('POST', '/payroll/employments', { ...employmentBody, personId: 'not-a-uuid' })).statusCode).toBe(400);
+    expect(m.create).not.toHaveBeenCalled();
+  });
+
+  it('the holiday calendar is optional with safe defaults; the uf is upper-cased; the city needs a uf', async () => {
+    m.create.mockResolvedValue({ id: EMP } as never);
+    expect((await call('POST', '/payroll/employments', employmentBody)).statusCode).toBe(201);
+    expect(m.create).toHaveBeenLastCalledWith(expect.objectContaining({ personId: PERSON, optionalHolidaysOff: false }));
+    expect(m.create.mock.calls[0]![0]).not.toHaveProperty('uf', expect.anything());
+
+    expect((await call('POST', '/payroll/employments', { ...employmentBody, uf: 'se', city: 'Aracaju', optionalHolidaysOff: true })).statusCode).toBe(201);
+    expect(m.create).toHaveBeenLastCalledWith(expect.objectContaining({ uf: 'SE', city: 'Aracaju', optionalHolidaysOff: true }));
+
+    expect((await call('POST', '/payroll/employments', { ...employmentBody, city: 'Aracaju' })).statusCode).toBe(400);
+    expect((await call('POST', '/payroll/employments', { ...employmentBody, uf: 'SEE' })).statusCode).toBe(400);
+  });
+
+  it('list and household events forward the person filter (a uuid)', async () => {
+    m.list.mockResolvedValue([] as never);
+    m.householdEvents.mockResolvedValue({ employments: [] } as never);
+    expect((await call('GET', `/payroll/employments?householdId=${HH}&personId=${PERSON}`)).statusCode).toBe(200);
+    expect(m.list).toHaveBeenCalledWith(HH, { personId: PERSON });
+    expect((await call('GET', `/payroll/events?householdId=${HH}&personId=${PERSON}`)).statusCode).toBe(200);
+    expect(m.householdEvents).toHaveBeenCalledWith(HH, expect.objectContaining({ personId: PERSON }));
+    expect((await call('GET', `/payroll/events?householdId=${HH}&personId=zzz`)).statusCode).toBe(400);
+  });
+
   it('refuses a regime that is not CLT (nothing else exists yet)', async () => {
     const res = await call('POST', '/payroll/employments', { ...employmentBody, regime: 'PJ' });
     expect(res.statusCode).toBe(400);
@@ -249,6 +280,22 @@ describe('sub-resource validation', () => {
 
   it('FGTS withdrawal: a kind among birthday, termination and other', async () => {
     expect((await post('fgts-withdrawals', { amount: 10, date: '2026-05-04', kind: 'WHATEVER' })).statusCode).toBe(400);
+  });
+
+  it('item: fixed monthly by default; per business day needs a pay day and keeps its fields in range', async () => {
+    vi.mocked(service.items.create).mockResolvedValue({} as never);
+    expect((await post('items', { name: 'Allowance' })).statusCode).toBe(201);
+    expect(vi.mocked(service.items.create)).toHaveBeenLastCalledWith(HH, EMP, expect.objectContaining({ calcMode: 'FIXED_MONTHLY', kind: 'EARNING' }));
+
+    const perDay = { name: 'Meal', calcMode: 'PER_BUSINESS_DAY', payDay: 25, referenceMonthOffset: 1, value: { amount: 10, startDate: '2026-01-01' } };
+    expect((await post('items', perDay)).statusCode).toBe(201);
+    expect(vi.mocked(service.items.create)).toHaveBeenLastCalledWith(HH, EMP, expect.objectContaining({ calcMode: 'PER_BUSINESS_DAY', payDay: 25, referenceMonthOffset: 1 }));
+
+    expect((await post('items', { ...perDay, payDay: undefined })).statusCode).toBe(400);
+    expect((await post('items', { ...perDay, marginDays: -1 })).statusCode).toBe(400);
+    expect((await post('items', { ...perDay, referenceMonthOffset: 2 })).statusCode).toBe(400);
+    expect((await post('items', { ...perDay, calcMode: 'WEEKLY' })).statusCode).toBe(400);
+    expect((await post('items', { ...perDay, recurringTransactionId: 'nope' })).statusCode).toBe(400);
   });
 
   it('salary: positive amount and a real date', async () => {

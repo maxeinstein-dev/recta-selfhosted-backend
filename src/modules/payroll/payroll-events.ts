@@ -9,12 +9,14 @@
  *   admission) is prorated on the 30-day commercial month.
  * - 13th installments and vacations dated before `today` are not forecast (already happened). Without `today` nothing
  *   is filtered. The salary list is never filtered by `today`.
- * - The vacation is paid two days before it starts, moving back to the previous weekday when that lands on a weekend.
- *   Holidays are not considered.
+ * - The vacation is paid two days before it starts, moving back to the previous business day when that lands on a
+ *   weekend or on a day off of the employment's holiday calendar (without a calendar: weekends only).
  * - FGTS has no interest or monetary correction here. A deposit counts on the last day of its competence month.
  * - With the birthday mode in force, the withdrawal of the birthday month is forecast on the 5th business day of that
- *   month (Monday to Friday, no holidays; the real window runs to the end of the second following month), valued by the official table over the estimated balance, or
+ *   month (Monday to Friday minus the days off of the holiday calendar, none without one; the real window runs to the end of the second following month), valued by the official table over the estimated balance, or
  *   by the amount the user informed on the mode record. Always 'estimated'.
+ * - Benefits paid per business day (`benefits`) are outside the salary, the 13th, the vacation and the FGTS: each has
+ *   its own payment (see payroll-daily-benefit.ts).
  * - Only CLT employments have payroll; the caller must not build data for other regimes.
  */
 import {
@@ -26,6 +28,8 @@ import {
   type PayrollTableSet,
 } from './payroll-calc.js';
 import { addDays, addMonths, formatDay, lastDayOfMonth, nthBusinessDay, parseDay, previousBusinessDay } from './payroll-dates.js';
+import { benefitPaymentDate, computeDailyBenefit, type DailyBenefitData, type DailyBenefitEvent } from './payroll-daily-benefit.js';
+import { offDayChecker, type HolidayConfig } from './payroll-holidays.js';
 import { birthdayWithdrawalCents, selectBirthdayTable } from './payroll-fgts-birthday.js';
 import { computeThirteenth, countThirteenthAvos, type InstallmentSchedule, type Thirteenth } from './payroll-thirteenth.js';
 import { computeVacation, resolveVacationPeriod, vacationDaysInMonth, type Vacation } from './payroll-vacation.js';
@@ -68,6 +72,14 @@ export type FgtsModeData = {
 
 export interface EmploymentData {
   employmentId: string;
+  /** Owner of the employment (a person of the household); absent/null = no owner. */
+  personId?: string | null;
+  /** Account that receives the salary money; used as the destination of benefits without an account of their own. */
+  accountId?: string | null;
+  /** Holiday calendar of the employment; absent/null = no holidays (weekends only). */
+  calendar?: HolidayConfig | null;
+  /** Benefits paid per business day. */
+  benefits?: readonly DailyBenefitData[];
   admissionDate: string;
   /** Last day of the employment; null/absent = still employed. */
   endDate?: string | null;
@@ -136,8 +148,8 @@ function vacationPeriodOf(v: VacationMark) {
 }
 
 /** The vacation pay lands two days before the start, moved back to a weekday. */
-export function vacationCashDate(start: string): string {
-  return previousBusinessDay(addDays(start, -2));
+export function vacationCashDate(start: string, calendar?: HolidayConfig | null): string {
+  return previousBusinessDay(addDays(start, -2), calendar ? offDayChecker(calendar) : undefined);
 }
 
 export interface SalaryEvent {
@@ -246,7 +258,7 @@ function vacationOf(data: EmploymentData, v: VacationMark, tables?: PayrollTable
   });
   return {
     id: v.id,
-    paymentDate: vacationCashDate(period.start),
+    paymentDate: vacationCashDate(period.start, data.calendar),
     period: vacation.period,
     netCents: vacation.netCents,
     estimated: vacation.estimated || vacation.warnings.length > 0,
@@ -294,6 +306,8 @@ export interface PayrollEvents {
   vacations: VacationEvent[];
   birthdayWithdrawals: BirthdayForecast[];
   fgts: FgtsForecast;
+  /** Per-business-day benefits paid in the period, by payment date (not filtered by `today`). */
+  benefits: DailyBenefitEvent[];
 }
 
 interface Movement {
@@ -355,10 +369,11 @@ function forecastBirthday(
   const anchor = range.today ?? basis?.asOfDate ?? range.from;
   const recordedYears = new Set(data.fgts.withdrawals.filter((w) => w.kind === 'birthday').map((w) => Number(w.date.slice(0, 4))));
   const all = [...base];
+  const isOff = offDayChecker(data.calendar);
   for (let year = Number(anchor.slice(0, 4)); year <= Number(range.to.slice(0, 4)); year++) {
     const candidates = modes
       .filter((m) => m.mode === 'birthday' && m.birthdayMonth)
-      .map((m) => ({ m, date: nthBusinessDay(`${String(year).padStart(4, '0')}-${String(m.birthdayMonth).padStart(2, '0')}`, 5) }))
+      .map((m) => ({ m, date: nthBusinessDay(`${String(year).padStart(4, '0')}-${String(m.birthdayMonth).padStart(2, '0')}`, 5, isOff) }))
       .filter(({ m, date }) => valueInForce(modes, date) === m)
       .sort((a, b) => a.date.localeCompare(b.date));
     for (const { m, date } of candidates) {
@@ -455,7 +470,43 @@ export function buildPayrollEvents(data: EmploymentData, options: EventOptions):
 
   const { birthday, ...fgts } = buildFgtsForecast(data, monthOf(from), monthOf(to), today, tables);
   const birthdayWithdrawals = birthday.filter((b) => inRange(b.date));
-  return { employmentId: data.employmentId, salary, thirteenth, vacations, birthdayWithdrawals, fgts };
+  return { employmentId: data.employmentId, salary, thirteenth, vacations, birthdayWithdrawals, fgts, benefits: benefitEvents(data, from, to) };
+}
+
+/** Periods of the marked vacations, as inclusive days. */
+function vacationSpans(data: EmploymentData): Array<{ start: string; end: string }> {
+  return data.vacations.map((v) => {
+    const p = vacationPeriodOf(v);
+    return { start: p.start, end: p.end };
+  });
+}
+
+/** The benefit of one reference month, or null when it does not apply then. */
+export function benefitOfReference(data: EmploymentData, benefit: DailyBenefitData, referenceMonth: string): DailyBenefitEvent | null {
+  return computeDailyBenefit(benefit, referenceMonth, {
+    admissionDate: data.admissionDate,
+    endDate: data.endDate,
+    calendar: data.calendar,
+    vacations: vacationSpans(data),
+  });
+}
+
+/** The benefit paid in `paymentMonth` ('YYYY-MM'): the one of the reference month `offset` months later. */
+export function benefitPaidInMonth(data: EmploymentData, benefit: DailyBenefitData, paymentMonth: string): DailyBenefitEvent | null {
+  return benefitOfReference(data, benefit, addMonths(paymentMonth, benefit.referenceMonthOffset));
+}
+
+/** Per-business-day benefits whose payment date is in [from, to], sorted by payment date then name. */
+export function benefitEvents(data: EmploymentData, from: string, to: string, only?: (b: DailyBenefitData) => boolean): DailyBenefitEvent[] {
+  const out: DailyBenefitEvent[] = [];
+  for (const benefit of data.benefits ?? []) {
+    if (only && !only(benefit)) continue;
+    for (let pay = addMonths(monthOf(from), -1); pay <= addMonths(monthOf(to), 1); pay = addMonths(pay, 1)) {
+      const ev = benefitPaidInMonth(data, benefit, pay);
+      if (ev && ev.paymentDate >= from && ev.paymentDate <= to) out.push(ev);
+    }
+  }
+  return out.sort((a, b) => a.paymentDate.localeCompare(b.paymentDate) || a.name.localeCompare(b.name));
 }
 
 export interface ExtraPayrollEvent {
@@ -497,4 +548,4 @@ export function salaryPaidInMonth(data: EmploymentData, paymentMonth: string, ta
   return computeCompetence(data, addMonths(paymentMonth, -1), tables);
 }
 
-export { DEFAULT_PAYROLL_METHOD };
+export { benefitPaymentDate, DEFAULT_PAYROLL_METHOD };

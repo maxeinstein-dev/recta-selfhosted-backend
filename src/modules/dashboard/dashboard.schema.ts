@@ -97,6 +97,8 @@ export interface DashboardOverviewResponse {
 export const cashFlowQuerySchema = z.object({
   householdId: z.string().uuid().optional(),
   accountId: z.string().uuid().optional(),
+  /** Only the income of the employments of this person (see loadCashFlow). */
+  personId: z.string().uuid().optional(),
   days: z.coerce.number().int().min(1).max(180).default(90),
 });
 

@@ -151,7 +151,10 @@ export async function updatePerson(
 
 export type DeletePersonResult = { deleted: true } | { deleted: false; person: PersonDto };
 
-/** Deletes a person with no history; one with shares or settlements is only deactivated (the data stays). */
+/**
+ * Deletes a person with no history; one with shares or settlements is only deactivated (the data stays). A person who
+ * owns an employment cannot be deleted (409): deactivating is allowed, and the employment must be moved or deleted first.
+ */
 export async function deletePerson(householdId: string, personId: string): Promise<DeletePersonResult> {
   try {
     return await deletePersonLocked(householdId, personId);
@@ -169,6 +172,8 @@ async function deletePersonLocked(householdId: string, personId: string): Promis
     // waiting for ours means the counts below see it (instead of the delete cascading it away)
     const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM people WHERE id = ${personId}::uuid FOR UPDATE`;
     if (locked.length === 0) throw new NotFoundError('Person');
+    const employments = await tx.employment.count({ where: { personId } });
+    if (employments > 0) throw new ConflictError('This person owns an employment: move or delete it first (or deactivate the person)');
     const [shares, settlements] = await Promise.all([
       tx.transactionShare.count({ where: { personId } }),
       tx.settlement.count({ where: { personId } }),

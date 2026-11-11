@@ -1,15 +1,20 @@
 /**
  * Employment rows to the pure `EmploymentData`, and the loader the cash flow and the card commitment use: the active
- * CLT employments of a household that point to a "Salary" recurrence. Read-only.
+ * CLT employments of a household that point to a "Salary" recurrence or have a benefit paid per business day
+ * (optionally only those of one person). Read-only.
  */
 import type { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
+import type { DailyBenefitData } from './payroll-daily-benefit.js';
 import type { EmploymentData } from './payroll-events.js';
 
 export const employmentInclude = {
   salaries: { orderBy: { startDate: 'asc' } },
-  items: { orderBy: { createdAt: 'asc' }, include: { values: { orderBy: { startDate: 'asc' } } } },
+  items: {
+    orderBy: { createdAt: 'asc' },
+    include: { values: { orderBy: { startDate: 'asc' } }, recurringTransaction: { select: { id: true, isActive: true } } },
+  },
   vacations: { orderBy: [{ startDate: 'asc' }, { month: 'asc' }], include: { items: true } },
   fgtsBalances: { orderBy: { asOfDate: 'asc' } },
   fgtsWithdrawals: { orderBy: { date: 'asc' } },
@@ -17,6 +22,8 @@ export const employmentInclude = {
 } satisfies Prisma.EmploymentInclude;
 
 export type EmploymentRow = Prisma.EmploymentGetPayload<{ include: typeof employmentInclude }>;
+
+const isPerBusinessDay = (i: { calcMode?: string | null }): boolean => i.calcMode === 'PER_BUSINESS_DAY';
 
 const cents = (d: { toNumber(): number }): number => Math.round(d.toNumber() * 100);
 const day = (d: Date | null): string | null => (d ? dayString(d) : null);
@@ -29,6 +36,9 @@ export function toEmploymentData(row: EmploymentRow): EmploymentData {
   );
   return {
     employmentId: row.id,
+    personId: row.personId ?? null,
+    accountId: row.accountId ?? null,
+    calendar: row.holidayUf ? { uf: row.holidayUf, city: row.holidayCity ?? null, optionalOff: row.optionalHolidaysOff ?? false } : null,
     admissionDate: dayString(row.admissionDate),
     endDate: day(row.endDate),
     dependents: row.dependents,
@@ -39,15 +49,32 @@ export function toEmploymentData(row: EmploymentRow): EmploymentData {
       second: { month: row.thirteenthSecondMonth, day: row.thirteenthSecondDay },
     },
     salaries: row.salaries.map((s) => ({ startDate: dayString(s.startDate), amountCents: cents(s.amount) })),
-    items: row.items.map((i) => ({
-      id: i.id,
-      name: i.name,
-      kind: i.kind === 'DEDUCTION' ? 'deduction' : 'earning',
-      inInssBase: i.inInssBase,
-      inIrrfBase: i.inIrrfBase,
-      inFgtsBase: i.inFgtsBase,
-      values: i.values.map((v) => ({ startDate: dayString(v.startDate), amountCents: cents(v.amount) })),
-    })),
+    // Items paid per business day have their own payment: they are not payslip lines
+    items: row.items
+      .filter((i) => !isPerBusinessDay(i))
+      .map((i) => ({
+        id: i.id,
+        name: i.name,
+        kind: i.kind === 'DEDUCTION' ? 'deduction' : 'earning',
+        inInssBase: i.inInssBase,
+        inIrrfBase: i.inIrrfBase,
+        inFgtsBase: i.inFgtsBase,
+        values: i.values.map((v) => ({ startDate: dayString(v.startDate), amountCents: cents(v.amount) })),
+      })),
+    benefits: row.items.filter(isPerBusinessDay).map(
+      (i): DailyBenefitData => ({
+        id: i.id,
+        name: i.name,
+        values: i.values.map((v) => ({ startDate: dayString(v.startDate), amountCents: cents(v.amount) })),
+        payDay: i.payDay ?? 1,
+        referenceMonthOffset: i.referenceMonthOffset ?? 0,
+        accountId: i.accountId ?? null,
+        isAvailableCash: i.isAvailableCash ?? true,
+        recurringTransactionId: i.recurringTransactionId ?? null,
+        recurrenceActive: i.recurringTransaction?.isActive ?? false,
+        marginDays: i.marginDays ?? 0,
+      }),
+    ),
     vacations: row.vacations.map((v) => ({
       id: v.id,
       start: day(v.startDate),
@@ -82,34 +109,45 @@ export function toEmploymentData(row: EmploymentRow): EmploymentData {
 
 export interface PayrollLink {
   employmentId: string;
-  recurringTransactionId: string;
-  /** Account of the linked recurrence. */
-  recurrenceAccountId: string;
+  /** Owner of the employment; null when it has none. */
+  personId: string | null;
+  /** The salary recurrence the employment feeds; null when it only has per-business-day benefits. */
+  recurringTransactionId: string | null;
+  /** Account of the linked recurrence; null without a salary recurrence. */
+  recurrenceAccountId: string | null;
+  /** False without a salary recurrence: nothing salary-related (13th, vacation, birthday withdrawal) is then forecast. */
   recurrenceActive: boolean;
-  /** Where the 13th, vacation and withdrawal money lands: the employment's account, else the recurrence's. */
-  receivingAccountId: string;
+  /** Where the 13th, vacation and withdrawal money lands: the employment's account, else the recurrence's. Null when neither exists. */
+  receivingAccountId: string | null;
   data: EmploymentData;
 }
 
-/** Active CLT employments of the household that point to a recurrence. Empty when there is none: callers do nothing then. */
-export async function loadPayrollLinks(householdId: string): Promise<PayrollLink[]> {
+/**
+ * Active CLT employments of the household that point to a recurrence or have a per-business-day benefit, optionally
+ * only those of one person. Empty when there is none: callers do nothing then.
+ */
+export async function loadPayrollLinks(householdId: string, filter: { personId?: string } = {}): Promise<PayrollLink[]> {
   const rows = await prisma.employment.findMany({
-    where: { householdId, isActive: true, regime: 'CLT', recurringTransactionId: { not: null } },
+    where: {
+      householdId,
+      isActive: true,
+      regime: 'CLT',
+      ...(filter.personId ? { personId: filter.personId } : {}),
+      OR: [{ recurringTransactionId: { not: null } }, { items: { some: { calcMode: 'PER_BUSINESS_DAY' } } }],
+    },
     include: { ...employmentInclude, recurringTransaction: { select: { id: true, accountId: true, isActive: true } } },
     orderBy: { createdAt: 'asc' },
   });
-  const links: PayrollLink[] = [];
-  for (const row of rows) {
+  return rows.map((row) => {
     const rec = row.recurringTransaction;
-    if (!rec) continue;
-    links.push({
+    return {
       employmentId: row.id,
-      recurringTransactionId: rec.id,
-      recurrenceAccountId: rec.accountId,
-      recurrenceActive: rec.isActive,
-      receivingAccountId: row.accountId ?? rec.accountId,
+      personId: row.personId ?? null,
+      recurringTransactionId: rec?.id ?? null,
+      recurrenceAccountId: rec?.accountId ?? null,
+      recurrenceActive: rec?.isActive ?? false,
+      receivingAccountId: row.accountId ?? rec?.accountId ?? null,
       data: toEmploymentData(row),
-    });
-  }
-  return links;
+    };
+  });
 }

@@ -5,7 +5,7 @@
  * Every lookup is scoped by the household, so a foreign id is a plain 404.
  */
 import { prisma } from '../../shared/db/prisma.js';
-import { BadRequestError, NotFoundError } from '../../shared/errors/app-error.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../../shared/errors/app-error.js';
 import { conflictOnUnique } from '../people/people.common.js';
 import { fromCents, toCents } from '../people/money.js';
 import { dayString } from '../recurring-transactions/recurring-dates.js';
@@ -13,6 +13,7 @@ import { isIncomeCategory } from '../recurring-transactions/recurring-forecast.j
 import { computeMonthlyPayroll, findGrossForNet, type PayrollItem, type PayrollMethod } from './payroll-calc.js';
 import { addDays } from './payroll-dates.js';
 import { buildPayrollEvents } from './payroll-events.js';
+import { normalizeUf } from './payroll-holidays.js';
 import { employmentInclude, toEmploymentData, type EmploymentRow } from './payroll.links.js';
 import type {
   CreateEmploymentInput,
@@ -86,13 +87,21 @@ const serializeMode = (m: { id: string; mode: string; birthdayMonth: number | nu
   expectedAmount: m.expectedAmount ? reais(m.expectedAmount) : null,
   startDate: dayString(m.startDate),
 });
-const serializeItem = (i: EmploymentRow['items'][number]) => ({
+type ItemRow = Omit<EmploymentRow['items'][number], 'recurringTransaction'>;
+const serializeItem = (i: ItemRow) => ({
   id: i.id,
   name: i.name,
   kind: i.kind,
   inInssBase: i.inInssBase,
   inIrrfBase: i.inIrrfBase,
   inFgtsBase: i.inFgtsBase,
+  calcMode: i.calcMode,
+  marginDays: i.marginDays,
+  payDay: i.payDay,
+  referenceMonthOffset: i.referenceMonthOffset,
+  accountId: i.accountId,
+  isAvailableCash: i.isAvailableCash,
+  recurringTransactionId: i.recurringTransactionId,
   values: i.values.map(serializeValue),
 });
 
@@ -100,6 +109,7 @@ export function serializeEmployment(row: EmploymentRow) {
   return {
     id: row.id,
     householdId: row.householdId,
+    personId: row.personId,
     regime: row.regime,
     employer: row.employer,
     admissionDate: dayString(row.admissionDate),
@@ -114,6 +124,9 @@ export function serializeEmployment(row: EmploymentRow) {
     thirteenthFirstDay: row.thirteenthFirstDay,
     thirteenthSecondMonth: row.thirteenthSecondMonth,
     thirteenthSecondDay: row.thirteenthSecondDay,
+    uf: row.holidayUf,
+    city: row.holidayCity,
+    optionalHolidaysOff: row.optionalHolidaysOff,
     isActive: row.isActive,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -141,6 +154,12 @@ async function requireEmployment(householdId: string, id: string): Promise<{ id:
   return row;
 }
 
+/** A person of the household: another household's person (or none) is a plain 404. */
+export async function requirePerson(householdId: string, personId: string): Promise<void> {
+  const person = await prisma.person.findFirst({ where: { id: personId, householdId }, select: { id: true } });
+  if (!person) throw new NotFoundError('Person');
+}
+
 async function validateLinks(householdId: string, accountId: string | null | undefined, recurringId: string | null | undefined): Promise<void> {
   if (accountId) {
     const account = await prisma.account.findFirst({ where: { id: accountId, householdId }, select: { type: true } });
@@ -153,7 +172,19 @@ async function validateLinks(householdId: string, accountId: string | null | und
     if (!(await isIncomeCategory(prisma, householdId, rec.categoryName))) {
       throw new BadRequestError('The linked recurrence must be an income recurrence');
     }
+    // One recurrence feeds one thing: a salary or one benefit, never both
+    const used = await prisma.employmentItem.findFirst({ where: { recurringTransactionId: recurringId }, select: { id: true } });
+    if (used) throw new ConflictError('That recurrence already feeds a benefit');
   }
+}
+
+/** UF is two letters; the city only makes sense with a UF. Returns the normalized pair. */
+function normalizeCalendar(uf: string | null | undefined, city: string | null | undefined): { uf: string | null; city: string | null } {
+  const u = normalizeUf(uf);
+  const c = city?.trim() ? city.trim() : null;
+  if (u && !/^[A-Z]{2}$/.test(u)) throw new BadRequestError('uf must be two letters');
+  if (c && !u) throw new BadRequestError('The city needs a uf');
+  return { uf: u, city: c };
 }
 
 function checkShape(s: { admissionDate: string; endDate: string | null; first: [number, number]; second: [number, number] }): void {
@@ -161,8 +192,9 @@ function checkShape(s: { admissionDate: string; endDate: string | null; first: [
   if (s.first[0] * 100 + s.first[1] > s.second[0] * 100 + s.second[1]) throw new BadRequestError('The first 13th installment cannot come after the second');
 }
 
-export async function listEmployments(householdId: string) {
-  const rows = await prisma.employment.findMany({ where: { householdId }, orderBy: [{ isActive: 'desc' }, { createdAt: 'asc' }], ...full });
+export async function listEmployments(householdId: string, filter: { personId?: string } = {}) {
+  if (filter.personId) await requirePerson(householdId, filter.personId);
+  const rows = await prisma.employment.findMany({ where: { householdId, ...(filter.personId ? { personId: filter.personId } : {}) }, orderBy: [{ isActive: 'desc' }, { createdAt: 'asc' }], ...full });
   return rows.map(serializeEmployment);
 }
 
@@ -179,11 +211,17 @@ export async function createEmployment(input: CreateEmploymentInput) {
     first: [input.thirteenthFirstMonth, input.thirteenthFirstDay],
     second: [input.thirteenthSecondMonth, input.thirteenthSecondDay],
   });
+  await requirePerson(input.householdId, input.personId);
+  const calendar = normalizeCalendar(input.uf, input.city);
   await validateLinks(input.householdId, input.accountId, input.recurringTransactionId);
   const row = await conflictOnUnique('That recurrence already feeds another employment', 'The account or recurrence was removed meanwhile', () =>
     prisma.employment.create({
       data: {
         householdId: input.householdId,
+        personId: input.personId,
+        holidayUf: calendar.uf,
+        holidayCity: calendar.city,
+        optionalHolidaysOff: input.optionalHolidaysOff,
         regime: input.regime,
         employer: input.employer,
         admissionDate: date(input.admissionDate),
@@ -217,11 +255,19 @@ export async function updateEmployment(householdId: string, id: string, input: U
     first: [input.thirteenthFirstMonth ?? current.thirteenthFirstMonth, input.thirteenthFirstDay ?? current.thirteenthFirstDay],
     second: [input.thirteenthSecondMonth ?? current.thirteenthSecondMonth, input.thirteenthSecondDay ?? current.thirteenthSecondDay],
   });
+  if (input.personId) await requirePerson(householdId, input.personId);
+  const calendar =
+    input.uf !== undefined || input.city !== undefined
+      ? normalizeCalendar(input.uf !== undefined ? input.uf : current.holidayUf, input.city !== undefined ? input.city : current.holidayCity)
+      : null;
   await validateLinks(householdId, input.accountId, input.recurringTransactionId);
   const row = await conflictOnUnique('That recurrence already feeds another employment', 'The account or recurrence was removed meanwhile', () =>
     prisma.employment.update({
       where: { id },
       data: {
+        ...(input.personId !== undefined && { personId: input.personId }),
+        ...(calendar && { holidayUf: calendar.uf, holidayCity: calendar.city }),
+        ...(input.optionalHolidaysOff !== undefined && { optionalHolidaysOff: input.optionalHolidaysOff }),
         ...(input.employer !== undefined && { employer: input.employer }),
         ...(input.admissionDate !== undefined && { admissionDate: date(input.admissionDate) }),
         ...(input.endDate !== undefined && { endDate: input.endDate ? date(input.endDate) : null }),
@@ -422,35 +468,108 @@ async function requireItem(householdId: string, employmentId: string, itemId: st
   return item;
 }
 
+interface ItemWrite {
+  name?: string;
+  kind?: 'EARNING' | 'DEDUCTION';
+  inInssBase?: boolean;
+  inIrrfBase?: boolean;
+  inFgtsBase?: boolean;
+  calcMode?: 'FIXED_MONTHLY' | 'PER_BUSINESS_DAY';
+  marginDays?: number;
+  payDay?: number | null;
+  referenceMonthOffset?: number;
+  accountId?: string | null;
+  isAvailableCash?: boolean;
+  recurringTransactionId?: string | null;
+}
+
+const ITEM_DEFAULTS = { marginDays: 0, payDay: null, referenceMonthOffset: 0, accountId: null, isAvailableCash: true, recurringTransactionId: null } as const;
+
+/**
+ * The calculation fields of an item after a create or update (`current` = the stored row on an update). A per-business-day
+ * item is an earning outside every base, with a pay day; a benefit that is not available money cannot feed a recurrence
+ * (it would put the money back in the cash flow). A fixed monthly item carries none of the per-day fields.
+ */
+async function resolveItemCalc(householdId: string, body: ItemWrite, current?: Omit<ItemRow, 'values'>) {
+  const mode = body.calcMode ?? current?.calcMode ?? 'FIXED_MONTHLY';
+  const pick2 = <K extends keyof typeof ITEM_DEFAULTS>(key: K) => (body[key] !== undefined ? body[key] : current ? (current[key] as ItemWrite[K]) : ITEM_DEFAULTS[key]);
+  if (mode === 'FIXED_MONTHLY') {
+    const touched = (['marginDays', 'payDay', 'referenceMonthOffset', 'accountId', 'isAvailableCash', 'recurringTransactionId'] as const).filter(
+      (k) => body[k] !== undefined && body[k] !== ITEM_DEFAULTS[k],
+    );
+    if (touched.length > 0) throw new BadRequestError(`${touched.join(', ')} only apply to an item paid per business day`);
+    return { calcMode: mode, ...ITEM_DEFAULTS };
+  }
+  const kind = body.kind ?? current?.kind ?? 'EARNING';
+  const bases = {
+    inInssBase: body.inInssBase ?? current?.inInssBase ?? false,
+    inIrrfBase: body.inIrrfBase ?? current?.inIrrfBase ?? false,
+    inFgtsBase: body.inFgtsBase ?? current?.inFgtsBase ?? false,
+  };
+  if (kind !== 'EARNING') throw new BadRequestError('An item paid per business day must be an earning');
+  if (bases.inInssBase || bases.inIrrfBase || bases.inFgtsBase) throw new BadRequestError('An item paid per business day stays outside the INSS, IRRF and FGTS bases');
+  const payDay = pick2('payDay');
+  if (!payDay) throw new BadRequestError('payDay is required for an item paid per business day');
+  const accountId = pick2('accountId');
+  const recurringTransactionId = pick2('recurringTransactionId');
+  const isAvailableCash = pick2('isAvailableCash');
+  if (recurringTransactionId && !isAvailableCash) throw new BadRequestError('A benefit that is not available money cannot feed a recurrence');
+  if (accountId || recurringTransactionId) {
+    await validateLinks(householdId, accountId, current && current.recurringTransactionId === recurringTransactionId ? null : recurringTransactionId);
+  }
+  return { calcMode: mode, marginDays: pick2('marginDays'), payDay, referenceMonthOffset: pick2('referenceMonthOffset'), accountId, isAvailableCash, recurringTransactionId };
+}
+
+/** A recurrence that already feeds an employment's salary cannot also feed a benefit. */
+async function ensureRecurrenceFree(recurringId: string | null | undefined): Promise<void> {
+  if (!recurringId) return;
+  const used = await prisma.employment.findFirst({ where: { recurringTransactionId: recurringId }, select: { id: true } });
+  if (used) throw new ConflictError('That recurrence already feeds an employment');
+}
+
+const itemInclude = { values: { orderBy: { startDate: 'asc' } } } as const;
+
 export const items: SubService = {
   async list(householdId, employmentId) {
     await requireEmployment(householdId, employmentId);
-    const rows = await prisma.employmentItem.findMany({ where: { employmentId, employment: { householdId } }, orderBy: { createdAt: 'asc' }, include: { values: { orderBy: { startDate: 'asc' } } } });
+    const rows = await prisma.employmentItem.findMany({ where: { employmentId, employment: { householdId } }, orderBy: { createdAt: 'asc' }, include: itemInclude });
     return rows.map(serializeItem);
   },
   async create(householdId, employmentId, body) {
     await requireEmployment(householdId, employmentId);
-    const row = await prisma.employmentItem.create({
-      data: {
-        employmentId,
-        name: body.name,
-        kind: body.kind,
-        inInssBase: body.inInssBase,
-        inIrrfBase: body.inIrrfBase,
-        inFgtsBase: body.inFgtsBase,
-        ...(body.value && { values: { create: [{ amount: c(body.value.amount), startDate: date(body.value.startDate) }] } }),
-      },
-      include: { values: { orderBy: { startDate: 'asc' } } },
-    });
+    const calc = await resolveItemCalc(householdId, body);
+    await ensureRecurrenceFree(calc.recurringTransactionId);
+    const row = await conflictOnUnique('That recurrence already feeds another benefit', 'The employment, account or recurrence was removed meanwhile', () =>
+      prisma.employmentItem.create({
+        data: {
+          employmentId,
+          name: body.name,
+          kind: body.kind,
+          inInssBase: body.inInssBase,
+          inIrrfBase: body.inIrrfBase,
+          inFgtsBase: body.inFgtsBase,
+          ...calc,
+          ...(body.value && { values: { create: [{ amount: c(body.value.amount), startDate: date(body.value.startDate) }] } }),
+        },
+        include: itemInclude,
+      }),
+    );
     return serializeItem(row);
   },
   async update(householdId, employmentId, subId, body) {
-    await requireItem(householdId, employmentId, subId);
-    const row = await prisma.employmentItem.update({
-      where: { id: subId },
-      data: pick(body, { name: same, kind: same, inInssBase: same, inIrrfBase: same, inFgtsBase: same }),
-      include: { values: { orderBy: { startDate: 'asc' } } },
-    });
+    const current = await requireItem(householdId, employmentId, subId);
+    const touchesCalc = ['calcMode', 'marginDays', 'payDay', 'referenceMonthOffset', 'accountId', 'isAvailableCash', 'recurringTransactionId', 'kind', 'inInssBase', 'inIrrfBase', 'inFgtsBase'].some(
+      (k) => body[k] !== undefined,
+    );
+    const calc = touchesCalc ? await resolveItemCalc(householdId, body, current) : null;
+    if (calc && calc.recurringTransactionId !== current.recurringTransactionId) await ensureRecurrenceFree(calc.recurringTransactionId);
+    const row = await conflictOnUnique('That recurrence already feeds another benefit', 'The account or recurrence was removed meanwhile', () =>
+      prisma.employmentItem.update({
+        where: { id: subId },
+        data: { ...pick(body, { name: same, kind: same, inInssBase: same, inIrrfBase: same, inFgtsBase: same }), ...(calc ?? {}) },
+        include: itemInclude,
+      }),
+    );
     return serializeItem(row);
   },
   async remove(householdId, employmentId, subId) {
@@ -545,8 +664,9 @@ export async function getEmploymentEvents(householdId: string, id: string, q: { 
 }
 
 /** The events of every active CLT employment of the household, one entry each (each event set carries its employment id). */
-export async function getHouseholdEvents(householdId: string, q: { from?: string; to?: string }, today = todayString()) {
-  const rows = await prisma.employment.findMany({ where: { householdId, isActive: true, regime: 'CLT' }, orderBy: { createdAt: 'asc' }, ...full });
+export async function getHouseholdEvents(householdId: string, q: { from?: string; to?: string; personId?: string }, today = todayString()) {
+  if (q.personId) await requirePerson(householdId, q.personId);
+  const rows = await prisma.employment.findMany({ where: { householdId, isActive: true, regime: 'CLT', ...(q.personId ? { personId: q.personId } : {}) }, orderBy: { createdAt: 'asc' }, ...full });
   const range = eventsRange(q, today);
   return moneyDeep({ ...range, today, employments: rows.map((row) => buildPayrollEvents(toEmploymentData(row), { ...range, today })) });
 }

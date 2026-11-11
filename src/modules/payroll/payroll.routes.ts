@@ -113,10 +113,10 @@ export async function payrollRoutes(app: FastifyInstance) {
   });
 
   // Employments ---------------------------------------------------------------------
-  app.get('/employments', { schema: docs('List the employments of a household, with their sub-resources (read: member)') }, async (request, reply) => {
+  app.get('/employments', { schema: docs('List the employments of a household (optionally of one person), with their sub-resources (read: member)') }, async (request, reply) => {
     const query = listEmploymentsQuerySchema.parse(request.query);
     await requireHouseholdMember(request, query.householdId);
-    return reply.send({ success: true, data: await listEmployments(query.householdId) });
+    return reply.send({ success: true, data: await listEmployments(query.householdId, { personId: query.personId }) });
   });
 
   app.post('/employments', { schema: docs('Create an employment; a household may have several (EDITOR+)') }, async (request, reply) => {
@@ -125,7 +125,7 @@ export async function payrollRoutes(app: FastifyInstance) {
     return reply.status(201).send({ success: true, data: await createEmployment(input) });
   });
 
-  app.get('/events', { schema: docs('Forecast events of every active employment of the household in a period (read: member)') }, async (request, reply) => {
+  app.get('/events', { schema: docs('Forecast events of every active employment of the household (optionally of one person) in a period, benefits included (read: member)') }, async (request, reply) => {
     const query = eventsHouseholdQuerySchema.parse(request.query);
     await requireHouseholdMember(request, query.householdId);
     return reply.send({ success: true, data: await getHouseholdEvents(query.householdId, query) });

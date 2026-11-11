@@ -39,10 +39,25 @@ const employmentFields = {
   thirteenthSecondMonth: monthNumber,
   thirteenthSecondDay: dayNumber,
   isActive: z.boolean(),
+  personId: uuid,
+  uf: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z]{2}$/, 'uf must be two letters')
+    .transform((v) => v.toUpperCase())
+    .nullable(),
+  city: z.string().trim().min(1).max(80).nullable(),
+  optionalHolidaysOff: z.boolean(),
 };
 
 export const createEmploymentSchema = z.object({
   householdId: uuid,
+  /** Owner: a person of the household (required from this release on). */
+  personId: employmentFields.personId,
+  /** Holiday calendar. Without a uf only weekends are days off; the city needs a uf. */
+  uf: employmentFields.uf.optional(),
+  city: employmentFields.city.optional(),
+  optionalHolidaysOff: employmentFields.optionalHolidaysOff.default(false),
   regime: employmentFields.regime.default('CLT'),
   employer: employmentFields.employer,
   admissionDate: employmentFields.admissionDate,
@@ -58,7 +73,7 @@ export const createEmploymentSchema = z.object({
   thirteenthSecondMonth: monthNumber.default(12),
   thirteenthSecondDay: dayNumber.default(20),
   isActive: z.boolean().default(true),
-});
+}).refine((v) => !v.city || !!v.uf, { message: 'The city needs a uf', path: ['city'] });
 export type CreateEmploymentInput = z.infer<typeof createEmploymentSchema>;
 
 export const updateEmploymentSchema = z
@@ -77,11 +92,15 @@ export const updateEmploymentSchema = z
     thirteenthSecondMonth: monthNumber.optional(),
     thirteenthSecondDay: dayNumber.optional(),
     isActive: z.boolean().optional(),
+    personId: employmentFields.personId.optional(),
+    uf: employmentFields.uf.optional(),
+    city: employmentFields.city.optional(),
+    optionalHolidaysOff: employmentFields.optionalHolidaysOff.optional(),
   })
   .refine((v) => Object.values(v).some((x) => x !== undefined), { message: 'Nothing to update' });
 export type UpdateEmploymentInput = z.infer<typeof updateEmploymentSchema>;
 
-export const listEmploymentsQuerySchema = z.object({ householdId: uuid });
+export const listEmploymentsQuerySchema = z.object({ householdId: uuid, personId: uuid.optional() });
 
 // Sub-resources -------------------------------------------------------------
 
@@ -95,17 +114,50 @@ const itemBase = {
   inIrrfBase: z.boolean(),
   inFgtsBase: z.boolean(),
 };
-export const itemSchema = z.object({
-  name: itemBase.name,
-  kind: itemBase.kind.default('EARNING'),
-  inInssBase: itemBase.inInssBase.default(false),
-  inIrrfBase: itemBase.inIrrfBase.default(false),
-  inFgtsBase: itemBase.inFgtsBase.default(false),
-  /** Optional first value of the history. */
-  value: z.object({ amount: money, startDate: dayString }).optional(),
-});
+const calcMode = z.enum(['FIXED_MONTHLY', 'PER_BUSINESS_DAY']);
+/** Fields of an item paid per business day (the value history is then the value per day). */
+const perDayFields = {
+  marginDays: z.number().int().min(0).max(31),
+  payDay: dayNumber.nullable(),
+  referenceMonthOffset: z.number().int().min(-1).max(1),
+  accountId: uuid.nullable(),
+  isAvailableCash: z.boolean(),
+  recurringTransactionId: uuid.nullable(),
+};
+export const itemSchema = z
+  .object({
+    name: itemBase.name,
+    kind: itemBase.kind.default('EARNING'),
+    inInssBase: itemBase.inInssBase.default(false),
+    inIrrfBase: itemBase.inIrrfBase.default(false),
+    inFgtsBase: itemBase.inFgtsBase.default(false),
+    /** FIXED_MONTHLY (default, the payslip line) or PER_BUSINESS_DAY (value per day x counted days, own payment). */
+    calcMode: calcMode.default('FIXED_MONTHLY'),
+    marginDays: perDayFields.marginDays.optional(),
+    payDay: perDayFields.payDay.optional(),
+    referenceMonthOffset: perDayFields.referenceMonthOffset.optional(),
+    accountId: perDayFields.accountId.optional(),
+    isAvailableCash: perDayFields.isAvailableCash.optional(),
+    recurringTransactionId: perDayFields.recurringTransactionId.optional(),
+    /** Optional first value of the history (per day when PER_BUSINESS_DAY). */
+    value: z.object({ amount: money, startDate: dayString }).optional(),
+  })
+  .refine((v) => v.calcMode !== 'PER_BUSINESS_DAY' || !!v.payDay, { message: 'payDay is required for an item paid per business day', path: ['payDay'] });
 export const itemUpdateSchema = z
-  .object({ name: itemBase.name.optional(), kind: itemBase.kind.optional(), inInssBase: itemBase.inInssBase.optional(), inIrrfBase: itemBase.inIrrfBase.optional(), inFgtsBase: itemBase.inFgtsBase.optional() })
+  .object({
+    name: itemBase.name.optional(),
+    kind: itemBase.kind.optional(),
+    inInssBase: itemBase.inInssBase.optional(),
+    inIrrfBase: itemBase.inIrrfBase.optional(),
+    inFgtsBase: itemBase.inFgtsBase.optional(),
+    calcMode: calcMode.optional(),
+    marginDays: perDayFields.marginDays.optional(),
+    payDay: perDayFields.payDay.optional(),
+    referenceMonthOffset: perDayFields.referenceMonthOffset.optional(),
+    accountId: perDayFields.accountId.optional(),
+    isAvailableCash: perDayFields.isAvailableCash.optional(),
+    recurringTransactionId: perDayFields.recurringTransactionId.optional(),
+  })
   .refine((v) => Object.values(v).some((x) => x !== undefined), { message: 'Nothing to update' });
 export const itemValueSchema = z.object({ amount: money, startDate: dayString });
 export const itemValueUpdateSchema = itemValueSchema.partial().refine((v) => Object.values(v).some((x) => x !== undefined), { message: 'Nothing to update' });
@@ -193,7 +245,7 @@ export const eventsQuerySchema = z
   .refine((v) => !v.from || !v.to || v.from <= v.to, { message: 'from must not be after to' })
   .refine((v) => !v.from || !v.to || (Date.parse(v.to) - Date.parse(v.from)) / 86_400_000 <= MAX_RANGE_DAYS, { message: 'The period is too long (5 years at most)' });
 export const eventsHouseholdQuerySchema = z
-  .object({ householdId: uuid, from: dayString.optional(), to: dayString.optional() })
+  .object({ householdId: uuid, personId: uuid.optional(), from: dayString.optional(), to: dayString.optional() })
   .refine((v) => !v.from || !v.to || v.from <= v.to, { message: 'from must not be after to' })
   .refine((v) => !v.from || !v.to || (Date.parse(v.to) - Date.parse(v.from)) / 86_400_000 <= MAX_RANGE_DAYS, { message: 'The period is too long (5 years at most)' });
 
