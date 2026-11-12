@@ -9,17 +9,26 @@ import { deductionCents, type TheirShare } from '../people/own-share.js';
  * A budget counts the transactions of its household, of its own type (an income filed under an expense category, such
  * as a refund, or a transfer, is not spending) and of its category; the "General" budget takes every category.
  * `periodWhere` is the period filter (see monthOrRangeWhere): the planning month, or a date range.
+ *
+ * The payment of a card invoice (tagged `invoice_pay:<card>:...` in `attachmentUrl`) is left out: the purchases of the
+ * card already count on their own dates, so the payment would count the same money twice.
  */
+export const INVOICE_PAYMENT_PREFIX = 'invoice_pay:';
+const NOT_INVOICE_PAYMENT = { OR: [{ attachmentUrl: null }, { NOT: { attachmentUrl: { startsWith: INVOICE_PAYMENT_PREFIX } } }] };
+
 export function budgetSpendingWhere(
   budget: { householdId: string | undefined; categoryName: string; type: string },
   periodWhere: Record<string, unknown>,
 ): Prisma.TransactionWhereInput {
+  const { AND: periodAnd, ...period } = periodWhere as { AND?: unknown };
+  const periodConditions = periodAnd === undefined ? [] : Array.isArray(periodAnd) ? periodAnd : [periodAnd];
   return {
     householdId: budget.householdId,
     ...(budget.categoryName === GENERAL_BUDGET_CATEGORY ? {} : { categoryName: budget.categoryName }),
     type: budget.type as CategoryType,
-    ...periodWhere,
-  };
+    ...period,
+    AND: [...periodConditions, NOT_INVOICE_PAYMENT],
+  } as Prisma.TransactionWhereInput;
 }
 
 /** Sum of the absolute amounts, in reais, added in whole cents. */

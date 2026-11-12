@@ -1,6 +1,6 @@
 /**
  * Tiny evaluator of the Prisma `where` shapes the month filters build (AND / OR / NOT, equality, null, in, gte / lte,
- * contains), over rows whose `date` is a 'YYYY-MM-DD' string. A Date bound is read by its UTC calendar day, which is
+ * contains, startsWith), over rows whose `date` is a 'YYYY-MM-DD' string. A Date bound is read by its UTC calendar day, which is
  * what the driver does with a bound on a `@db.Date` column (it sends the UTC date part), so a bound that is not built
  * as a UTC-midnight day is judged here exactly as the database judges it, in every time zone.
  */
@@ -38,6 +38,7 @@ export function matchesWhere(row: Row, where: Record<string, unknown> | undefine
     if ('in' in c && !(c.in as unknown[]).includes(value)) return false;
     if ('equals' in c && value !== c.equals) return false;
     if ('contains' in c && !(typeof value === 'string' && value.toLowerCase().includes(String(c.contains).toLowerCase()))) return false;
+    if ('startsWith' in c && !(typeof value === 'string' && value.startsWith(String(c.startsWith)))) return false;
     if ('gte' in c && !(asDay(value) >= asDay(c.gte))) return false;
     if ('lte' in c && !(asDay(value) <= asDay(c.lte))) return false;
   }
