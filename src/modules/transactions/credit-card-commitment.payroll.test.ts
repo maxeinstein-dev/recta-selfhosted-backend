@@ -12,7 +12,7 @@ vi.mock('./transactions.service.js', () => ({ calculateCreditCardInvoice: vi.fn(
 
 import { computeMonthlyPayroll } from '../payroll/payroll-calc.js';
 import { computeThirteenth } from '../payroll/payroll-thirteenth.js';
-import { expectedIncomeByMonth } from './credit-card-commitment.js';
+import { expectedIncomeByMonth, firstIncomeMonth } from './credit-card-commitment.js';
 
 // Invented data only.
 const utc = (day: string) => new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10))));
@@ -107,6 +107,36 @@ describe('expected income of the card commitment', () => {
     const june = await expectedIncomeByMonth(HH, ['2026-06']);
     const t = computeThirteenth({ year: 2026, grossCents: 400000, avos: 12 });
     expect(june.get('2026-06')).toBeGreaterThanOrEqual(t.first.amountCents);
+  });
+
+  it('the current month counts the income that already came in: a recurrence that ran this month (its next run is next month) is still income of this month', async () => {
+    db.recurringTransaction.findMany.mockResolvedValue([recurrence({ nextRunAt: utc('2026-12-05') })]);
+    const result = await expectedIncomeByMonth(HH, MONTHS);
+    expect([...result.entries()]).toEqual(MONTHS.map((m) => [m, 300000]));
+  });
+
+  it('with a linked employment too: the salary paid on the 5th counts in the month after its recurrence already ran', async () => {
+    db.recurringTransaction.findMany.mockResolvedValue([recurrence({ nextRunAt: utc('2026-12-05') })]);
+    db.employment.findMany.mockResolvedValue([employment()]);
+    const result = await expectedIncomeByMonth(HH, ['2026-11']);
+    expect(result.get('2026-11')).toBe(computeMonthlyPayroll({ date: '2026-11-05', grossCents: 400000, workedDays: 30 }).netCents);
+  });
+
+  it('a recurrence that starts after its day of this month does not count this month: its first run is next month', async () => {
+    db.recurringTransaction.findMany.mockResolvedValue([recurrence({ startDate: utc('2026-11-20'), nextRunAt: utc('2026-12-05') })]);
+    const result = await expectedIncomeByMonth(HH, MONTHS);
+    expect([...result.values()]).toEqual([0, 300000, 300000, 300000]);
+  });
+
+  it('first income month: the earliest run on or after the start, found by walking the monthly runs back from the next one', () => {
+    expect(firstIncomeMonth(utc('2026-12-05'), utc('2025-01-05'))).toBe('2025-01');
+    expect(firstIncomeMonth(utc('2026-12-05'), utc('2026-11-05'))).toBe('2026-11');
+    expect(firstIncomeMonth(utc('2026-12-05'), utc('2026-11-06'))).toBe('2026-12');
+    expect(firstIncomeMonth(utc('2026-12-05'), utc('2026-12-05'))).toBe('2026-12');
+    expect(firstIncomeMonth(utc('2026-12-05'), utc('2027-03-01'))).toBe('2026-12');
+    // a run on the 31st lands on the last day of a shorter month: 28 February is on or after a start on 10 February
+    expect(firstIncomeMonth(utc('2027-03-31'), utc('2027-02-10'))).toBe('2027-02');
+    expect(firstIncomeMonth(utc('2027-03-31'), utc('2027-03-01'))).toBe('2027-03');
   });
 
   it('a linked employment on an inactive recurrence adds no 13th', async () => {
