@@ -128,9 +128,35 @@ export function buildCommitment(
 }
 
 /**
+ * The first month a monthly recurrence brings income: the month of its earliest run on or after its start date, found
+ * by walking the monthly runs back from the next one. `nextRunAt` alone is not it: once the run of the month in course
+ * happened, the next run is next month, and the month in course would lose income it already received.
+ * A run on a day the month does not have falls on its last day.
+ */
+export function firstIncomeMonth(nextRunAt: Date, startDate: Date | null | undefined): string {
+  const next = dayString(nextRunAt);
+  let month = next.slice(0, 7);
+  if (!startDate) return month;
+  const start = dayString(startDate);
+  const day = Number(next.slice(8, 10));
+  // bounded walk: 50 years of monthly runs
+  for (let i = 0; i < 600; i += 1) {
+    const previous = addMonthKey(month, -1);
+    const year = Number(previous.slice(0, 4));
+    const monthNumber = Number(previous.slice(5, 7));
+    const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+    if (formatDay(year, monthNumber, Math.min(day, lastDay)) < start) break;
+    month = previous;
+  }
+  return month;
+}
+
+/**
  * Income expected per month, in cents, from the household's active MONTHLY income recurrences (their forecast strategy
- * decides the amount). A recurrence counts from the month of its next run to the month of its end date. Other
- * frequencies are left out: this is a reference line for the card, not a cash-flow projection.
+ * decides the amount). A recurrence counts from the month of its first run (see firstIncomeMonth) to the month of its
+ * end date: the month in course counts the income that already came in, because it is the income of the month that is
+ * compared with the invoice, not what is still to arrive. Other frequencies are left out: this is a reference line for
+ * the card, not a cash-flow projection.
  * An employment linked to a salary recurrence replaces that recurrence's amount with the calculated net paid in the
  * month, and adds the 13th, vacation and FGTS birthday withdrawal of the month they fall in (nothing is filtered by
  * today: it is the income of the month). Without a linked employment the result is the one of the recurrences alone.
@@ -148,7 +174,7 @@ export async function expectedIncomeByMonth(householdId: string, months: readonl
     const batch = await forecastBatch(prisma, rows);
     for (const row of rows) {
       if (!batch.isIncome(row)) continue;
-      const first = dayString(row.nextRunAt).slice(0, 7);
+      const first = firstIncomeMonth(row.nextRunAt, row.startDate);
       const last = row.endDate ? dayString(row.endDate).slice(0, 7) : null;
       const link = payroll.find((l) => l.recurringTransactionId === row.id);
       const benefitOwner = link ? undefined : payroll.find((l) => (l.data.benefits ?? []).some((b) => b.recurringTransactionId === row.id));
