@@ -365,7 +365,8 @@ model Budget {
   householdId  String       @map("household_id") @db.Uuid
   categoryName String       @map("category_name") @db.VarChar(50)
   monthlyLimit Decimal      @map("monthly_limit") @db.Decimal(15, 2)
-  month        DateTime     @db.Date // Month this budget applies to (start of month)
+  month        DateTime     @db.Date // First month this budget is in force (start of month); it repeats in the next ones
+  endMonth     DateTime?    @map("end_month") @db.Date // Last month in force (start of month); null = no end
   type         CategoryType // INCOME or EXPENSE
   measure      BudgetMeasure @default(WHOLE)
   createdAt    DateTime     @default(now()) @map("created_at")

@@ -46,6 +46,8 @@ export const updateBudgetSchema = z.object({
   month: localDateSchema.optional(),
   type: categoryTypeEnum.optional(),
   measure: budgetMeasureEnum.optional(),
+  // Last month the budget is in force (any day of it); null takes the end away
+  endMonth: localDateSchema.nullable().optional(),
 });
 
 export type UpdateBudgetInput = z.infer<typeof updateBudgetSchema>;

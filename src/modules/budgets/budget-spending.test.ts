@@ -30,9 +30,10 @@ vi.mock('../../shared/db/prisma.js', () => {
       budget: {
         findMany: vi.fn(async () => store.budgets.map(budgetRow)),
         findFirst: vi.fn(async (args: { where: Record<string, unknown> }) => {
-          // The month is a Date: compared by instant, the other fields by the real `where`
-          const { month, ...rest } = args.where as { month: Date } & Record<string, unknown>;
-          const found = store.budgets.find((b) => (b.month as Date).getTime() === month.getTime() && matchesWhere(b as Row, rest));
+          // The real `where` (the month bound included), newest month first, as the query orders it
+          const found = store.budgets
+            .filter((b) => matchesWhere(b as Row, args.where))
+            .sort((a, b) => (b.month as Date).getTime() - (a.month as Date).getTime())[0];
           return found ? budgetRow(found) : null;
         }),
       },
