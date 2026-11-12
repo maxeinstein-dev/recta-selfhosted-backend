@@ -1,4 +1,5 @@
 import { monthOrRangeWhere } from '../../shared/utils/competence.js';
+import { budgetSpendingWhere, sumSpending } from './budget-spending.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
@@ -215,40 +216,12 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
   // Get spending for each budget category
   const budgetSummaries = await Promise.all(
     budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; type: string; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
-      let spending: number;
-
-      if (budget.categoryName === GENERAL_BUDGET_CATEGORY) {
-        // General pseudo-budget represents the total spending/income of the period.
-        const totalWhere: Prisma.TransactionWhereInput = {
-          householdId,
-          type: budget.type as CategoryType,
-          ...periodWhere,
-        };
-        const totalTransactions = await prisma.transaction.findMany({
-          where: totalWhere,
-          select: { amount: true },
-        });
-        spending = totalTransactions.reduce((sum: number, t: { amount: Prisma.Decimal }) => {
-          return sum + Math.abs(t.amount.toNumber());
-        }, 0);
-      } else {
-        // Only rows of the budget type: a refund (income) or a transfer filed under the category is not spending.
-        const where: Prisma.TransactionWhereInput = {
-          householdId,
-          categoryName: budget.categoryName,
-          type: budget.type as CategoryType,
-          ...periodWhere,
-        };
-
-        const transactions = await prisma.transaction.findMany({
-          where,
-          select: { amount: true },
-        });
-
-        spending = transactions.reduce((sum: number, t: { amount: Prisma.Decimal }) => {
-          return sum + Math.abs(t.amount.toNumber());
-        }, 0);
-      }
+      // One definition of what counts, shared with the budget alerts (see budget-spending.ts)
+      const transactions = await prisma.transaction.findMany({
+        where: budgetSpendingWhere({ householdId, categoryName: budget.categoryName, type: budget.type }, periodWhere),
+        select: { amount: true },
+      });
+      const spending = sumSpending(transactions);
 
       // Own share: the same spending without the parts other people owe back (expense budgets only)
       const sharedCents =
