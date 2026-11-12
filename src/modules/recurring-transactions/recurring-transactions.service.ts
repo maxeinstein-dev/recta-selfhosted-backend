@@ -1,17 +1,18 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { NotFoundError, BadRequestError, AppError } from '../../shared/errors/index.js';
+import { NotFoundError, BadRequestError, ConflictError, AppError } from '../../shared/errors/index.js';
 import { getCategoryColor, AccountType, TransactionType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
 import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
 import { expectedAmountFor, normalizeStrategy } from './expected-amount.js';
-import { assertForecastConsistent, forecastInputOf, forecastBatch, isIncomeCategory, loadConfirmedHistory, referenceMonthOf } from './recurring-forecast.js';
+import { assertEarlyDiscountConsistent, assertForecastConsistent, earlyDiscountQuoteOf, forecastInputOf, forecastBatch, isIncomeCategory, loadConfirmedHistory, localTodayString, referenceMonthOf } from './recurring-forecast.js';
+import { amountOnDay, earlyDiscountOf } from './early-discount.js';
 import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { addMonthsClamped, anchorDayOf, dayString, localDate, monthBoundsUtc } from './recurring-dates.js';
 import { normalizeDescription } from './detect.js';
 import { recurrenceNameKeys } from './recurring-aliases.js';
-import { FOLLOW_LOOKAHEAD_DAYS, plusDays } from './recurring-follow.js';
+import { FOLLOW_LOOKAHEAD_DAYS, followLastAmountInTx, plusDays } from './recurring-follow.js';
 import type {
   CreateRecurringTransactionInput,
   UpdateRecurringTransactionInput,
@@ -68,8 +69,13 @@ export function occurrenceDateFor(
 }
 
 /** JSON-safe view of a stored recurrence: decimals as numbers. */
-function plain<T extends { amount: { toNumber(): number }; dailyRate?: { toNumber(): number } | null }>(r: T) {
-  return { ...r, amount: r.amount.toNumber(), dailyRate: r.dailyRate ? r.dailyRate.toNumber() : null };
+function plain<T extends { amount: { toNumber(): number }; dailyRate?: { toNumber(): number } | null; earlyDiscountValue?: { toNumber(): number } | null }>(r: T) {
+  return {
+    ...r,
+    amount: r.amount.toNumber(),
+    dailyRate: r.dailyRate ? r.dailyRate.toNumber() : null,
+    earlyDiscountValue: r.earlyDiscountValue ? r.earlyDiscountValue.toNumber() : null,
+  };
 }
 
 /**
@@ -113,9 +119,13 @@ export async function createRecurringTransaction(
     nonWorkingDays,
     optionalHolidays,
     aliases,
+    earlyDiscountDay,
+    earlyDiscountType,
+    earlyDiscountValue,
   } = input;
 
   assertForecastConsistent({ forecastStrategy, dailyRate: dailyRate ?? null, frequency });
+  assertEarlyDiscountConsistent({ amount, day: earlyDiscountDay ?? null, type: earlyDiscountType ?? null, value: earlyDiscountValue ?? null });
 
   // Verify account belongs to household
   const account = await prisma.account.findFirst({
@@ -157,6 +167,9 @@ export async function createRecurringTransaction(
       nonWorkingDays,
       optionalHolidays,
       aliases,
+      earlyDiscountDay: earlyDiscountDay ?? null,
+      earlyDiscountType: earlyDiscountType ?? null,
+      earlyDiscountValue: earlyDiscountValue != null ? new Prisma.Decimal(earlyDiscountValue) : null,
     },
     include: {
       account: {
@@ -289,12 +302,18 @@ export async function listRecurringTransactions(
   // (two queries for the whole list, not two per recurrence)
   const batch = await forecastBatch(prisma, recurring);
   const forecasts = recurring.map((r) => batch.expected(r, referenceMonthOf(r.nextRunAt, r.competenceOffsetMonths)));
+  const today = localTodayString();
   // Convert Prisma.Decimal to number for JSON serialization
-  return recurring.map((r, i) => ({
-    ...plain(r),
-    lastOccurrenceDate: last.get(r.id) ?? null,
-    forecast: forecasts[i],
-  }));
+  return recurring.map((r, i) => {
+    // The discount of the next occurrence while it can still be had (absent otherwise): `amount` stays the full amount
+    const earlyDiscount = earlyDiscountQuoteOf(r, forecasts[i]!.amount, dayString(r.nextRunAt), today);
+    return {
+      ...plain(r),
+      lastOccurrenceDate: last.get(r.id) ?? null,
+      forecast: forecasts[i],
+      ...(earlyDiscount && { earlyDiscount }),
+    };
+  });
 }
 
 /**
@@ -342,6 +361,13 @@ export async function updateRecurringTransaction(
     dailyRate: input.dailyRate !== undefined ? input.dailyRate : existing.dailyRate?.toNumber() ?? null,
     frequency: input.frequency ?? existing.frequency,
   });
+  // Early-payment discount: the merge of what was sent with what is stored must be all-or-none and fit the amount
+  assertEarlyDiscountConsistent({
+    amount: input.amount ?? existing.amount.toNumber(),
+    day: input.earlyDiscountDay !== undefined ? input.earlyDiscountDay : existing.earlyDiscountDay ?? null,
+    type: input.earlyDiscountType !== undefined ? input.earlyDiscountType : existing.earlyDiscountType ?? null,
+    value: input.earlyDiscountValue !== undefined ? input.earlyDiscountValue : existing.earlyDiscountValue?.toNumber() ?? null,
+  });
 
   const recurring = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
   await lockCustomCategory(tx, householdId, input.categoryName);
@@ -369,6 +395,9 @@ export async function updateRecurringTransaction(
       ...(input.nonWorkingDays !== undefined && { nonWorkingDays: input.nonWorkingDays }),
       ...(input.optionalHolidays !== undefined && { optionalHolidays: input.optionalHolidays }),
       ...(input.aliases !== undefined && { aliases: input.aliases }),
+      ...(input.earlyDiscountDay !== undefined && { earlyDiscountDay: input.earlyDiscountDay }),
+      ...(input.earlyDiscountType !== undefined && { earlyDiscountType: input.earlyDiscountType }),
+      ...(input.earlyDiscountValue !== undefined && { earlyDiscountValue: input.earlyDiscountValue === null ? null : new Prisma.Decimal(input.earlyDiscountValue) }),
     },
     include: {
       account: {
@@ -466,12 +495,17 @@ export async function deleteRecurringTransaction(
  * - Para conta bancária: paid: false (pendente para revisão)
  * 
  * Atualiza lastRunDate e nextRunAt.
- * NÃO deve ser chamada manualmente pelo usuário.
+ *
+ * O cronjob é o chamador normal, mas a rota /execute e `payNextOccurrence` (pagar antes pelo app) também passam por aqui,
+ * para a regra do valor, do mês de referência e do avanço da recorrência ser uma só. Com `payNow` a ocorrência é a de
+ * `nextRunAt` (valor previsto pela regra do desconto tomando HOJE como referência), nasce PAGA na data informada e a
+ * recorrência avança a partir da ocorrência agendada, não da data do pagamento.
  */
 export async function executeRecurringTransaction(
   recurringId: string,
   householdId: string,
-  input: ExecuteRecurringTransactionInput = {}
+  input: ExecuteRecurringTransactionInput = {},
+  payNow?: { amount?: number; accountId?: string }
 ) {
   const recurring = await prisma.recurringTransaction.findFirst({
     where: { id: recurringId, householdId, isActive: true },
@@ -485,7 +519,16 @@ export async function executeRecurringTransaction(
   }
 
   const transactionDate = input.date || recurring.nextRunAt;
-  const isPaid = input.paid ?? false; // Default: false (pendente)
+  // The occurrence being generated: the scheduled one (nextRunAt) when paying ahead, else the one dated like the transaction
+  const occurrenceDate = payNow ? recurring.nextRunAt : transactionDate;
+  const isPaid = payNow ? true : input.paid ?? false; // Default: false (pendente)
+
+  // Paying ahead can use another account than the recurrence's (it must belong to the household)
+  const payAccount =
+    payNow?.accountId && payNow.accountId !== recurring.accountId
+      ? await prisma.account.findFirst({ where: { id: payNow.accountId, householdId, isActive: true } })
+      : recurring.account;
+  if (!payAccount) throw new NotFoundError('Account');
 
   const anchorDay = anchorDayOf(recurring.startDate);
 
@@ -494,12 +537,18 @@ export async function executeRecurringTransaction(
   // The amount of the occurrence comes from one function (the extension point for forecast strategies). Its history is
   // the recurrence's last confirmed occurrences, read only when the strategy uses it.
   const history = await loadConfirmedHistory(prisma, recurring, isIncome);
-  const occurrenceAmount = expectedAmountFor(
+  const fullAmount = expectedAmountFor(
     forecastInputOf(recurring, isIncome),
     history,
     // The month the occurrence counts for (its reference month), not the month of its date
-    referenceMonthOf(transactionDate, recurring.competenceOffsetMonths),
+    referenceMonthOf(occurrenceDate, recurring.competenceOffsetMonths),
   );
+  // Early-payment discount: an occurrence generated up to the limit day of its month is born with the discounted amount;
+  // generated later (the job runs on the due date, after the limit) it is the full amount. The recurrence keeps the full one.
+  const occurrenceAmount =
+    payNow?.amount !== undefined
+      ? payNow.amount
+      : amountOnDay(fullAmount, earlyDiscountOf(recurring), dayString(occurrenceDate), localTodayString());
 
   function calculateBalanceChange(amount: number, isInc: boolean, accountType: string): number {
     const isCreditCard = accountType === AccountType.CREDIT;
@@ -535,11 +584,32 @@ export async function executeRecurringTransaction(
     // transaction of this recurrence (generated earlier, or taken over by an imported sheet row), nothing is created
     // and the recurrence just moves on. The check runs under a per-recurrence lock, so two executions (cron, manual,
     // sheet confirm) cannot both see an empty month.
-    if (recurring.frequency === 'MONTHLY') {
+    if (payNow) {
+      // Paying ahead: under the same per-recurrence lock the job takes, the recurrence must still be where this call read
+      // it (another payment or the job may have advanced it meanwhile) and its months must be free of an occurrence.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${recurring.id}`}))`;
+      const current = await tx.recurringTransaction.findFirst({ where: { id: recurringId, householdId }, select: { nextRunAt: true } });
+      if (!current || dayString(current.nextRunAt) !== dayString(recurring.nextRunAt)) {
+        throw new ConflictError('This occurrence was already generated or paid');
+      }
+      if (recurring.frequency === 'MONTHLY') {
+        // Only the month of the occurrence being paid matters, not the month of the payment date: an occurrence of the
+        // month is one dated in it OR one that refers to it (paid ahead, dated in another month)
+        if (await monthHasOccurrence(tx, householdId, recurring.id, dayString(occurrenceDate), referenceMonthOf(occurrenceDate, recurring.competenceOffsetMonths))) {
+          throw new ConflictError('This month already has an occurrence of the recurrence');
+        }
+      }
+    }
+    if (recurring.frequency === 'MONTHLY' && !payNow) {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recurring:${recurring.id}`}))`;
       const { start, end } = monthBoundsUtc(dayString(transactionDate));
+      // An occurrence paid ahead (dated in an earlier month, referring to this one) counts as this month's too
       const existing = await tx.transaction.findFirst({
-        where: { householdId, recurringTransactionId: recurring.id, date: { gte: start, lt: end } },
+        where: {
+          householdId,
+          recurringTransactionId: recurring.id,
+          OR: [{ date: { gte: start, lt: end } }, { competenceMonth: referenceMonthOf(transactionDate, recurring.competenceOffsetMonths) }],
+        },
         include: { account: { select: { id: true, name: true, type: true } } },
       });
       if (existing) {
@@ -597,17 +667,21 @@ export async function executeRecurringTransaction(
       data: {
         householdId,
         type: transactionType,
-        accountId: recurring.accountId,
+        accountId: payAccount.id,
         categoryName,
         amount: new Prisma.Decimal(occurrenceAmount),
         description: recurring.description || `Recurring: ${categoryName}`,
         date: transactionDate,
-        notes: `Auto-generated from recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
+        notes: `${payNow ? 'Paid ahead from' : 'Auto-generated from'} recurring transaction: ${recurring.id} on ${new Date().toISOString()}`,
         paid: isPaid,
         recurringTransactionId: recurring.id,
         // Reference month of the occurrence (a voucher paid on 25 Sep that refers to October): date month + offset
         ...(recurring.competenceOffsetMonths != null && {
-          competenceMonth: addMonths(monthOfDate(transactionDate), recurring.competenceOffsetMonths),
+          competenceMonth: addMonths(monthOfDate(occurrenceDate), recurring.competenceOffsetMonths),
+        }),
+        // Paid ahead in another month than the occurrence's: it refers to the occurrence's month, not to the payment's
+        ...(payNow && recurring.competenceOffsetMonths == null && monthOfDate(transactionDate) !== monthOfDate(occurrenceDate) && {
+          competenceMonth: monthOfDate(occurrenceDate),
         }),
       },
       include: {
@@ -620,21 +694,26 @@ export async function executeRecurringTransaction(
     // REGRA DE NEGÓCIO: Atualizar saldo APENAS se paid: true
     // Para cartão de crédito: consome limite imediatamente
     // Para conta bancária: saldo só é atualizado quando confirmada
-    if (isPaid && recurring.account) {
+    if (isPaid && payAccount) {
       const amount = occurrenceAmount;
-      const balanceChange = calculateBalanceChange(amount, isIncome, recurring.account.type);
+      const balanceChange = calculateBalanceChange(amount, isIncome, payAccount.type);
       
       // Use centralized balance update function to ensure consistency
-      await updateBalanceForNormalTransaction(tx, recurring.accountId, balanceChange);
+      await updateBalanceForNormalTransaction(tx, payAccount.id, balanceChange);
       
       // Recalculate credit card limit if it's a credit card
-      if (recurring.account.type === AccountType.CREDIT) {
-        await recalculateCreditCardLimit(tx, recurring.accountId);
+      if (payAccount.type === AccountType.CREDIT) {
+        await recalculateCreditCardLimit(tx, payAccount.id);
       }
     }
 
+    // Paying ahead follows the last amount by the same rule as editing the occurrence (a discounted payment keeps the full amount)
+    if (payNow) {
+      await followLastAmountInTx(tx, { id: transaction.id, householdId, recurringTransactionId: recurring.id, date: transactionDate, amount: occurrenceAmount }, { amount: occurrenceAmount });
+    }
+
     // Calculate and update next run date
-    const nextRunAt = calculateNextRunDate(transactionDate, recurring.frequency, anchorDay);
+    const nextRunAt = calculateNextRunDate(occurrenceDate, recurring.frequency, anchorDay);
 
     // Update lastRunDate and nextRunAt
     await tx.recurringTransaction.update({
@@ -653,6 +732,46 @@ export async function executeRecurringTransaction(
   });
 
   return result;
+}
+
+/**
+ * True when the month of `occurrenceDay` already holds an occurrence of the recurrence: one dated in the month, or one
+ * that refers to it by its competence month (an occurrence paid ahead is dated in an earlier month).
+ */
+async function monthHasOccurrence(tx: Prisma.TransactionClient, householdId: string, recurringId: string, occurrenceDay: string, referenceMonth: string): Promise<boolean> {
+  const { start, end } = monthBoundsUtc(occurrenceDay);
+  const found = await tx.transaction.findFirst({
+    where: { householdId, recurringTransactionId: recurringId, OR: [{ date: { gte: start, lt: end } }, { competenceMonth: referenceMonth }] },
+    select: { id: true },
+  });
+  return found !== null;
+}
+
+/**
+ * "Pagar antes pelo app": creates NOW the occurrence of `nextRunAt`, already paid, and advances the recurrence as the job
+ * would, so the job does not generate another one for that month at the due date. The amount is the one the discount
+ * rule gives for today (discounted up to the limit day of the occurrence's month, full after), unless `amount` is given;
+ * the date defaults to today and the account to the recurrence's. Refuses an inactive or ended recurrence, and a month
+ * that already holds an occurrence, or an occurrence more than 31 days after the payment date (409), creating nothing.
+ */
+export async function payNextOccurrence(
+  recurringId: string,
+  householdId: string,
+  input: { amount?: number; date?: Date; accountId?: string } = {},
+) {
+  const recurring = await prisma.recurringTransaction.findFirst({ where: { id: recurringId, householdId } });
+  if (!recurring) throw new NotFoundError('Recurring transaction');
+  if (!recurring.isActive) throw new BadRequestError('The recurring transaction is inactive');
+  if (recurring.endDate && dayString(recurring.endDate) < dayString(recurring.nextRunAt)) {
+    throw new BadRequestError('The recurring transaction has ended: there is no occurrence left to pay');
+  }
+  // Guard against a double tap: the occurrence must be at most 31 days after the payment date (the one the user means
+  // is the nearest; the following one, a month later, is refused)
+  const paymentDate = input.date ?? localDate(localTodayString());
+  if (dayString(recurring.nextRunAt) > plusDays(paymentDate, FOLLOW_LOOKAHEAD_DAYS)) {
+    throw new ConflictError('The next occurrence is more than a month ahead of the payment date');
+  }
+  return executeRecurringTransaction(recurringId, householdId, { date: paymentDate }, { amount: input.amount, accountId: input.accountId });
 }
 
 /**

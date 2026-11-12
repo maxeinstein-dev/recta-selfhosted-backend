@@ -415,6 +415,12 @@ enum RecurrenceFrequency {
   YEARLY
 }
 
+// Whether the early-payment discount of a recurrence is a fixed value in reais or a percentage (see modules/recurring-transactions/early-discount.ts).
+enum EarlyDiscountType {
+  FIXED
+  PERCENT
+}
+
 // How the amount of the next occurrence is forecast (see modules/recurring-transactions/expected-amount.ts).
 enum ForecastStrategy {
   LAST
@@ -453,6 +459,11 @@ model RecurringTransaction {
   // Other names the bank or the card machine uses for this charge ("Pg *Motoseguro Conecta"): an imported transaction
   // whose normalized description equals the name or one alias is taken by the recurrence instead of duplicated.
   aliases      String[]            @default([]) @map("aliases")
+  // Early-payment discount: paid up to `earlyDiscountDay` of the occurrence's month the amount is reduced by a fixed value
+  // or a percentage (rounded up to the cent). All three columns are set together, or none (no discount).
+  earlyDiscountDay   Int?              @map("early_discount_day")
+  earlyDiscountType  EarlyDiscountType? @map("early_discount_type")
+  earlyDiscountValue Decimal?          @map("early_discount_value") @db.Decimal(15, 2)
   createdAt    DateTime            @default(now()) @map("created_at")
   updatedAt    DateTime            @updatedAt @map("updated_at")
 

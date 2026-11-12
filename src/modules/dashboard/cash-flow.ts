@@ -5,6 +5,17 @@
  * Read-only by design: nothing here creates an entry or touches a balance.
  */
 
+import type { EarlyDiscountQuote } from '../recurring-transactions/early-discount.js';
+
+/** The discount of a recurrence event, plus what the screen needs to pay it ahead (POST /recurring-transactions/:recurringId/pay-next). */
+export interface CashFlowEarlyDiscount extends EarlyDiscountQuote {
+  recurringId: string;
+  /** 'YYYY-MM-DD' of the occurrence (its due date). */
+  occurrenceDate: string;
+  /** True when this is the occurrence pay-next would pay (the one of the recurrence's nextRunAt). */
+  canPayNow: boolean;
+}
+
 /** 'payroll': 13th, vacation and FGTS birthday withdrawal forecast by an employment (never a recorded entry). */
 export type CashFlowSource = 'pending' | 'recurrence' | 'payroll' | 'invoice';
 export type CashFlowCertainty = 'confirmed' | 'expected' | 'estimated';
@@ -24,6 +35,8 @@ export interface CashFlowEventInput {
   accountId: string;
   /** Invoices only: 'YYYY-MM' of the invoice. */
   invoiceMonth?: string | null;
+  /** Recurrences with an early-payment discount that can still be had: the amount above is the discounted one. */
+  earlyDiscount?: CashFlowEarlyDiscount;
 }
 
 /** An unpaid invoice with nobody to pay it: it is listed apart and never enters the balance. */
@@ -60,6 +73,11 @@ export interface CashFlowEvent {
   sourceId: string;
   accountId: string;
   invoiceMonth: string | null;
+  /**
+   * Only present on a recurrence occurrence whose early-payment discount can still be had (today <= limitDate): `amount`
+   * is then the discounted one, `fullAmount` what it costs after `limitDate`. Absent otherwise.
+   */
+  earlyDiscount?: CashFlowEarlyDiscount;
 }
 
 export interface CashFlowDay {
@@ -142,6 +160,7 @@ export function buildCashFlow(input: CashFlowInput): CashFlowProjection {
       sourceId: e.sourceId,
       accountId: e.accountId,
       invoiceMonth: e.invoiceMonth ?? null,
+      ...(e.earlyDiscount && { earlyDiscount: e.earlyDiscount }),
     });
   }
   // Same order everywhere: day, kind of source, description, id (a stable list for the screen and for the tests)

@@ -82,17 +82,11 @@ export async function loadRecurringMatcher(
   const start = new Date(Date.UTC(Number(monthKey.slice(0, 4)), Number(monthKey.slice(5, 7)) - 1, 1));
   const end = new Date(Date.UTC(Number(monthKey.slice(0, 4)), Number(monthKey.slice(5, 7)), 1));
 
-  const generated = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      type: 'EXPENSE',
-      sourceRef: null,
-      recurringTransactionId: { not: null },
-      accountId: { in: accountIds },
-      date: { gte: start, lt: end },
-    },
-    select: { id: true, accountId: true, description: true, date: true, amount: true, paid: true, recurringTransactionId: true },
-  });
+  const generatedWhere = { householdId, type: 'EXPENSE' as const, sourceRef: null, recurringTransactionId: { not: null }, accountId: { in: accountIds } };
+  const generatedSelect = { id: true, accountId: true, description: true, date: true, amount: true, paid: true, recurringTransactionId: true, competenceMonth: true } as const;
+  let generated = await prisma.transaction.findMany({ where: { ...generatedWhere, date: { gte: start, lt: end } }, select: generatedSelect });
+  // Occurrences paid ahead: dated in another month but referring to this one (competence month)
+  const ahead = await prisma.transaction.findMany({ where: { ...generatedWhere, competenceMonth: monthKey }, select: generatedSelect });
 
   const recurrences = await prisma.recurringTransaction.findMany({
     where: { householdId, isActive: true, frequency: 'MONTHLY', accountId: { in: accountIds } },
@@ -133,11 +127,23 @@ export async function loadRecurringMatcher(
   };
   // Aliases of the recurrences that generated the month's transactions (they may not be in the `due` window)
   const aliasesOf = new Map<string, string[]>(recurrences.map((r) => [r.id, r.aliases ?? []]));
-  const missing = [...new Set(generated.map((t) => t.recurringTransactionId).filter((id): id is string => !!id && !aliasesOf.has(id)))];
+  const offsetOf = new Map<string, number | null>(recurrences.map((r) => [r.id, r.competenceOffsetMonths ?? null]));
+  const missing = [...new Set([...generated, ...ahead].map((t) => t.recurringTransactionId).filter((id): id is string => !!id && !aliasesOf.has(id)))];
   if (missing.length > 0) {
-    const extra = await prisma.recurringTransaction.findMany({ where: { householdId, id: { in: missing } }, select: { id: true, aliases: true } });
-    for (const r of extra) aliasesOf.set(r.id, r.aliases ?? []);
+    const extra = await prisma.recurringTransaction.findMany({ where: { householdId, id: { in: missing } }, select: { id: true, aliases: true, competenceOffsetMonths: true } });
+    for (const r of extra) {
+      aliasesOf.set(r.id, r.aliases ?? []);
+      offsetOf.set(r.id, r.competenceOffsetMonths ?? null);
+    }
   }
+  // A recurrence WITHOUT an offset only has a competence month on an occurrence paid ahead: that one belongs to the month it
+  // refers to, not to the month of its date (so the month it is dated in does not see the same bill twice, and the month it
+  // refers to finds it). A recurrence with an offset always has one, so it keeps matching by date.
+  const noOffset = (t: { recurringTransactionId: string | null }): boolean => t.recurringTransactionId !== null && offsetOf.get(t.recurringTransactionId) === null;
+  generated = [
+    ...generated.filter((t) => !(t.competenceMonth && t.competenceMonth !== monthKey && noOffset(t))),
+    ...ahead.filter((t) => !inMonth(dayString(t.date), monthKey) && noOffset(t)),
+  ];
 
   [...generated]
     .sort((a, b) => dayString(a.date).localeCompare(dayString(b.date)) || a.id.localeCompare(b.id))
