@@ -205,6 +205,12 @@ enum CategoryType {
   EXPENSE
 }
 
+// How a budget is measured: the full spending (kept together) or the own share (kept separately)
+enum BudgetMeasure {
+  WHOLE
+  OWN_SHARE
+}
+
 enum TransactionType {
   INCOME
   EXPENSE
@@ -361,6 +367,7 @@ model Budget {
   monthlyLimit Decimal      @map("monthly_limit") @db.Decimal(15, 2)
   month        DateTime     @db.Date // Month this budget applies to (start of month)
   type         CategoryType // INCOME or EXPENSE
+  measure      BudgetMeasure @default(WHOLE)
   createdAt    DateTime     @default(now()) @map("created_at")
   updatedAt    DateTime     @updatedAt @map("updated_at")
 
