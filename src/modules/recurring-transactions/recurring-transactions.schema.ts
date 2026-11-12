@@ -5,6 +5,7 @@ import { categoryNameSchema } from '../categories/categories.schema.js';
 import { isValidNonWorkingDay, normalizeNonWorkingDays, OPTIONAL_HOLIDAYS } from './br-calendar.js';
 import { aliasesSchema } from './recurring-aliases.js';
 import { FORECAST_STRATEGIES, MAX_CONSERVATIVE_WINDOW } from './expected-amount.js';
+import { EARLY_DISCOUNT_TYPES, validateEarlyDiscount } from './early-discount.js';
 
 /**
  * Recurrence frequency enum
@@ -34,6 +35,11 @@ export const optionalHolidaysSchema = z
   .max(OPTIONAL_HOLIDAYS.length)
   .transform((days) => [...new Set(days)]);
 
+/** Early-payment discount: limit day of the occurrence's month, kind (fixed reais / percent) and value (reais or %). */
+export const earlyDiscountDaySchema = z.number().int().min(1).max(31);
+export const earlyDiscountTypeSchema = z.enum(EARLY_DISCOUNT_TYPES);
+export const earlyDiscountValueSchema = z.union([z.number(), z.string().trim().min(1)]).pipe(z.coerce.number().positive().max(1_000_000_000));
+
 /**
  * Create recurring transaction request
  */
@@ -60,6 +66,20 @@ export const createRecurringTransactionSchema = z.object({
   nonWorkingDays: nonWorkingDaysSchema.default([]),
   optionalHolidays: optionalHolidaysSchema.default([]),
   aliases: aliasesSchema.default([]),
+  // Early-payment discount: the three together, or none
+  earlyDiscountDay: earlyDiscountDaySchema.nullish(),
+  earlyDiscountType: earlyDiscountTypeSchema.nullish(),
+  earlyDiscountValue: earlyDiscountValueSchema.nullish(),
+}).superRefine((input, ctx) => {
+  const { earlyDiscountDay: day, earlyDiscountType: type, earlyDiscountValue: value } = input;
+  const given = [day, type, value].filter((v) => v !== null && v !== undefined).length;
+  if (given === 0) return;
+  if (given !== 3) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['earlyDiscountDay'], message: 'The discount day, type and value must be sent together' });
+    return;
+  }
+  const problem = validateEarlyDiscount({ day: day!, type: type!, value: value!, amount: input.amount });
+  if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['earlyDiscountValue'], message: problem });
 });
 
 export type CreateRecurringTransactionInput = z.infer<
@@ -88,6 +108,10 @@ export const updateRecurringTransactionSchema = z.object({
   nonWorkingDays: nonWorkingDaysSchema.optional(),
   optionalHolidays: optionalHolidaysSchema.optional(),
   aliases: aliasesSchema.optional(),
+  // Early-payment discount: null clears it; the service validates the merge with the stored columns
+  earlyDiscountDay: earlyDiscountDaySchema.nullable().optional(),
+  earlyDiscountType: earlyDiscountTypeSchema.nullable().optional(),
+  earlyDiscountValue: earlyDiscountValueSchema.nullable().optional(),
 });
 
 export type UpdateRecurringTransactionInput = z.infer<
@@ -132,6 +156,15 @@ export type ExecuteRecurringTransactionInput = z.infer<
   typeof executeRecurringTransactionSchema
 >;
 
+
+/** Pay the next occurrence ahead (POST /recurring-transactions/:id/pay-next): everything optional. */
+export const payNextOccurrenceSchema = z.object({
+  amount: z.coerce.number().positive().max(1_000_000_000).optional(),
+  date: localDateSchema.optional(),
+  accountId: z.string().uuid().optional(),
+});
+
+export type PayNextOccurrenceInput = z.infer<typeof payNextOccurrenceSchema>;
 
 /**
  * Detect recurring expenses (POST /recurring-transactions/detect) and apply the chosen candidates

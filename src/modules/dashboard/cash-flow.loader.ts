@@ -4,7 +4,8 @@ import { addMonthKey } from '../transactions/credit-card-commitment.js';
 import { projectRecurrence, toCents, type ForecastRecurrence, type InvoiceState } from '../transactions/credit-card-invoice-forecast.js';
 import { calculateCreditCardInvoice, utcToday } from '../transactions/transactions.service.js';
 import { dayString, localDate } from '../recurring-transactions/recurring-dates.js';
-import { forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
+import { earlyDiscountQuoteOf, forecastBatch, referenceMonthOf } from '../recurring-transactions/recurring-forecast.js';
+import { amountOnDay, earlyDiscountOf } from '../recurring-transactions/early-discount.js';
 import { benefitEvents, benefitPaidInMonth, extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
 import { loadPayrollLinks, type PayrollLink } from '../payroll/payroll.links.js';
 import { addDays, buildCashFlow, type CashFlowEventInput, type CashFlowProjection, type UnassignedInvoiceInput } from './cash-flow.js';
@@ -206,6 +207,8 @@ async function recurrenceEvents(
     generated.add(`${t.recurringTransactionId}:${d.slice(0, 7)}`);
   }
 
+  const fullAmountOn = (r: (typeof rows)[number], day: string): number => batch.expected(r, referenceMonthOf(localDate(day), r.competenceOffsetMonths)).amount;
+
   const events: CashFlowEventInput[] = [];
   for (const r of rows) {
     const strategy = r.forecastStrategy ?? 'LAST';
@@ -221,7 +224,8 @@ async function recurrenceEvents(
       endDate: r.endDate,
       nextRunAt: r.nextRunAt,
       followLastAmount: estimated,
-      amountOn: (day: string) => batch.expected(r, referenceMonthOf(localDate(day), r.competenceOffsetMonths)).amount,
+      // Early-payment discount: until its limit day (from `today` on) the occurrence costs the discounted amount
+      amountOn: (day: string) => amountOnDay(fullAmountOn(r, day), earlyDiscountOf(r), day, today),
       sign: 1,
     };
     const sign = batch.isIncome(r) ? 1 : -1;
@@ -235,6 +239,9 @@ async function recurrenceEvents(
       // A salary recurrence fed by an employment takes the calculated net of the month it pays (raise, month after vacation)
       const calc = link ? salaryPaidInMonth(link.data, item.date.slice(0, 7)) : null;
       const benefitCalc = benefit && benefitOwner ? benefitPaidInMonth(benefitOwner.data, benefit, item.date.slice(0, 7)) : null;
+      // What the screens show beside the discounted amount; a salary or benefit calculated value has no discount
+      const quote = calc || benefitCalc ? null : earlyDiscountQuoteOf(r, fullAmountOn(r, item.date), item.date, today);
+      const earlyDiscount = quote ? { ...quote, recurringId: r.id, occurrenceDate: item.date, canPayNow: item.date === dayString(r.nextRunAt) } : null;
       events.push({
         date: item.date,
         description: item.description,
@@ -245,6 +252,7 @@ async function recurrenceEvents(
         overdue: item.date < today || (staleNext && index === 0),
         sourceId: r.id,
         accountId: r.accountId,
+        ...(earlyDiscount && { earlyDiscount }),
       });
     });
   }

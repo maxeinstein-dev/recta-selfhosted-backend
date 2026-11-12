@@ -183,6 +183,19 @@ export async function dashboardRoutes(app: FastifyInstance) {
       sourceId: { type: 'string' },
       accountId: { type: 'string' },
       invoiceMonth: { type: ['string', 'null'] },
+      // Recurrence with an early-payment discount that can still be had: `amount` is the discounted one
+      earlyDiscount: {
+        type: 'object',
+        properties: {
+          limitDate: { type: 'string' },
+          fullAmount: { type: 'number' },
+          discountedAmount: { type: 'number' },
+          savings: { type: 'number' },
+          recurringId: { type: 'string' },
+          occurrenceDate: { type: 'string' },
+          canPayNow: { type: 'boolean' },
+        },
+      },
     },
   };
   app.get('/cash-flow', {

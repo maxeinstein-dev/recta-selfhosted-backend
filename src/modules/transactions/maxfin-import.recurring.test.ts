@@ -664,4 +664,25 @@ describe('loadRecurringMatcher: the recurrence-only branch stops at today + 31 d
     const m = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 9, 20));
     expect(m.take(BILLS, 'Energia')).toMatchObject({ kind: 'generated' });
   });
+
+  it('an occurrence paid ahead (dated in November, referring to December) is the December one for the December sheet', async () => {
+    const rec = energyRecurrence({ nextRunAt: '2027-01-05' });
+    generated(rec.id, { date: '2026-11-28', competenceMonth: '2026-12' });
+    const m = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 10, 29));
+    expect(m.take(BILLS, 'Energia')).toMatchObject({ kind: 'generated', day: '2026-11-28' });
+  });
+
+  it('...and not for the November sheet, which must not see the same bill twice', async () => {
+    const rec = energyRecurrence({ nextRunAt: '2027-01-05' });
+    generated(rec.id, { date: '2026-11-28', competenceMonth: '2026-12' });
+    const m = await loadRecurringMatcher(HH, [BILLS], '2026-11', new Date(2026, 10, 29));
+    expect(m.take(BILLS, 'Energia')).toBeUndefined();
+  });
+
+  it('a recurrence with an offset keeps matching by date only (its competence month is always the following month)', async () => {
+    const rec = energyRecurrence({ nextRunAt: '2027-01-05', competenceOffsetMonths: 1 });
+    generated(rec.id, { date: '2026-11-05', competenceMonth: '2026-12' });
+    const m = await loadRecurringMatcher(HH, [BILLS], '2026-12', new Date(2026, 10, 29));
+    expect(m.take(BILLS, 'Energia')).toBeUndefined();
+  });
 });

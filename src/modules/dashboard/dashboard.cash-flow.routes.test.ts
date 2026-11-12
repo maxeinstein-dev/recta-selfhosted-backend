@@ -107,6 +107,24 @@ describe('GET /dashboard/cash-flow', () => {
     expect(body.data.unassignedInvoices).toEqual([]);
   });
 
+  it('keeps the early-payment discount data of a recurrence event, and leaves the other events as they are', async () => {
+    const earlyDiscount = { limitDate: '2026-11-18', fullAmount: 200, discountedAmount: 175, savings: 25, recurringId: 'rec-1', occurrenceDate: '2026-11-20', canPayNow: true };
+    m.load.mockResolvedValue({
+      currency: 'BRL',
+      ...buildCashFlow({
+        startingBalanceCents: 100000,
+        today: '2026-11-10',
+        days: 30,
+        events: [{ date: '2026-11-20', description: 'Bill', amountCents: -17500, source: 'recurrence', certainty: 'expected', sourceId: 'rec-1', accountId: ACC, earlyDiscount }],
+      }),
+    } as never);
+    const body = (await get(`?householdId=${HH}`)).json();
+    expect(body.data.days[0].events[0]).toMatchObject({ amount: -175, earlyDiscount });
+    m.load.mockResolvedValue(sample() as never);
+    const plain = (await get(`?householdId=${HH}`)).json();
+    expect(plain.data.days[0].events[0]).not.toHaveProperty('earlyDiscount');
+  });
+
   it('passes the account and the days through', async () => {
     await get(`?householdId=${HH}&accountId=${ACC}&days=30`);
     expect(m.load).toHaveBeenCalledWith({ householdId: HH, accountId: ACC, days: 30 });

@@ -110,7 +110,7 @@ function setup(s: Setup = {}) {
   }));
 }
 
-const run = (over: { accountId?: string; days?: number } = {}) => loadCashFlow({ householdId: HH, days: over.days ?? 90, today: TODAY, accountId: over.accountId });
+const run = (over: { accountId?: string; days?: number; today?: Date } = {}) => loadCashFlow({ householdId: HH, days: over.days ?? 90, today: over.today ?? TODAY, accountId: over.accountId });
 const flat = (out: Awaited<ReturnType<typeof run>>) => out.days.flatMap((d) => d.events);
 
 beforeEach(() => {
@@ -370,6 +370,82 @@ describe('loadCashFlow: recurrences', () => {
   it('a weekly recurrence is dated by its own steps', async () => {
     setup({ recurrences: [recurrence({ categoryName: 'HOUSING', frequency: 'WEEKLY', amount: dec(10), startDate: utc('2026-11-12'), nextRunAt: utc('2026-11-12') })] });
     expect(flat(await run({ days: 20 })).map((e) => e.date)).toEqual(['2026-11-12', '2026-11-19', '2026-11-26']);
+  });
+});
+
+describe('loadCashFlow: early-payment discount', () => {
+  // A monthly expense of 200 due on the 20th; paid up to the 18th it costs 25 less. Invented values.
+  const bill = (over: Record<string, unknown> = {}) =>
+    recurrence({
+      id: 'bill', categoryName: 'HOUSING', amount: dec(200), description: 'Bill', nextRunAt: utc('2026-11-20'), startDate: utc('2026-01-20'),
+      earlyDiscountDay: 18, earlyDiscountType: 'FIXED', earlyDiscountValue: dec(25), ...over,
+    });
+  const billEvents = (out: Awaited<ReturnType<typeof run>>) => flat(out).filter((e) => e.sourceId === 'bill');
+
+  it('until the limit day the event carries the discounted amount, and the data the screens need', async () => {
+    setup({ recurrences: [bill()] });
+    const [event] = billEvents(await run({ days: 20 }));
+    expect(event).toMatchObject({ date: '2026-11-20', amount: -175, certainty: 'expected' });
+    expect(event!.earlyDiscount).toEqual({ limitDate: '2026-11-18', fullAmount: 200, discountedAmount: 175, savings: 25, recurringId: 'bill', occurrenceDate: '2026-11-20', canPayNow: true });
+  });
+
+  it('the limit day itself still counts the discount; the day after it, the full amount and no warning', async () => {
+    setup({ recurrences: [bill()] });
+    const onLimit = billEvents(await run({ days: 20, today: utc('2026-11-18') }));
+    expect(onLimit[0]).toMatchObject({ amount: -175 });
+    expect(onLimit[0]!.earlyDiscount).toBeDefined();
+    const after = billEvents(await run({ days: 20, today: utc('2026-11-19') }));
+    expect(after[0]).toMatchObject({ amount: -200 });
+    expect(after[0]).not.toHaveProperty('earlyDiscount');
+  });
+
+  it('each month has its own limit: a future month keeps the discount while an overdue one is the full amount', async () => {
+    setup({ recurrences: [bill({ nextRunAt: utc('2026-10-20') })] });
+    const events = billEvents(await run({ days: 60 }));
+    // 20/10 is stale (counts today, overdue): the limit of its month passed. 20/11 and 20/12 are still ahead.
+    expect(events.map((e) => [e.date, e.amount, e.earlyDiscount?.limitDate ?? null])).toEqual([
+      ['2026-11-10', -200, null],
+      ['2026-11-20', -175, '2026-11-18'],
+      ['2026-12-20', -175, '2026-12-18'],
+    ]);
+  });
+
+  it('only the next occurrence of the recurrence (nextRunAt) can be paid now through pay-next; later months say so', async () => {
+    setup({ recurrences: [bill()] });
+    const events = billEvents(await run({ days: 60 }));
+    expect(events.map((e) => [e.date, e.earlyDiscount?.recurringId, e.earlyDiscount?.occurrenceDate, e.earlyDiscount?.canPayNow])).toEqual([
+      ['2026-11-20', 'bill', '2026-11-20', true],
+      ['2026-12-20', 'bill', '2026-12-20', false],
+    ]);
+  });
+
+  it('limit day 31 in a short month is its last day', async () => {
+    setup({ recurrences: [bill({ nextRunAt: utc('2027-02-20'), earlyDiscountDay: 31 })] });
+    const [event] = billEvents(await run({ days: 120 }));
+    expect(event!.earlyDiscount!.limitDate).toBe('2027-02-28');
+  });
+
+  it('a percentage is rounded up to the cent', async () => {
+    setup({ recurrences: [bill({ amount: dec(123.45), earlyDiscountType: 'PERCENT', earlyDiscountValue: dec(8) })] });
+    const [event] = billEvents(await run({ days: 20 }));
+    expect(event).toMatchObject({ amount: -113.58 });
+    expect(event!.earlyDiscount).toMatchObject({ fullAmount: 123.45, discountedAmount: 113.58, savings: 9.87 });
+  });
+
+  it('the discount comes off the amount the strategy gives (here a followed last amount, still estimated)', async () => {
+    setup({ recurrences: [bill({ followLastAmount: true, amount: dec(240) })] });
+    const [event] = billEvents(await run({ days: 20 }));
+    expect(event).toMatchObject({ amount: -215, certainty: 'estimated' });
+  });
+
+  it('a recurrence without discount is exactly as before: no earlyDiscount key at all', async () => {
+    setup({ recurrences: [bill({ earlyDiscountDay: null, earlyDiscountType: null, earlyDiscountValue: null }), recurrence({ id: 'old', categoryName: 'HOUSING' })] });
+    const events = flat(await run({ days: 20 }));
+    expect(events).toHaveLength(2);
+    for (const e of events) {
+      expect(e).not.toHaveProperty('earlyDiscount');
+      expect(e.amount).toBe(e.sourceId === 'bill' ? -200 : -3000);
+    }
   });
 });
 

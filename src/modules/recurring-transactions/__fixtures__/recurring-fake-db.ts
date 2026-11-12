@@ -21,7 +21,8 @@ const SPECS: Record<string, { unique: string[][]; defaults: () => Record<string,
   recurringTransaction: {
     unique: [],
     defaults: () => ({ description: null, endDate: null, lastRunDate: null, isActive: true, followLastAmount: false, frequency: 'MONTHLY', competenceOffsetMonths: null,
-      forecastStrategy: 'LAST', forecastWindow: null, dailyRate: null, safetyBusinessDays: 0, nonWorkingDays: [], optionalHolidays: [], aliases: [] }),
+      forecastStrategy: 'LAST', forecastWindow: null, dailyRate: null, safetyBusinessDays: 0, nonWorkingDays: [], optionalHolidays: [], aliases: [],
+      earlyDiscountDay: null, earlyDiscountType: null, earlyDiscountValue: null }),
   },
   account: { unique: [], defaults: () => ({ balance: 0, isActive: true, type: 'CHECKING', name: 'Conta' }) },
   category: { unique: [], defaults: () => ({}) },
@@ -43,13 +44,17 @@ function prismaError(code: string, message: string): Error {
 
 function toStored(field: string, value: unknown): unknown {
   if (value instanceof Date) return dayString(value);
-  if ((field === 'amount' || field === 'dailyRate') && value !== null && typeof value === 'object') return Number(String(value));
+  if ((field === 'amount' || field === 'dailyRate' || field === 'earlyDiscountValue') && value !== null && typeof value === 'object') return Number(String(value));
   return value;
 }
 
 function matches(row: Row, where: Where | undefined): boolean {
   if (!where) return true;
   for (const [key, condition] of Object.entries(where)) {
+    if (key === 'OR') {
+      if (!(condition as Where[]).some((branch) => matches(row, branch))) return false;
+      continue;
+    }
     const value = row[key];
     if (condition === null) {
       if (value !== null && value !== undefined) return false;
@@ -77,6 +82,7 @@ function project(row: Row, select?: Record<string, boolean>): Record<string, unk
   const full: Record<string, unknown> = { ...row };
   if (typeof row.amount === 'number') full.amount = decimal(row.amount);
   if (typeof row.dailyRate === 'number') full.dailyRate = decimal(row.dailyRate);
+  if (typeof row.earlyDiscountValue === 'number') full.earlyDiscountValue = decimal(row.earlyDiscountValue);
   for (const f of ['date', 'startDate', 'nextRunAt', 'endDate', 'lastRunDate']) {
     if (typeof row[f] === 'string') full[f] = new Date(`${row[f]}T00:00:00.000Z`);
   }
@@ -332,6 +338,9 @@ export interface SeedRecurrence {
   nonWorkingDays?: string[];
   optionalHolidays?: string[];
   aliases?: string[];
+  earlyDiscountDay?: number | null;
+  earlyDiscountType?: 'FIXED' | 'PERCENT' | null;
+  earlyDiscountValue?: number | null;
 }
 
 export function seedRecurrence(data: SeedRecurrence): Row {

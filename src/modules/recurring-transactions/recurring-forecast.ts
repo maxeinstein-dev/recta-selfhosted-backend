@@ -7,6 +7,9 @@ import { addMonths, monthOfDate } from '../../shared/utils/competence.js';
 import { conservativeWindowOf, explainExpectedAmount, normalizeStrategy } from './expected-amount.js';
 import type { ConfirmedOccurrence, ExpectedAmountDetail, ExpectedAmountRecurrence, ForecastStrategy } from './expected-amount.js';
 import { dayString } from './recurring-dates.js';
+import { plusDays } from './recurring-follow.js';
+import { earlyDiscountOf, earlyDiscountQuote, validateEarlyDiscount } from './early-discount.js';
+import type { EarlyDiscount, EarlyDiscountQuote } from './early-discount.js';
 
 /** The columns of a recurrence row that decide its forecast. */
 export interface ForecastRow {
@@ -19,6 +22,9 @@ export interface ForecastRow {
   nonWorkingDays?: string[] | null;
   optionalHolidays?: string[] | null;
   competenceOffsetMonths?: number | null;
+  earlyDiscountDay?: number | null;
+  earlyDiscountType?: string | null;
+  earlyDiscountValue?: { toNumber(): number } | null;
 }
 
 /** Input of `expectedAmountFor` for a stored recurrence of the given kind. */
@@ -34,6 +40,19 @@ export function forecastInputOf(row: ForecastRow, isIncome: boolean): ExpectedAm
     nonWorkingDays: row.nonWorkingDays ?? [],
     optionalHolidays: row.optionalHolidays ?? [],
   };
+}
+
+/** 'YYYY-MM-DD' of the local calendar day of `now` (the day the cron and the user live in). */
+export function localTodayString(now: Date = new Date()): string {
+  return plusDays(now, 0);
+}
+
+/**
+ * The early-payment discount of an occurrence while it can still be had, for the screens: the limit date, the full
+ * amount, the discounted one and the saving. null for a recurrence without discount, or once the limit passed.
+ */
+export function earlyDiscountQuoteOf(row: ForecastRow, fullAmount: number, occurrenceDate: string, today: string): EarlyDiscountQuote | null {
+  return earlyDiscountQuote(fullAmount, earlyDiscountOf(row), occurrenceDate, today);
 }
 
 /** The month an occurrence dated `date` counts for: its date month moved by the recurrence offset. */
@@ -130,6 +149,15 @@ export async function forecastBatch(
     history,
     expected: (row, referenceMonth) => ({ ...explainExpectedAmount(forecastInputOf(row, isIncome(row)), history(row), referenceMonth), referenceMonth }),
   };
+}
+
+/** The discount rule across fields, on the merged recurrence: all three columns or none, and coherent with the amount. */
+export function assertEarlyDiscountConsistent(merged: { amount: number; day: number | null; type: EarlyDiscount['type'] | null; value: number | null }): void {
+  const given = [merged.day, merged.type, merged.value].filter((v) => v !== null).length;
+  if (given === 0) return;
+  if (given !== 3) throw new BadRequestError('The discount day, type and value must be set together (or all cleared)');
+  const problem = validateEarlyDiscount({ day: merged.day!, type: merged.type!, value: merged.value!, amount: merged.amount });
+  if (problem) throw new BadRequestError(problem);
 }
 
 /** The strategy rules that span fields: refuses a recurrence that could not compute its amount. */

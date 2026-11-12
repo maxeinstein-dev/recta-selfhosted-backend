@@ -1,5 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { dayString } from './recurring-dates.js';
+import { earlyDiscountOf, earlyDiscountQuote } from './early-discount.js';
 
 /** How far ahead an occurrence still counts as "the current one" (days). */
 export const FOLLOW_LOOKAHEAD_DAYS = 31;
@@ -46,9 +47,21 @@ export async function followLastAmountInTx(
   const recurrence = await tx.recurringTransaction.findFirst({
     // Only the LAST strategy follows the last confirmed value (FIXED / CONSERVATIVE / PER_BUSINESS_DAY never adopt it)
     where: { id: recurringId, householdId: before.householdId, isActive: true, followLastAmount: true, forecastStrategy: 'LAST' },
-    select: { id: true, amount: true },
+    select: { id: true, amount: true, earlyDiscountDay: true, earlyDiscountType: true, earlyDiscountValue: true },
   });
   if (!recurrence || Math.abs(recurrence.amount.toNumber() - newAmount) < 0.005) return null;
+
+  // A payment with the early-payment discount is the full amount minus the discount, not a new price: the recurrence keeps
+  // its full amount. The value is compared with the discounted amount of the month of the edited occurrence (the full
+  // amount is the recurrence's, and the discount is a separate rule).
+  const discount = earlyDiscountOf(recurrence);
+  if (discount) {
+    const full = recurrence.amount.toNumber();
+    const occurrenceDay = dayString(update.date ?? before.date);
+    // `today` = the day of the occurrence's own limit, so the quote exists whatever the real day is
+    const quote = earlyDiscountQuote(full, discount, occurrenceDay, occurrenceDay.slice(0, 8) + '01');
+    if (quote && Math.abs(quote.discountedAmount - newAmount) < 0.005) return null;
+  }
 
   const limit = plusDays(now, FOLLOW_LOOKAHEAD_DAYS);
   const editedDay = dayString(update.date ?? before.date);

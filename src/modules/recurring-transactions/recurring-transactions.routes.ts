@@ -9,6 +9,7 @@ import {
   createRecurringTransactionSchema,
   updateRecurringTransactionSchema,
   executeRecurringTransactionSchema,
+  payNextOccurrenceSchema,
   recurringTransactionIdParamSchema,
   listRecurringTransactionsQuerySchema,
   detectRecurringSchema,
@@ -415,6 +416,46 @@ export async function recurringTransactionRoutes(app: FastifyInstance) {
         success: true,
         data: result,
       });
+    }
+  );
+
+  /**
+   * POST /recurring-transactions/:recurringId/pay-next
+   * Pay the next not-yet-generated occurrence now, ahead of the due date (EDITOR+). The body is optional.
+   */
+  app.post<{ Params: { recurringId: string } }>(
+    '/:recurringId/pay-next',
+    {
+      schema: {
+        description:
+          'Create now the next occurrence of the recurrence (the one of nextRunAt), already paid, and advance the recurrence. Amount defaults to the one the early-payment discount rule gives for today; date to today; account to the recurrence account (EDITOR+)',
+        tags: ['Recurring Transactions'],
+        security: [{ bearerAuth: [] }],
+        params: {
+          type: 'object',
+          required: ['recurringId'],
+          properties: { recurringId: { type: 'string', format: 'uuid' } },
+        },
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: { type: 'object', additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { recurringId } = recurringTransactionIdParamSchema.parse(request.params);
+      const input = payNextOccurrenceSchema.parse(request.body ?? {});
+
+      const existing = await recurringTransactionsService.getRecurringTransaction(recurringId);
+      await requireEditor(request, existing.householdId);
+
+      const result = await recurringTransactionsService.payNextOccurrence(recurringId, existing.householdId, input);
+      return reply.send({ success: true, data: result });
     }
   );
 }
