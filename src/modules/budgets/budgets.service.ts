@@ -1,5 +1,7 @@
 import { monthOrRangeWhere } from '../../shared/utils/competence.js';
 import { budgetSpendingWhere, measureOf, measuredAmount, ownSpentOf, sumSpending } from './budget-spending.js';
+import { pickEffectiveBudgets } from './budget-effective.js';
+import { monthOfDate } from '../../shared/utils/competence.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
@@ -160,6 +162,19 @@ export async function updateBudget(budgetId: string, input: UpdateBudgetInput) {
     updateData.month = budgetMonthStart(input.month);
   }
 
+  // End month: the last month in force; never before the budget's own first month
+  if (input.endMonth !== undefined) {
+    updateData.endMonth = input.endMonth ? budgetMonthStart(input.endMonth) : null;
+    if (updateData.endMonth) {
+      const current = await prisma.budget.findUnique({ where: { id: budgetId }, select: { month: true } });
+      if (!current) throw new NotFoundError('Budget');
+      const first: Date = updateData.month ?? current.month;
+      if (monthOfDate(updateData.endMonth) < monthOfDate(first)) {
+        throw new BadRequestError('The end month cannot be before the first month of the budget');
+      }
+    }
+  }
+
   const budget = await prisma.budget.update({
     where: { id: budgetId },
     data: updateData,
@@ -200,10 +215,11 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
   // A month means the planning month (reference month when set, else the month of the date); a range stays by date.
   const periodWhere = monthOrRangeWhere({ month, startDate, endDate });
 
-  // Get all budgets for the household
-  const budgets = await prisma.budget.findMany({
+  // The budgets of the household; for a month, only the ones in force in it (a budget repeats from its month on)
+  const allBudgets = await prisma.budget.findMany({
     where: { householdId },
   });
+  const budgets = month ? pickEffectiveBudgets(allBudgets, month) : allBudgets;
 
   // Resolve colors for custom categories (batch)
   const customIds = budgets
@@ -228,7 +244,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
 
   // Get spending for each budget category
   const budgetSummaries = await Promise.all(
-    budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; type: string; measure?: string | null; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
+    budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; endMonth?: Date | null; type: string; measure?: string | null; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
       // One definition of what counts, shared with the budget alerts (see budget-spending.ts)
       const transactions = await prisma.transaction.findMany({
         where: budgetSpendingWhere({ householdId, categoryName: budget.categoryName, type: budget.type }, periodWhere),
@@ -250,6 +266,9 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
         categoryName: budget.categoryName,
         categoryColor: categoryColor(budget.categoryName),
         monthlyLimit: limit,
+        // First month in force and last one (null = no end): the budget repeats in between
+        month: monthOfDate(budget.month),
+        endMonth: budget.endMonth ? monthOfDate(budget.endMonth) : null,
         measure: measureOf(budget),
         spending,
         ownSpent,

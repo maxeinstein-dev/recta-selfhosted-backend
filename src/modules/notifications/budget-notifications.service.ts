@@ -3,6 +3,7 @@ import { NotificationType } from './notifications.schema.js';
 import { createNotification } from './notifications.service.js';
 import { monthOfDate, monthOrRangeWhere } from '../../shared/utils/competence.js';
 import { budgetSpendingWhere, measureOf, measuredAmount, ownSpentOf, sumSpending } from '../budgets/budget-spending.js';
+import { pickEffectiveBudgets } from '../budgets/budget-effective.js';
 import { loadTheirShares } from '../people/own-share.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { CategoryName, CATEGORY_NAME_DISPLAY, GENERAL_BUDGET_CATEGORY } from '../../shared/enums/index.js';
@@ -48,8 +49,15 @@ export async function checkBudgetThresholds(
   // A budget month is stored as the first day, a UTC-midnight date like every @db.Date value
   const budgetMonthStart = new Date(Date.UTC(Number(budgetMonth.slice(0, 4)), Number(budgetMonth.slice(5, 7)) - 1, 1));
 
-  const findBudget = (name: string) =>
-    prisma.budget.findFirst({ where: { householdId, categoryName: name, month: budgetMonthStart, type: 'EXPENSE' } });
+  // The budget in force in the month (it repeats from its own month on): the newest one not after the month, unless it
+  // ended before it. Same rule as the summary (see budget-effective.ts).
+  const findBudget = async (name: string) => {
+    const newest = await prisma.budget.findFirst({
+      where: { householdId, categoryName: name, type: 'EXPENSE', month: { lte: budgetMonthStart } },
+      orderBy: { month: 'desc' },
+    });
+    return newest ? (pickEffectiveBudgets([newest], budgetMonth)[0] ?? null) : null;
+  };
   const categoryBudget = await findBudget(categoryName);
   const generalBudget = categoryName === GENERAL_BUDGET_CATEGORY ? null : await findBudget(GENERAL_BUDGET_CATEGORY);
   const budgets = [categoryBudget, generalBudget].filter((b): b is NonNullable<typeof b> => b !== null) as BudgetRow[];
