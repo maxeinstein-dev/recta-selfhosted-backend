@@ -100,6 +100,7 @@ const { deviceRoutes } = await import('../devices/index.js');
 const { captureRoutes, capturesRateLimit } = await import('./index.js');
 const { generateDeviceToken, hashDeviceToken } = await import('../devices/index.js');
 const { computeDedupKey } = await import('./captures.service.js');
+const { PARSER_VERSION } = await import('./parsers/index.js');
 const { errorHandler } = await import('../../shared/errors/error-handler.js');
 const { signJwt } = await import('../auth/local.service.js');
 const { authRoutes } = await import('../auth/index.js');
@@ -439,6 +440,40 @@ describe('POST /captures storage and dedup', () => {
     const res = await post(shared, { items: [item()] });
     expect(res.json().data.results[0].status).toBe('created');
     expect(store.captures.map((c) => c.householdId).sort()).toEqual([PERSONAL_ID, SHARED_ID].sort());
+  });
+});
+
+describe('POST /captures reads the notification', () => {
+  const NU = 'com.nu.production';
+  const purchase = { package: NU, title: 'Compra no crédito aprovada', text: 'Compra de R$ 37,50 APROVADA em PADARIA ZETA para o cartão com final 1234.' };
+
+  it('stores what the parser understood, with the parser version, and keeps the capture PENDING', async () => {
+    const token = await newToken();
+    const res = await post(token, { items: [item(purchase)] });
+
+    expect(res.statusCode).toBe(200);
+    expect(store.captures[0]).toMatchObject({
+      status: 'PENDING',
+      parserVersion: PARSER_VERSION,
+      parsed: { kind: 'CARD_PURCHASE', type: 'EXPENSE', amount: 37.5, description: 'PADARIA ZETA' },
+    });
+  });
+
+  it('stores an ignorable notice (known informative) as IGNORED', async () => {
+    const token = await newToken();
+    await post(token, { items: [item({ package: NU, title: 'Seu novo limite está valendo', text: 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.' })] });
+
+    expect(store.captures[0]).toMatchObject({ status: 'IGNORED', parserVersion: PARSER_VERSION, parsed: { kind: 'IGNORE', ignore: true } });
+  });
+
+  it('answers 200 and keeps the capture PENDING without parsed when the text is not understood', async () => {
+    const token = await newToken();
+    const res = await post(token, { items: [item({ package: NU, title: 'Promoção', text: 'Ganhe um cupom agora.' })] });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.results[0].status).toBe('created');
+    expect(store.captures[0]).toMatchObject({ status: 'PENDING' });
+    expect(store.captures[0]!.parsed).toBeUndefined();
   });
 });
 

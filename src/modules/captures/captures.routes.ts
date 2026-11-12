@@ -188,6 +188,21 @@ export async function captureRoutes(app: FastifyInstance) {
     });
   });
 
+  /** POST /captures/reparse : read the PENDING drafts again with the current parser (EDITOR+). */
+  app.post('/reparse', {
+    ...jwt,
+    schema: {
+      ...jwtRoute,
+      description: 'Re-read the PENDING captures of the household with the current parser version (EDITOR+). Known informative notices become IGNORED; no transaction is created.',
+      response: { 200: objectResponse },
+    },
+  }, async (request, reply) => {
+    const query = captureActionQuerySchema.parse(request.query);
+    const householdId = await resolveHousehold(request, query.householdId);
+    await requireEditor(request, householdId);
+    return reply.send({ success: true, data: await capturesService.reparseCaptures(householdId) });
+  });
+
   /** POST /captures/:id/dismiss : PENDING -> DISMISSED (idempotent). */
   app.post('/:id/dismiss', {
     ...jwt,

@@ -140,6 +140,7 @@ vi.mock('../transactions/transactions.service.js', () => ({
 }));
 
 const { captureRoutes, buildSuggestion } = await import('./index.js');
+const { PARSER_VERSION } = await import('./parsers/index.js');
 const { generateDeviceToken } = await import('../devices/index.js');
 const { errorHandler } = await import('../../shared/errors/error-handler.js');
 const { signJwt } = await import('../auth/local.service.js');
@@ -573,5 +574,89 @@ describe('account rules', () => {
     const { prisma } = await import('../../shared/db/prisma.js');
     await put({ rules: [rule()] });
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('buildSuggestion with a parsed notification', () => {
+  const postedAt = new Date('2026-11-09T14:03:21.000Z');
+  const rules = [{ package: PKG, kind: 'CARD_PURCHASE', accountId: CARD_ID }];
+  const parsed = { kind: 'CARD_PURCHASE', type: 'EXPENSE', amount: 37.5, description: 'PADARIA ZETA' };
+
+  it('fills type, amount, description and the account of the rule; the category stays null', () => {
+    expect(buildSuggestion({ package: PKG, postedAt, parsed }, rules)).toEqual({
+      type: 'EXPENSE', accountId: CARD_ID, categoryName: null, amount: 37.5, description: 'PADARIA ZETA', date: '2026-11-09T14:03:21.000Z',
+    });
+  });
+
+  it('suggests income for a refund', () => {
+    expect(buildSuggestion({ package: PKG, postedAt, parsed: { kind: 'REFUND', type: 'INCOME', amount: 12.34, description: 'Estorno: X' } }, rules)).toMatchObject({
+      type: 'INCOME', amount: 12.34, description: 'Estorno: X', accountId: null,
+    });
+  });
+
+  it('ignores parsed fields of the wrong shape', () => {
+    expect(buildSuggestion({ package: PKG, postedAt, parsed: { kind: 'PIX_IN', type: 'SIDEWAYS', amount: '5', description: 7 } }, rules)).toMatchObject({
+      type: null, amount: null, description: null,
+    });
+    expect(buildSuggestion({ package: PKG, postedAt, parsed: { kind: 'PIX_IN', type: 'INCOME', amount: -1, description: '' } }, rules)).toMatchObject({
+      type: 'INCOME', amount: null, description: null,
+    });
+  });
+});
+
+// The in-memory stand-in stores Prisma's DbNull sentinel as is; for the database it means SQL NULL.
+const isNullJson = (value: unknown) => value == null || (value as object).constructor?.name === 'DbNull';
+
+describe('POST /captures/reparse', () => {
+  const NU = 'com.nu.production';
+  const purchaseText = 'Compra de R$ 37,50 APROVADA em PADARIA ZETA para o cartão com final 1234.';
+
+  it('reads the PENDING captures of the household with the current parser and stores the result', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText });
+    addCapture(2, { package: NU, title: 'Estorno', text: 'A compra em PADARIA ZETA no valor de R$ 37,50 foi estornada.' });
+    addCapture(3, { package: NU, title: 'Promoção', text: 'Ganhe um cupom agora.' });
+    addCapture(4, { package: NU, title: 'Seu novo limite está valendo', text: 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.' });
+
+    const res = await postTo('/captures/reparse');
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data).toEqual({ scanned: 4, understood: 2, ignored: 1, notUnderstood: 1, parserVersion: PARSER_VERSION });
+    const byId = Object.fromEntries(store.captures.map((c) => [c.id, c]));
+    expect(byId[capId(1)]).toMatchObject({ status: 'PENDING', parserVersion: PARSER_VERSION, parsed: { kind: 'CARD_PURCHASE', amount: 37.5 } });
+    expect(byId[capId(2)]).toMatchObject({ status: 'PENDING', parsed: { kind: 'REFUND', type: 'INCOME' } });
+    expect(byId[capId(3)]!.status).toBe('PENDING');
+    expect(isNullJson(byId[capId(3)]!.parsed)).toBe(true);
+    expect(byId[capId(4)]).toMatchObject({ status: 'IGNORED', parsed: { kind: 'IGNORE' } });
+  });
+
+  it('replaces an older reading when the rule changed and clears one that is no longer understood', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, parsed: { kind: 'CARD_PURCHASE', amount: 1 }, parserVersion: 0 });
+    addCapture(2, { package: NU, title: 'x', text: 'texto que nenhum parser entende', parsed: { kind: 'PIX_IN', amount: 9 }, parserVersion: 0 });
+
+    await postTo('/captures/reparse');
+
+    expect(store.captures[0]).toMatchObject({ parsed: { amount: 37.5 }, parserVersion: PARSER_VERSION });
+    expect(isNullJson(store.captures[1]!.parsed)).toBe(true);
+    expect(store.captures[1]!.parserVersion).toBe(PARSER_VERSION);
+  });
+
+  it('touches only PENDING captures of the caller household', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'CONFIRMED' });
+    addCapture(2, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'DISMISSED' });
+    addCapture(3, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, householdId: OTHER_HOUSEHOLD_ID });
+
+    const res = await postTo('/captures/reparse');
+
+    expect(res.json().data.scanned).toBe(0);
+    expect(store.captures.every((c) => c.parsed === null)).toBe(true);
+    expect(store.captures.map((c) => c.status)).toEqual(['CONFIRMED', 'DISMISSED', 'PENDING']);
+  });
+
+  it('needs an EDITOR login: a VIEWER gets 403, a device token or nothing gets 401', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText });
+    expect((await postTo('/captures/reparse', undefined, as(VIEWER_ID))).statusCode).toBe(403);
+    expect((await postTo('/captures/reparse', undefined, { authorization: `Bearer ${generateDeviceToken()}` })).statusCode).toBe(401);
+    expect((await postTo('/captures/reparse', undefined, {} as never)).statusCode).toBe(401);
+    expect(store.captures[0]!.parsed).toBeNull();
   });
 });

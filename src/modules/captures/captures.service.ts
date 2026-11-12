@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import type { Prisma } from '../../generated/prisma/client.js';
+import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { ConflictError, NotFoundError } from '../../shared/errors/index.js';
 import { buildPaginationArgs, createPaginatedResponse } from '../../shared/utils/pagination.js';
 import { createTransaction, getTransactionWithHousehold } from '../transactions/transactions.service.js';
 import type { CreateTransactionInput } from '../transactions/transactions.schema.js';
 import { buildSuggestion, type SuggestionRule } from './capture-suggestion.js';
+import { PARSER_VERSION, parseCapture } from './parsers/index.js';
 import type { AccountRuleInput, CaptureItemInput, CaptureStatusValue, ConfirmCaptureInput } from './captures.schema.js';
 
 export interface CaptureResult {
@@ -49,16 +50,21 @@ export async function ingestCaptures(
   }
 
   const inserted = await prisma.capturedNotification.createManyAndReturn({
-    data: [...firstByKey.values()].map(({ item, postedAt, dedupKey }) => ({
-      householdId: scope.householdId,
-      userId: scope.userId,
-      package: item.package,
-      title: item.title ?? null,
-      text: item.text,
-      postedAt,
-      dedupKey,
-      status: 'PENDING' as const,
-    })),
+    data: [...firstByKey.values()].map(({ item, postedAt, dedupKey }) => {
+      // The raw text is stored either way; a reading only adds `parsed` (and IGNORED for a known informative notice).
+      const parsed = parseCapture({ package: item.package, title: item.title ?? null, text: item.text });
+      return {
+        householdId: scope.householdId,
+        userId: scope.userId,
+        package: item.package,
+        title: item.title ?? null,
+        text: item.text,
+        postedAt,
+        dedupKey,
+        status: parsed?.ignore ? ('IGNORED' as const) : ('PENDING' as const),
+        ...(parsed ? { parsed: parsed as unknown as Prisma.InputJsonObject, parserVersion: PARSER_VERSION } : {}),
+      };
+    }),
     skipDuplicates: true,
     select: { dedupKey: true },
   });
@@ -283,4 +289,50 @@ export async function replaceAccountRules(householdId: string, rules: AccountRul
     }
   });
   return listAccountRules(householdId);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Reparse
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Upper bound of one reparse run; a personal household has a handful of pending drafts. */
+const REPARSE_LIMIT = 1000;
+
+export interface ReparseResult {
+  scanned: number;
+  understood: number;
+  ignored: number;
+  notUnderstood: number;
+  parserVersion: number;
+}
+
+/**
+ * Reads again, with the current parser, the PENDING captures of the household (after a rule changed). A capture the
+ * parser no longer understands loses its old reading; a known informative notice becomes IGNORED. Each update is
+ * conditional on the capture still being PENDING, so a draft confirmed or dismissed meanwhile is left alone.
+ * Nothing is created or deleted besides these two fields and the status.
+ */
+export async function reparseCaptures(householdId: string): Promise<ReparseResult> {
+  const rows = await prisma.capturedNotification.findMany({
+    where: { householdId, status: 'PENDING' },
+    select: { id: true, package: true, title: true, text: true },
+    orderBy: CAPTURE_ORDER,
+    take: REPARSE_LIMIT,
+  });
+  const result: ReparseResult = { scanned: rows.length, understood: 0, ignored: 0, notUnderstood: 0, parserVersion: PARSER_VERSION };
+  for (const row of rows) {
+    const parsed = parseCapture(row);
+    if (!parsed) result.notUnderstood += 1;
+    else if (parsed.ignore) result.ignored += 1;
+    else result.understood += 1;
+    await prisma.capturedNotification.updateMany({
+      where: { id: row.id, householdId, status: 'PENDING' },
+      data: {
+        parsed: parsed ? (parsed as unknown as Prisma.InputJsonObject) : Prisma.DbNull,
+        parserVersion: PARSER_VERSION,
+        ...(parsed?.ignore ? { status: 'IGNORED' as const } : {}),
+      },
+    });
+  }
+  return result;
 }
