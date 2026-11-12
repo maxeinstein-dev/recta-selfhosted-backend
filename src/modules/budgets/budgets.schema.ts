@@ -19,6 +19,10 @@ export const budgetCategoryNameSchema = z.union([
   categoryNameSchema,
 ]);
 
+/** How the budget is measured: the full spending (WHOLE) or the own share (OWN_SHARE, expense budgets only). */
+export const budgetMeasureEnum = z.enum(['WHOLE', 'OWN_SHARE']);
+const OWN_SHARE_ONLY_EXPENSE = 'Only an expense budget can be measured by the own share';
+
 /**
  * Create budget request
  */
@@ -28,7 +32,8 @@ export const createBudgetSchema = z.object({
   monthlyLimit: z.coerce.number().positive('Monthly limit must be positive'),
   month: localDateSchema,
   type: categoryTypeEnum,
-});
+  measure: budgetMeasureEnum.default('WHOLE'),
+}).refine((v) => v.measure !== 'OWN_SHARE' || v.type === CategoryType.EXPENSE, { message: OWN_SHARE_ONLY_EXPENSE, path: ['measure'] });
 
 export type CreateBudgetInput = z.infer<typeof createBudgetSchema>;
 
@@ -40,6 +45,7 @@ export const updateBudgetSchema = z.object({
   // Same parsing as on create: 'YYYY-MM-DD' is a local day (z.coerce.date read it as UTC midnight, the evening before)
   month: localDateSchema.optional(),
   type: categoryTypeEnum.optional(),
+  measure: budgetMeasureEnum.optional(),
 });
 
 export type UpdateBudgetInput = z.infer<typeof updateBudgetSchema>;

@@ -1,5 +1,5 @@
 import { monthOrRangeWhere } from '../../shared/utils/competence.js';
-import { budgetSpendingWhere, sumSpending } from './budget-spending.js';
+import { budgetSpendingWhere, measureOf, measuredAmount, ownSpentOf, sumSpending } from './budget-spending.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
@@ -34,7 +34,7 @@ export async function createBudget(input: CreateBudgetInput) {
   }
   const householdId = input.householdId;
 
-  const { categoryName, monthlyLimit, month, type } = input;
+  const { categoryName, monthlyLimit, month, type, measure } = input;
 
   // Verify category type matches budget type
   if (categoryName === GENERAL_BUDGET_CATEGORY) {
@@ -80,6 +80,7 @@ export async function createBudget(input: CreateBudgetInput) {
         monthlyLimit: new Prisma.Decimal(monthlyLimit),
         month: monthStart,
         type,
+        measure: measure ?? 'WHOLE',
       },
     });
   });
@@ -140,7 +141,19 @@ export async function updateBudget(budgetId: string, input: UpdateBudgetInput) {
       monthlyLimit: new Prisma.Decimal(input.monthlyLimit),
     }),
     ...(input.type !== undefined && { type: input.type }),
+    ...(input.measure !== undefined && { measure: input.measure }),
   };
+
+  // The own share only exists for expenses: checked against the type the budget ends up with
+  if (input.measure === 'OWN_SHARE' || input.type === 'INCOME') {
+    const current = await prisma.budget.findUnique({ where: { id: budgetId }, select: { type: true, measure: true } });
+    if (!current) throw new NotFoundError('Budget');
+    const finalType = input.type ?? current.type;
+    const finalMeasure = input.measure ?? current.measure;
+    if (finalMeasure === 'OWN_SHARE' && finalType !== 'EXPENSE') {
+      throw new BadRequestError('Only an expense budget can be measured by the own share');
+    }
+  }
 
   // Normalize month to start of month if provided
   if (input.month) {
@@ -215,7 +228,7 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
 
   // Get spending for each budget category
   const budgetSummaries = await Promise.all(
-    budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; type: string; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
+    budgets.map(async (budget: { categoryName: string; monthlyLimit: Prisma.Decimal; month: Date; type: string; measure?: string | null; id: string; householdId: string; createdAt: Date; updatedAt: Date }) => {
       // One definition of what counts, shared with the budget alerts (see budget-spending.ts)
       const transactions = await prisma.transaction.findMany({
         where: budgetSpendingWhere({ householdId, categoryName: budget.categoryName, type: budget.type }, periodWhere),
@@ -224,28 +237,26 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
       const spending = sumSpending(transactions);
 
       // Own share: the same spending without the parts other people owe back (expense budgets only)
-      const sharedCents =
-        budget.type !== 'EXPENSE'
-          ? 0
-          : theirShares
-              .filter((share) => budget.categoryName === GENERAL_BUDGET_CATEGORY || share.categoryName === budget.categoryName)
-              .reduce((sum, share) => sum + deductionCents(share), 0);
-      const ownSpent = sharedCents === 0 ? spending : Math.max(0, Math.round(spending * 100) - sharedCents) / 100;
+      const ownSpent = ownSpentOf(budget, spending, theirShares);
+      // What the limit is compared with: the own share for a budget measured separately, the spending otherwise
+      const measured = measuredAmount(budget, spending, ownSpent);
 
       const limit = budget.monthlyLimit.toNumber();
-      const remaining = limit - spending;
-      const percentage = limit > 0 ? (spending / limit) * 100 : 0;
+      const remaining = (Math.round(limit * 100) - Math.round(measured * 100)) / 100;
+      const percentage = limit > 0 ? (measured / limit) * 100 : 0;
 
       return {
         budgetId: budget.id,
         categoryName: budget.categoryName,
         categoryColor: categoryColor(budget.categoryName),
         monthlyLimit: limit,
+        measure: measureOf(budget),
         spending,
         ownSpent,
+        measured,
         remaining,
         percentage: Math.round(percentage * 100) / 100,
-        isOverBudget: spending > limit,
+        isOverBudget: measured > limit,
       };
     })
   );
