@@ -1,7 +1,8 @@
 import { prisma } from '../../shared/db/prisma.js';
 import { NotificationType } from './notifications.schema.js';
 import { createNotification } from './notifications.service.js';
-import { effectiveMonthWhere, monthOfDate } from '../../shared/utils/competence.js';
+import { monthOfDate, monthOrRangeWhere } from '../../shared/utils/competence.js';
+import { budgetSpendingWhere, sumSpending } from '../budgets/budget-spending.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { CategoryName, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
@@ -41,20 +42,13 @@ export async function checkBudgetThresholds(
     return; // No budget for this category
   }
 
-  // Calculate spending for this category in this month
+  // The spending of the budget in its month: the same definition the budget summary shows (see budget-spending.ts)
   const transactions = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      categoryName,
-      type: 'EXPENSE',
-      AND: [effectiveMonthWhere(budgetMonth)],
-    },
+    where: budgetSpendingWhere({ householdId, categoryName, type: 'EXPENSE' }, monthOrRangeWhere({ month: budgetMonth })),
     select: { amount: true },
   });
 
-  const spending = transactions.reduce((sum, t) => {
-    return sum + Math.abs(t.amount.toNumber());
-  }, 0);
+  const spending = sumSpending(transactions);
 
   const limit = budget.monthlyLimit.toNumber();
   if (limit <= 0) {
