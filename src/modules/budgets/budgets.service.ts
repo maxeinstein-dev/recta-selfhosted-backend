@@ -232,9 +232,11 @@ export async function getBudgetSummary(query: BudgetSummaryQuery) {
           return sum + Math.abs(t.amount.toNumber());
         }, 0);
       } else {
+        // Only rows of the budget type: a refund (income) or a transfer filed under the category is not spending.
         const where: Prisma.TransactionWhereInput = {
           householdId,
           categoryName: budget.categoryName,
+          type: budget.type as CategoryType,
           ...periodWhere,
         };
 

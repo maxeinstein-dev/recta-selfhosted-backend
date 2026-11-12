@@ -275,3 +275,42 @@ describe('routes', () => {
     expect(data.summary.totalExpense).toBe(100);
   });
 });
+
+// The summary is the one place where the realized amount of a budget is computed (the screens only show it).
+describe('budget summary: only rows of the budget type count', () => {
+  it('an income row filed under an expense category (a refund) does not add to the spending of the expense budget', async () => {
+    budget();
+    tx({ amount: -100 });
+    tx({ type: 'INCOME', amount: 40 });
+    const [b] = (await summary()).budgets;
+    expect(b).toMatchObject({ spending: 100, ownSpent: 100 });
+  });
+
+  it('a transfer filed under the category does not count either; an income budget only sums income', async () => {
+    budget();
+    budget({ categoryName: 'SALARY', type: 'INCOME' });
+    tx({ amount: -100 });
+    tx({ type: 'TRANSFER', amount: -70 });
+    tx({ type: 'INCOME', categoryName: 'SALARY', amount: 900 });
+    tx({ type: 'EXPENSE', categoryName: 'SALARY', amount: -15 });
+    const r = await summary();
+    expect(r.budgets.map((b) => [b.categoryName, b.spending])).toEqual([['GROCERIES', 100], ['SALARY', 900]]);
+  });
+
+  it('own share never exceeds the spending, whatever the shares are', async () => {
+    budget();
+    budget({ categoryName: 'GENERAL' });
+    const a = tx({ amount: -100 });
+    const b = tx({ amount: -20.1 });
+    tx({ type: 'INCOME', amount: 55 });
+    share(a, 30);
+    share(a, 25.55);
+    share(b, 500);
+    const r = await summary();
+    for (const line of r.budgets) {
+      expect(line.ownSpent).toBeLessThanOrEqual(line.spending);
+      expect(line.ownSpent).toBeGreaterThanOrEqual(0);
+    }
+    expect(r.budgets.map((l) => [l.spending, l.ownSpent])).toEqual([[120.1, 44.45], [120.1, 44.45]]);
+  });
+});
