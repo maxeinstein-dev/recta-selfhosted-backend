@@ -1,15 +1,18 @@
 import { CARD_LAST4_PATTERN, type CaptureKind } from './captures.schema.js';
 import type { CaptureWarning } from './parsers/types.js';
+import type { CategoryHints, CategorySource } from './capture-category.js';
 
 /**
  * What the web app pre-fills when a capture is opened as a draft. Type, amount and description come from the parser
- * (null when it did not understand the text); the category is always null for now: no rule of the household
- * defines it from a notification, and none is invented here.
+ * (null when it did not understand the text); the category comes from the household's history of the same place
+ * (capture-category.ts), or null when there is none.
  */
 export interface CaptureSuggestion {
   type: 'INCOME' | 'EXPENSE' | null;
   accountId: string | null;
   categoryName: string | null;
+  /** Where the category came from: a recurrence of the place, the latest transaction of the place, or nowhere. */
+  categorySource: CategorySource | null;
   /** Reais (the confirm body takes reais), from the integer cents of the reading. */
   amount: number | null;
   description: string | null;
@@ -65,15 +68,23 @@ function suggestedAmount(parsed: unknown): number | null {
   return typeof amount === 'number' && Number.isFinite(amount) && amount > 0 ? amount : null;
 }
 
+/** The place the parser read (`merchant`), when it read one; the category hint is keyed by it. */
+export function suggestedPlace(parsed: unknown): string | null {
+  const merchant = parsedField(parsed, 'merchant');
+  return typeof merchant === 'string' && merchant.trim().length > 0 ? merchant : null;
+}
+
 /**
  * Pure: builds the draft suggestion of one capture from its stored fields and the household's rules.
  * Account: a card-ending rule of the same app wins (one account per card, virtual cards included); else the
- * (package, kind) rule; else none. Fields of the wrong shape are dropped to null, never guessed.
+ * (package, kind) rule; else none. Category: the hint of the place the parser read (`merchant`), for the type it
+ * read; none without both. Fields of the wrong shape are dropped to null, never guessed.
  */
 export function buildSuggestion(
   capture: SuggestionInput,
   rules: readonly SuggestionRule[],
-  cardRules: readonly SuggestionCardRule[] = []
+  cardRules: readonly SuggestionCardRule[] = [],
+  hints?: CategoryHints
 ): CaptureSuggestion {
   const kind = parsedKind(capture.parsed);
   const rawLast4 = parsedField(capture.parsed, 'cardLast4');
@@ -83,10 +94,14 @@ export function buildSuggestion(
   const type = parsedField(capture.parsed, 'type');
   const description = parsedField(capture.parsed, 'description');
   const warning = parsedField(capture.parsed, 'warning');
+  const place = suggestedPlace(capture.parsed);
+  const knownType = type === 'INCOME' || type === 'EXPENSE' ? type : null;
+  const hint = hints && knownType && place ? hints.lookup(knownType, place) : null;
   return {
-    type: type === 'INCOME' || type === 'EXPENSE' ? type : null,
+    type: knownType,
     accountId: cardRule?.accountId ?? rule?.accountId ?? null,
-    categoryName: null,
+    categoryName: hint?.categoryName ?? null,
+    categorySource: hint?.source ?? null,
     amount: suggestedAmount(capture.parsed),
     description: typeof description === 'string' && description.length > 0 ? description : null,
     date: capture.postedAt.toISOString(),

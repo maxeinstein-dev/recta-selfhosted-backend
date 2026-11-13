@@ -16,6 +16,9 @@ const store = vi.hoisted(() => ({
   cardRules: [] as Row[],
   accounts: [] as Row[],
   transactions: [] as Row[],
+  history: [] as Row[], // past transactions read for the category hint
+  recurrences: [] as Row[],
+  customCategories: [] as Row[],
   members: new Map<string, string>(), // `${householdId}:${userId}` -> role
   personalHousehold: { id: '' },
   beforeCreate: null as null | (() => void),
@@ -109,7 +112,20 @@ vi.mock('../../shared/db/prisma.js', () => {
     captureAccountRule: ruleOps,
     captureCardRule: cardRuleOps,
     account: { count: vi.fn(async ({ where }: { where: Row }) => store.accounts.filter((a) => matches(a, where)).length) },
-    transaction: { findFirst: vi.fn(async ({ where }: { where: Row }) => store.transactions.find((t) => matches(t, where)) ?? null) },
+    transaction: {
+      findFirst: vi.fn(async ({ where }: { where: Row }) => store.transactions.find((t) => matches(t, where)) ?? null),
+      // Only the household and the type are honoured; the hint itself must cope with any order and any category.
+      findMany: vi.fn(async ({ where, select }: { where: { householdId: string; type: { in: string[] } }; select?: Record<string, boolean> }) =>
+        store.history.filter((t) => t.householdId === where.householdId && where.type.in.includes(t.type as string)).map((t) => pick(t, select))),
+    },
+    recurringTransaction: {
+      findMany: vi.fn(async ({ where, select }: { where: Row; select?: Record<string, boolean> }) =>
+        store.recurrences.filter((r) => matches(r, where)).map((r) => pick(r, select))),
+    },
+    category: {
+      findMany: vi.fn(async ({ where, select }: { where: Row; select?: Record<string, boolean> }) =>
+        store.customCategories.filter((c) => matches(c, where)).map((c) => pick(c, select))),
+    },
     $queryRaw: vi.fn(async () => []),
     // Interactive transactions: roll the rule table back when the callback throws.
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
@@ -202,6 +218,9 @@ beforeEach(() => {
   store.rules = [];
   store.cardRules = [];
   store.transactions = [];
+  store.history = [];
+  store.recurrences = [];
+  store.customCategories = [];
   store.members.clear();
   store.beforeCreate = null;
   store.createCalls = 0;
@@ -232,7 +251,7 @@ describe('buildSuggestion (pure)', () => {
 
   it('without parsed data only the date is filled', () => {
     expect(buildSuggestion({ package: PKG, postedAt, parsed: null }, rules)).toEqual({
-      type: null, accountId: null, categoryName: null, amount: null, description: null, date: '2026-11-09T14:03:21.000Z',
+      type: null, accountId: null, categoryName: null, categorySource: null, amount: null, description: null, date: '2026-11-09T14:03:21.000Z',
       cardLast4: null, warning: null,
     });
   });
@@ -290,7 +309,7 @@ describe('GET /captures', () => {
     addCapture(1);
     const { data } = (await get('/captures')).json();
     expect(data[0].suggestion).toEqual({
-      type: null, accountId: null, categoryName: null, amount: null, description: null, date: '2026-11-09T12:01:00.000Z',
+      type: null, accountId: null, categoryName: null, categorySource: null, amount: null, description: null, date: '2026-11-09T12:01:00.000Z',
       cardLast4: null, warning: null,
     });
   });
@@ -304,6 +323,31 @@ describe('GET /captures', () => {
     const { data } = (await get('/captures')).json();
     const byId = Object.fromEntries(data.map((c: { id: string; suggestion: { accountId: string | null } }) => [c.id, c.suggestion.accountId]));
     expect(byId).toEqual({ [capId(1)]: CARD_ID, [capId(2)]: null, [capId(3)]: null });
+  });
+
+  it('suggests the category of the latest transaction of the same place in this household, never of another one', async () => {
+    const purchase = { kind: 'CARD_PURCHASE', type: 'EXPENSE', amountCents: 1250, merchant: 'PADARIA CENTRAL', description: 'PADARIA CENTRAL' };
+    const past = (householdId: string, categoryName: string, date: string) => ({
+      householdId, type: 'EXPENSE', description: 'Padaria Central', categoryName, date: new Date(`${date}T00:00:00Z`), createdAt: new Date(`${date}T00:00:00Z`),
+    });
+    store.history.push(past(PERSONAL_ID, 'FOOD', '2026-10-01'), past(PERSONAL_ID, 'GROCERIES', '2026-11-01'), past(OTHER_HOUSEHOLD_ID, 'RESTAURANT', '2026-11-12'));
+    store.recurrences.push({ householdId: OTHER_HOUSEHOLD_ID, isActive: true, description: 'Padaria Central', aliases: [], categoryName: 'HEALTHCARE' });
+    addCapture(1, { parsed: purchase });
+    addCapture(2, { parsed: { ...purchase, merchant: 'Loja Nova', description: 'Loja Nova' } });
+
+    const { data } = (await get('/captures')).json();
+    const byId = Object.fromEntries(data.map((c: { id: string; suggestion: Row }) => [c.id, [c.suggestion.categoryName, c.suggestion.categorySource]]));
+    expect(byId).toEqual({ [capId(1)]: ['GROCERIES', 'history'], [capId(2)]: [null, null] });
+  });
+
+  it('reads no history when no capture of the page names a place', async () => {
+    addCapture(1, { parsed: { kind: 'PIX_IN', type: 'INCOME', amountCents: 500, description: 'Transferência recebida' } });
+    addCapture(2);
+    const prisma = prismaMock.current as { transaction: { findMany: ReturnType<typeof vi.fn> }; recurringTransaction: { findMany: ReturnType<typeof vi.fn> } };
+
+    expect((await get('/captures')).statusCode).toBe(200);
+    expect(prisma.transaction.findMany).not.toHaveBeenCalled();
+    expect(prisma.recurringTransaction.findMany).not.toHaveBeenCalled();
   });
 
   it('filters by status', async () => {
@@ -608,9 +652,9 @@ describe('buildSuggestion with a parsed notification', () => {
   const rules = [{ package: PKG, kind: 'CARD_PURCHASE', accountId: CARD_ID }];
   const parsed = { kind: 'CARD_PURCHASE', type: 'EXPENSE', amount: 37.5, description: 'PADARIA ZETA' };
 
-  it('fills type, amount, description and the account of the rule; the category stays null', () => {
+  it('fills type, amount, description and the account of the rule; the category stays null without hints', () => {
     expect(buildSuggestion({ package: PKG, postedAt, parsed }, rules)).toEqual({
-      type: 'EXPENSE', accountId: CARD_ID, categoryName: null, amount: 37.5, description: 'PADARIA ZETA', date: '2026-11-09T14:03:21.000Z',
+      type: 'EXPENSE', accountId: CARD_ID, categoryName: null, categorySource: null, amount: 37.5, description: 'PADARIA ZETA', date: '2026-11-09T14:03:21.000Z',
       cardLast4: null, warning: null,
     });
   });
