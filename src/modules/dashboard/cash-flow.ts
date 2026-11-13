@@ -16,8 +16,12 @@ export interface CashFlowEarlyDiscount extends EarlyDiscountQuote {
   canPayNow: boolean;
 }
 
-/** 'payroll': 13th, vacation and FGTS birthday withdrawal forecast by an employment (never a recorded entry). */
-export type CashFlowSource = 'pending' | 'recurrence' | 'payroll' | 'invoice';
+/**
+ * 'payroll': 13th, vacation and FGTS birthday withdrawal forecast by an employment (never a recorded entry).
+ * 'reserve': the planned contribution of a savings goal not yet made this month (sourceId = the goal). It leaves the FREE
+ * balance (see `allocated`); it never leaves the account.
+ */
+export type CashFlowSource = 'pending' | 'recurrence' | 'payroll' | 'invoice' | 'reserve';
 export type CashFlowCertainty = 'confirmed' | 'expected' | 'estimated';
 
 /** An event as the loader hands it over: dates are 'YYYY-MM-DD', the amount is signed whole cents (income +, outflow -). */
@@ -50,7 +54,10 @@ export interface UnassignedInvoiceInput {
 }
 
 export interface CashFlowInput {
+  /** The FREE balance: what the accounts hold minus what the savings goals keep in them (`allocatedCents`). */
   startingBalanceCents: number;
+  /** What the savings goals of these accounts keep; only reported (the balance above already excludes it). Default 0. */
+  allocatedCents?: number;
   /** 'YYYY-MM-DD' (UTC) */
   today: string;
   /** Length of the period in days after today; the period runs from today to today + days, both inclusive. */
@@ -109,7 +116,12 @@ export interface CashFlowSummary {
 
 export interface CashFlowProjection {
   period: { from: string; to: string; days: number };
+  /** Free balance at the start (what the accounts hold minus `allocated`); every balance below is free balance too. */
   startingBalance: number;
+  /** Kept in savings goals inside these accounts right now (one definition: modules/savings-goals/savings-goals.planning.ts). */
+  allocated: number;
+  /** What the accounts hold (matches the statements): `startingBalance + allocated`. */
+  totalBalance: number;
   days: CashFlowDay[];
   summary: CashFlowSummary;
   unassignedInvoices: Array<{
@@ -132,7 +144,7 @@ export function addDays(day: string, n: number): string {
   return `${String(d.getUTCFullYear()).padStart(4, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-const SOURCE_ORDER: Record<CashFlowSource, number> = { pending: 0, recurrence: 1, payroll: 2, invoice: 3 };
+const SOURCE_ORDER: Record<CashFlowSource, number> = { pending: 0, recurrence: 1, payroll: 2, invoice: 3, reserve: 4 };
 
 /**
  * Builds the projection. An event dated before today is moved to today and marked overdue (the money is still due, and
@@ -254,6 +266,8 @@ export function buildCashFlow(input: CashFlowInput): CashFlowProjection {
   return {
     period: { from: today, to: end, days: horizon },
     startingBalance: fromCents(input.startingBalanceCents),
+    allocated: fromCents(input.allocatedCents ?? 0),
+    totalBalance: fromCents(input.startingBalanceCents + (input.allocatedCents ?? 0)),
     days: dayList,
     summary,
     unassignedInvoices: (input.unassignedInvoices ?? []).map((u) => ({

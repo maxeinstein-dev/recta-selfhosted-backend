@@ -11,8 +11,12 @@ import {
   addToSavingsGoalSchema,
   savingsGoalIdParamSchema,
   listSavingsGoalsQuerySchema,
+  contributeSchema,
+  contributionParamsSchema,
+  contributionsQuerySchema,
 } from './savings-goals.schema.js';
 import * as savingsGoalsService from './savings-goals.service.js';
+import * as contributions from './savings-goals.contributions.js';
 
 export async function savingsGoalRoutes(app: FastifyInstance) {
   // All routes require authentication
@@ -60,6 +64,106 @@ export async function savingsGoalRoutes(app: FastifyInstance) {
     });
   });
 
+  const dataResponse = {
+    200: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        data: { type: 'object', additionalProperties: true },
+      },
+    },
+  };
+  const goalIdParams = {
+    type: 'object',
+    required: ['goalId'],
+    properties: { goalId: { type: 'string', format: 'uuid' } },
+  };
+
+  /**
+   * GET /savings-goals/summary
+   * Per account that holds goals: balance (unchanged by goals), kept in goals, free balance
+   */
+  app.get('/summary', {
+    schema: {
+      description: 'Balance, kept in goals and free balance of each account that holds savings goals',
+      tags: ['Savings Goals'],
+      security: [{ bearerAuth: [] }],
+      querystring: { type: 'object', properties: { householdId: { type: 'string', format: 'uuid' } } },
+      response: dataResponse,
+    },
+  }, async (request, reply) => {
+    const query = listSavingsGoalsQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+    return reply.send({ success: true, data: await savingsGoalsService.savingsSummary(householdId) });
+  });
+
+  /**
+   * POST /savings-goals/:goalId/contributions
+   * Put money in the goal ("guardar agora") (EDITOR+). 409 when the month already has one, unless confirmDuplicate.
+   */
+  app.post<{ Params: { goalId: string } }>('/:goalId/contributions', {
+    schema: {
+      description: 'Register a contribution to a savings goal (EDITOR+). Creates no transaction and does not change the account balance',
+      tags: ['Savings Goals'],
+      security: [{ bearerAuth: [] }],
+      params: goalIdParams,
+      response: { 201: dataResponse[200] },
+    },
+  }, async (request, reply) => {
+    const { goalId } = savingsGoalIdParamSchema.parse(request.params);
+    const input = contributeSchema.parse(request.body ?? {});
+    const existing = await savingsGoalsService.getSavingsGoal(goalId);
+    await requireEditor(request, existing.householdId);
+    const data = await contributions.contribute({ goalId, householdId: existing.householdId, ...input });
+    return reply.status(201).send({ success: true, data });
+  });
+
+  /**
+   * GET /savings-goals/:goalId/contributions?month=YYYY-MM
+   */
+  app.get<{ Params: { goalId: string } }>('/:goalId/contributions', {
+    schema: {
+      description: 'List the contributions of a savings goal',
+      tags: ['Savings Goals'],
+      security: [{ bearerAuth: [] }],
+      params: goalIdParams,
+      querystring: { type: 'object', properties: { month: { type: 'string', pattern: '^\\d{4}-\\d{2}$' } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { type: 'object', additionalProperties: true } } } } },
+    },
+  }, async (request, reply) => {
+    const { goalId } = savingsGoalIdParamSchema.parse(request.params);
+    const query = contributionsQuerySchema.parse(request.query);
+    const existing = await savingsGoalsService.getSavingsGoal(goalId);
+    await requireHouseholdMember(request, existing.householdId);
+    const data = await contributions.listContributions({ goalId, householdId: existing.householdId, month: query.month });
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * DELETE /savings-goals/:goalId/contributions/:contributionId
+   * Undo a contribution (EDITOR+): deletes it and gives the amount back to the goal
+   */
+  app.delete<{ Params: { goalId: string; contributionId: string } }>('/:goalId/contributions/:contributionId', {
+    schema: {
+      description: 'Undo a contribution to a savings goal (EDITOR+)',
+      tags: ['Savings Goals'],
+      security: [{ bearerAuth: [] }],
+      params: {
+        type: 'object',
+        required: ['goalId', 'contributionId'],
+        properties: { goalId: { type: 'string', format: 'uuid' }, contributionId: { type: 'string', format: 'uuid' } },
+      },
+      response: dataResponse,
+    },
+  }, async (request, reply) => {
+    const { goalId, contributionId } = contributionParamsSchema.parse(request.params);
+    const existing = await savingsGoalsService.getSavingsGoal(goalId);
+    await requireEditor(request, existing.householdId);
+    const data = await contributions.undoContribution({ goalId, householdId: existing.householdId, contributionId });
+    return reply.send({ success: true, data });
+  });
+
   /**
    * POST /savings-goals
    * Create a new savings goal (EDITOR+)
@@ -82,7 +186,7 @@ export async function savingsGoalRoutes(app: FastifyInstance) {
           type: 'object',
           properties: {
             success: { type: 'boolean' },
-            data: { type: 'object' },
+            data: { type: 'object', additionalProperties: true },
           },
         },
       },
