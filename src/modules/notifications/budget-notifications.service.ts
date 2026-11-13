@@ -8,6 +8,7 @@ import { loadTheirShares } from '../people/own-share.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { CategoryName, CATEGORY_NAME_DISPLAY, GENERAL_BUDGET_CATEGORY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
+import { budgetAlertCopy, budgetAlertKind } from '../budgets/budget-status.js';
 
 type BudgetRow = { id: string; categoryName: string; type: string; measure?: string | null; monthlyLimit: Prisma.Decimal };
 
@@ -119,36 +120,25 @@ export async function checkBudgetThresholds(
     // What the limit is compared with: the own share for a budget measured separately, the full spending otherwise
     const spending = measuredAmount(budget, fullSpending, ownSpentOf(budget, fullSpending, theirShares));
 
-    const percentage = (spending / limit) * 100;
-    const roundedPercentage = Math.round(percentage * 100) / 100;
-
-    // Notifications already sent for this specific budget, and their thresholds
-    const notifiedPercentages = existingNotifications
+    // Alerts already sent for this specific budget this month: each kind (75%, reached, exceeded) goes out once
+    const sentAlerts = existingNotifications
       .filter((n) => {
         const metadata = n.metadata as any;
         return metadata && typeof metadata === 'object' && metadata.budgetId === budget.id;
       })
-      .map((n) => (n.metadata as any)?.percentage)
-      .filter((p): p is number => typeof p === 'number');
+      .map((n) => ({ status: (n.metadata as any)?.status, percentage: (n.metadata as any)?.percentage }));
 
-    const hasNotified75 = notifiedPercentages.some((p) => p >= 75 && p < 100);
-    const hasNotified100 = notifiedPercentages.some((p) => p >= 100);
-
-    const reaches75 = roundedPercentage >= 75 && roundedPercentage < 100 && !hasNotified75;
-    const reaches100 = roundedPercentage >= 100 && !hasNotified100;
-    if (!reaches75 && !reaches100) {
+    const kind = budgetAlertKind(spending, limit, sentAlerts);
+    if (kind === null) {
       continue;
     }
+    const roundedPercentage = Math.round((spending / limit) * 10000) / 100;
 
     const categoryDisplayName = await categoryDisplayNameOf(budget.categoryName);
     const deepLink = `/app/budgets?budgetId=${budget.id}`;
     // A budget measured separately says so: the amounts in the message are the own share, not the full spending
     const ownNote = measure === 'OWN_SHARE' ? ' (sua parte)' : '';
-    const overBudgetAmount = spending - limit;
-    const title = reaches100 ? `Orçamento ${categoryDisplayName} excedido!` : `Orçamento ${categoryDisplayName} atingiu 75%`;
-    const message = reaches100
-      ? `Você excedeu o orçamento de ${categoryDisplayName} em ${overBudgetAmount.toFixed(2)} este mês. O limite era ${limit.toFixed(2)} e você gastou ${spending.toFixed(2)}${ownNote}.`
-      : `Você já gastou ${roundedPercentage.toFixed(2)}% do orçamento de ${categoryDisplayName} este mês${ownNote}. Restam ${((100 - roundedPercentage) * limit / 100).toFixed(2)} para o final do mês.`;
+    const { title, message } = budgetAlertCopy(kind, { name: categoryDisplayName, spending, limit, ownNote });
 
     for (const member of members) {
       if (member.user) {
@@ -163,18 +153,19 @@ export async function checkBudgetThresholds(
               householdId,
               categoryName: budget.categoryName,
               percentage: roundedPercentage,
+              status: kind,
               spending,
               fullSpending,
               measure,
               limit,
-              ...(reaches100 ? { overBudget: overBudgetAmount } : {}),
+              ...(kind === 'exceeded' ? { overBudget: spending - limit } : {}),
               month: notificationsStart.toISOString(),
             },
             deepLink,
           });
           notifications.push(notification);
         } catch (error) {
-          console.error(`[checkBudgetThresholds] Error creating ${reaches100 ? '100%' : '75%'} notification for user ${member.user.id}:`, error);
+          console.error(`[checkBudgetThresholds] Error creating ${kind} notification for user ${member.user.id}:`, error);
         }
       }
     }
