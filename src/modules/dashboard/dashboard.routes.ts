@@ -178,7 +178,7 @@ export async function dashboardRoutes(app: FastifyInstance) {
       date: { type: 'string' },
       description: { type: 'string' },
       amount: { type: 'number' },
-      source: { type: 'string', enum: ['pending', 'recurrence', 'payroll', 'invoice'] },
+      source: { type: 'string', enum: ['pending', 'recurrence', 'payroll', 'invoice', 'reserve'] },
       certainty: { type: 'string', enum: ['confirmed', 'expected', 'estimated'] },
       overdue: { type: 'boolean' },
       originalDate: { type: ['string', 'null'] },
@@ -223,7 +223,10 @@ export async function dashboardRoutes(app: FastifyInstance) {
               properties: {
                 currency: { type: ['string', 'null'] },
                 period: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' }, days: { type: 'integer' } } },
+                // Free balance (accounts minus what the savings goals keep); every balance below is free balance too
                 startingBalance: { type: 'number' },
+                allocated: { type: 'number' },
+                totalBalance: { type: 'number' },
                 days: {
                   type: 'array',
                   items: {

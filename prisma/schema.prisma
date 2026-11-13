@@ -77,6 +77,7 @@ model Household {
   transactions          Transaction[]
   budgets               Budget[]
   savingsGoals          SavingsGoal[]
+  savingsGoalContributions SavingsGoalContribution[]
   recurringTransactions RecurringTransaction[]
   people                Person[]
   settlements           Settlement[]
@@ -384,6 +385,17 @@ model Budget {
   @@map("budgets")
 }
 
+// RESERVE: money kept apart for a goal (move, wedding, emergency). PROVISION: a yearly expense (insurance, IPVA) saved
+// month by month up to `dueMonth`.
+enum SavingsGoalKind {
+  RESERVE
+  PROVISION
+}
+
+// A goal is money MARKED inside an account, not a separate account: the account balance (what matches the statement)
+// never changes with a contribution; only the free balance (balance minus what the goals of the account hold) does.
+// `currentAmount` is what is kept; `monthlyContribution` (+ `contributionDay`) is the planned contribution of each month
+// (a PROVISION without it saves the rest evenly up to `dueMonth`, see modules/savings-goals/savings-goals.planning.ts).
 model SavingsGoal {
   id            String    @id @default(uuid()) @db.Uuid
   householdId   String    @map("household_id") @db.Uuid
@@ -392,17 +404,42 @@ model SavingsGoal {
   targetAmount  Decimal   @map("target_amount") @db.Decimal(15, 2)
   currentAmount Decimal   @default(0) @map("current_amount") @db.Decimal(15, 2)
   targetDate    DateTime? @map("target_date") @db.Date
+  kind                SavingsGoalKind @default(RESERVE)
+  monthlyContribution Decimal?        @map("monthly_contribution") @db.Decimal(15, 2)
+  contributionDay     Int?            @map("contribution_day")
+  dueMonth            String?         @map("due_month") @db.VarChar(7) // 'YYYY-MM'; PROVISION only
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 
   // Relations
   household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
   account   Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  contributions SavingsGoalContribution[]
 
   // Indexes
   @@index([householdId])
   @@index([accountId])
   @@map("savings_goals")
+}
+
+// One recorded contribution ("guardar agora") to a goal. Its own table on purpose: it creates no Transaction, so it can
+// never reach a balance, a statement reconciliation or a dashboard sum. `month` ('YYYY-MM') is the month it counts for
+// (the planned contribution of that month is done once one exists); undoing deletes the row and gives the amount back.
+model SavingsGoalContribution {
+  id          String   @id @default(uuid()) @db.Uuid
+  goalId      String   @map("goal_id") @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  amount      Decimal  @db.Decimal(15, 2)
+  date        DateTime @db.Date
+  month       String   @db.VarChar(7)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  goal      SavingsGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  household Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([goalId, month])
+  @@index([householdId])
+  @@map("savings_goal_contributions")
 }
 
 // ============================================================================

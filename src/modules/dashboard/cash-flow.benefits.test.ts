@@ -6,6 +6,8 @@ const db = vi.hoisted(() => ({
   recurringTransaction: { findMany: vi.fn() },
   category: { findMany: vi.fn() },
   employment: { findMany: vi.fn() },
+  savingsGoal: { findMany: vi.fn().mockResolvedValue([]) },
+  savingsGoalContribution: { findMany: vi.fn().mockResolvedValue([]) },
 }));
 
 vi.mock('../../shared/db/prisma.js', () => ({ prisma: db }));

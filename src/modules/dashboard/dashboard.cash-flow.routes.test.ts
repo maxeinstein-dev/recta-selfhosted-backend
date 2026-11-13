@@ -162,6 +162,23 @@ describe('GET /dashboard/cash-flow', () => {
     expect(m.load).not.toHaveBeenCalled();
   });
 
+  it('keeps the free/kept split and the reserve events (the response schema must not drop them)', async () => {
+    m.load.mockResolvedValue({
+      currency: 'BRL',
+      ...buildCashFlow({
+        startingBalanceCents: 200000,
+        allocatedCents: 100000,
+        today: '2026-11-10',
+        days: 30,
+        events: [{ date: '2026-11-15', description: 'Guardar: Emergency', amountCents: -50000, source: 'reserve', certainty: 'expected', sourceId: 'goal-1', accountId: ACC }],
+      }),
+    } as never);
+    const body = (await get(`?householdId=${HH}`)).json();
+    expect(body.data).toMatchObject({ startingBalance: 2000, allocated: 1000, totalBalance: 3000 });
+    expect(body.data.days[0].events[0]).toMatchObject({ source: 'reserve', amount: -500, sourceId: 'goal-1' });
+    expect(body.data.days[0].endBalance).toBe(1500);
+  });
+
   it('accepts the limits 1 and 180', async () => {
     expect((await get(`?householdId=${HH}&days=1`)).statusCode).toBe(200);
     expect((await get(`?householdId=${HH}&days=180`)).statusCode).toBe(200);

@@ -8,6 +8,8 @@ import { earlyDiscountQuoteOf, forecastBatch, referenceMonthOf } from '../recurr
 import { amountOnDay, earlyDiscountOf } from '../recurring-transactions/early-discount.js';
 import { benefitEvents, benefitPaidInMonth, extraPayrollEvents, salaryPaidInMonth } from '../payroll/payroll-events.js';
 import { loadPayrollLinks, type PayrollLink } from '../payroll/payroll.links.js';
+import { allocatedCentsByAccount, plannedContributions } from '../savings-goals/savings-goals.planning.js';
+import { planGoalOf, type GoalRow } from '../savings-goals/savings-goals.contributions.js';
 import { addDays, buildCashFlow, type CashFlowEventInput, type CashFlowProjection, type UnassignedInvoiceInput } from './cash-flow.js';
 
 /** Account types the projection is about: where the household's money sits. Cards and investments are left out. */
@@ -124,7 +126,16 @@ export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProj
     throw new BadRequestError('The cash accounts use different currencies: ask for one account (accountId)');
   }
   const scopeIds = new Set(scope.map((a) => a.id));
-  const startingBalanceCents = scope.reduce((sum, a) => sum + toCents(a.balance.toNumber()), 0);
+  const totalBalanceCents = scope.reduce((sum, a) => sum + toCents(a.balance.toNumber()), 0);
+
+  // Savings goals kept inside these accounts: the projection runs on the FREE balance (what the account holds minus what
+  // the goals keep), and each goal's planned contribution not yet made this month leaves it on its day.
+  const goals =
+    scope.length > 0
+      ? (await prisma.savingsGoal.findMany({ where: { householdId, accountId: { in: [...scopeIds] } } })).map((g) => planGoalOf(g as unknown as GoalRow))
+      : [];
+  const allocatedCents = [...allocatedCentsByAccount(goals).values()].reduce((sum, c) => sum + c, 0);
+  const startingBalanceCents = totalBalanceCents - allocatedCents;
 
   const events: CashFlowEventInput[] = [];
   const unassignedInvoices: UnassignedInvoiceInput[] = [];
@@ -139,10 +150,36 @@ export async function loadCashFlow(params: CashFlowParams): Promise<CashFlowProj
     const invoices = await invoiceEvents(householdId, accounts, scopeIds, today, end);
     events.push(...invoices.events);
     unassignedInvoices.push(...invoices.unassigned);
+    events.push(...(await reserveEvents(householdId, goals, today, end)));
   }
 
-  const projection = buildCashFlow({ startingBalanceCents, today, days, events, unassignedInvoices });
+  const projection = buildCashFlow({ startingBalanceCents, allocatedCents, today, days, events, unassignedInvoices });
   return { currency: scope[0]?.currency ?? null, ...projection };
+}
+
+/**
+ * The planned contribution of each savings goal in each month of the period that has none recorded yet, on the goal's
+ * contribution day (before today: overdue, the builder moves it to today). The month is "done" once any contribution
+ * exists for it, so a contributed month never shows again.
+ */
+async function reserveEvents(householdId: string, goals: ReturnType<typeof planGoalOf>[], today: string, end: string): Promise<CashFlowEventInput[]> {
+  const planned = goals.filter((g) => g.accountId && g.contributionDay !== null);
+  if (planned.length === 0) return [];
+  const rows = await prisma.savingsGoalContribution.findMany({
+    where: { householdId, goalId: { in: planned.map((g) => g.id) }, month: { gte: today.slice(0, 7), lte: end.slice(0, 7) } },
+    select: { goalId: true, month: true },
+  });
+  const doneMonths = new Set(rows.map((r) => `${r.goalId}:${r.month}`));
+  return plannedContributions(planned, { today, end, doneMonths }).map((p) => ({
+    date: p.date,
+    description: `Guardar: ${p.goalName}`,
+    amountCents: -p.amountCents,
+    source: 'reserve' as const,
+    certainty: 'expected' as const,
+    overdue: p.date < today,
+    sourceId: p.goalId,
+    accountId: p.accountId,
+  }));
 }
 
 /**
