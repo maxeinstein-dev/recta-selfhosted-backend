@@ -77,6 +77,10 @@ export const cardOfxConfirmBodySchema = z.object({
   payment: z
     .object({ apply: z.boolean(), sourceAccountId: z.string().uuid().optional() })
     .nullable(),
+  otherPeople: z
+    .array(z.object({ group: z.string().min(1).max(MAX_GROUP_ID_LENGTH), personId: z.string().uuid() }))
+    .max(MAX_CARD_OFX_LINES)
+    .optional(),
 });
 
 export const cardOfxReviewQuerySchema = z.object({

@@ -184,6 +184,13 @@ export interface CardOfxConfirmRequest {
    * recorded.sourceAccountId is null; otherwise an adjust pays again from the recorded payment's account.
    */
   payment: null | { apply: boolean; sourceAccountId?: string };
+  /**
+   * Lines that belong to another person, by proposal. Only selected `create` and `advance-payment` groups qualify, once each.
+   * A `create` group is recorded as the holder's own expense and split 100% to the person (a THEY_OWE_ME share, on every
+   * installment generated); an `advance-payment` group is recorded as the credit on the card and a RECEIVED settlement with
+   * the person linked to it. The person must be active and of the card's household.
+   */
+  otherPeople?: Array<{ group: string; personId: string }>;
 }
 
 export interface CardOfxConfirmResponse {
@@ -200,6 +207,10 @@ export interface CardOfxConfirmResponse {
   /** Advance payments recorded as credits on the card (one per `advance-payment` proposal applied). */
   advancePayments: number;
   payment: null | { action: 'adjusted' | 'created'; transactionId: string; amount: number; date: string };
+  /** Transactions (installments included) split 100% to another person (`otherPeople`). */
+  sharedWithPeople: number;
+  /** Advance payments recorded together with a RECEIVED settlement with the person who made them. */
+  settlementsRecorded: number;
   /** Selected groups that no longer exist in the recomputation (or were applied meanwhile by another confirm). */
   skipped: number;
   createdCategories: Array<{ id: string; name: string; type: 'INCOME' | 'EXPENSE' }>;

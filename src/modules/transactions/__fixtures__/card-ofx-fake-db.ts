@@ -61,10 +61,37 @@ export interface FakeCategory {
   type: 'INCOME' | 'EXPENSE';
 }
 
+export interface FakeShare {
+  transactionId: string;
+  householdId?: string;
+  personId?: string;
+  amount?: unknown;
+  direction?: string;
+  source?: string;
+}
+
+export interface FakeSettlement {
+  transactionId: string | null;
+  householdId?: string;
+  personId?: string;
+  direction?: string;
+  amount?: unknown;
+  date?: unknown;
+  note?: string | null;
+}
+
+export interface FakePerson {
+  id: string;
+  householdId: string;
+  name: string;
+  isActive: boolean;
+}
+
 interface Store {
   /** Rows that only exist to block merges: shares and settlements of a transaction. */
-  shares: Array<{ transactionId: string }>;
-  settlements: Array<{ transactionId: string }>;
+  shares: FakeShare[];
+  settlements: FakeSettlement[];
+  people: FakePerson[];
   transactions: FakeTransaction[];
   refs: FakeExternalRef[];
   accounts: FakeAccount[];
@@ -72,7 +99,7 @@ interface Store {
   recurrences: FakeRecurrence[];
 }
 
-export const store: Store = { shares: [], settlements: [], transactions: [], refs: [], accounts: [], categories: [], recurrences: [] };
+export const store: Store = { shares: [], settlements: [], people: [], transactions: [], refs: [], accounts: [], categories: [], recurrences: [] };
 let sequence = 0;
 
 function nextId(prefix: string): string {
@@ -83,6 +110,7 @@ function nextId(prefix: string): string {
 export function resetStore(): void {
   store.shares = [];
   store.settlements = [];
+  store.people = [];
   store.transactions = [];
   store.refs = [];
   store.accounts = [];
@@ -229,6 +257,7 @@ function snapshot(): Store {
   return {
     shares: store.shares.map((r) => ({ ...r })),
     settlements: store.settlements.map((r) => ({ ...r })),
+    people: store.people.map((r) => ({ ...r })),
     transactions: store.transactions.map((t) => ({ ...t })),
     refs: store.refs.map((r) => ({ ...r })),
     accounts: store.accounts.map((a) => ({ ...a })),
@@ -314,12 +343,34 @@ export const fakePrisma = {
   },
   $queryRaw: vi.fn(async () => []),
   transactionShare: {
+    create: vi.fn(async (args: { data: FakeShare }) => {
+      const row = { ...args.data };
+      if (store.shares.some((r) => r.transactionId === row.transactionId && r.personId === row.personId && r.direction === row.direction)) {
+        throw prismaError('P2002', 'Unique constraint failed on the fields: (`transaction_id`,`person_id`,`direction`)');
+      }
+      store.shares.push(row);
+      return { ...row };
+    }),
     count: vi.fn(async (args: { where?: Where }) => store.shares.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).length),
     findMany: vi.fn((args: { where?: Where }) =>
       lazy(() => store.shares.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
     ),
   },
+  person: {
+    findMany: vi.fn((args: { where?: Where }) =>
+      lazy(() => store.people.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
+    ),
+  },
   settlement: {
+    create: vi.fn(async (args: { data: FakeSettlement }) => {
+      const { transactionId } = args.data;
+      if (transactionId && store.settlements.some((r) => r.transactionId === transactionId)) {
+        throw prismaError('P2002', 'Unique constraint failed on the fields: (`transaction_id`)');
+      }
+      const row = { ...args.data };
+      store.settlements.push(row);
+      return { ...row };
+    }),
     count: vi.fn(async (args: { where?: Where }) => store.settlements.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).length),
     findMany: vi.fn((args: { where?: Where }) =>
       lazy(() => store.settlements.filter((r) => matches(r as unknown as Record<string, unknown>, args.where)).map((r) => ({ ...r }))),
@@ -454,6 +505,12 @@ export function seedTransaction(data: Partial<FakeTransaction> & { householdId: 
 
 export function seedSettlement(transactionId: string): void {
   store.settlements.push({ transactionId });
+}
+
+export function seedPerson(data: Partial<FakePerson> & { householdId: string; name: string }): FakePerson {
+  const person: FakePerson = { id: nextId('person'), isActive: true, ...data };
+  store.people.push(person);
+  return person;
 }
 
 export function seedShare(transactionId: string): void {
