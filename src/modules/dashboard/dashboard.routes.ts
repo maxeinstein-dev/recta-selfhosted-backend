@@ -2,10 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { authMiddleware } from '../../shared/middleware/auth.middleware.js';
 import {
   requireHouseholdMember,
+  requireEditor,
   ensurePersonalHousehold,
 } from '../../shared/middleware/authorization.middleware.js';
-import { cashFlowQuerySchema, dashboardOverviewQuerySchema } from './dashboard.schema.js';
+import { cashFlowQuerySchema, dashboardOverviewQuerySchema, monthCloseBodySchema, monthCloseQuerySchema } from './dashboard.schema.js';
 import { loadCashFlow } from './cash-flow.loader.js';
+import { loadMonthClose, saveMonthClosing } from './month-close.js';
 import * as dashboardService from './dashboard.service.js';
 
 export async function dashboardRoutes(app: FastifyInstance) {
@@ -279,6 +281,51 @@ export async function dashboardRoutes(app: FastifyInstance) {
     await requireHouseholdMember(request, householdId);
 
     const data = await loadCashFlow({ householdId, accountId: query.accountId, days: query.days });
+    return reply.send({ success: true, data });
+  });
+  /**
+   * GET /dashboard/month-close
+   * Is the month conferred? Cash account balances, card invoices and what is still pending. Read only.
+   */
+  app.get('/month-close', {
+    schema: {
+      description: 'What still stops a month from being conferred: balances, invoices, pending entries',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        required: ['month'],
+        properties: {
+          householdId: { type: 'string', format: 'uuid' },
+          month: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = monthCloseQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+
+    const data = await loadMonthClose({ householdId, month: query.month });
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * POST /dashboard/month-close
+   * Records the conference of one account (or card) for a month. The system figure is computed on the server.
+   */
+  app.post('/month-close', {
+    schema: {
+      description: 'Record the conference of one account for a month: informed balance against the system balance',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+    },
+  }, async (request, reply) => {
+    const body = monthCloseBodySchema.parse(request.body);
+    const householdId = body.householdId || await ensurePersonalHousehold(request);
+    const membership = await requireEditor(request, householdId);
+
+    const data = await saveMonthClosing({ householdId, month: body.month, accountId: body.accountId, informedBalance: body.informedBalance, userId: membership.userId });
     return reply.send({ success: true, data });
   });
 }

@@ -84,6 +84,7 @@ model Household {
   deviceTokens          DeviceToken[]
   captureAccountRules   CaptureAccountRule[]
   employments           Employment[]
+  monthClosings         MonthClosing[]
 
   @@map("households")
 }
@@ -192,6 +193,7 @@ model Account {
   recurringTransactions RecurringTransaction[]
   savingsGoals          SavingsGoal[]
   captureAccountRules   CaptureAccountRule[]
+  monthClosings         MonthClosing[]
   employments           Employment[]
   employmentItems       EmploymentItem[]
 
@@ -1004,4 +1006,27 @@ model EmploymentFgtsMode {
 
   @@unique([employmentId, startDate])
   @@map("employment_fgts_modes")
+}
+
+// Month close: the user's conference of one account (or card) for one month. `informedBalance` is what the statement says
+// (the bank's balance on the last day; for a card, the invoice total), `systemBalance` what the system computed at that
+// moment, `difference` = informed - system. One row per (household, month, account): conferring again replaces it.
+// It never blocks or edits the month's entries; the read route only warns when something of the month changed afterwards.
+model MonthClosing {
+  id              String   @id @default(uuid()) @db.Uuid
+  householdId     String   @map("household_id") @db.Uuid
+  accountId       String   @map("account_id") @db.Uuid
+  month           String   @db.VarChar(7) // 'YYYY-MM'
+  informedBalance Decimal  @map("informed_balance") @db.Decimal(15, 2)
+  systemBalance   Decimal  @map("system_balance") @db.Decimal(15, 2)
+  difference      Decimal  @db.Decimal(15, 2)
+  closedByUserId  String?  @map("closed_by_user_id") @db.Uuid
+  closedAt        DateTime @default(now()) @map("closed_at") @db.Timestamptz(3)
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, month, accountId])
+  @@index([householdId, month])
+  @@map("month_closings")
 }
