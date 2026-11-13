@@ -2052,7 +2052,8 @@ export async function calculateCreditCardInvoice(
     previousBalance = Math.max(0, previousNetExpenses - previousPaymentsTotal);
   } else {
     // No previous transactions - check if account has initial debt
-    // Get current invoice period transactions to see if balance was modified
+    // The card balance already holds the movements of this invoice and of the later ones, so the opening debt is the
+    // balance minus all of them: this period's movements plus those dated after it.
     const currentPeriodTransactions = await prisma.transaction.findMany({
       where: {
         OR: [
@@ -2061,15 +2062,24 @@ export async function calculateCreditCardInvoice(
         ],
       },
     });
-    
-    if (currentPeriodTransactions.length === 0) {
+    const laterTransactions = await prisma.transaction.findMany({
+      where: {
+        OR: [
+          { accountId, householdId, date: { gt: invoiceEnd } },
+          { householdId, attachmentUrl: { startsWith: `invoice_pay:${accountId}:` }, date: { gt: invoiceEnd } },
+        ],
+      },
+    });
+    const movementsFromPeriod = [...currentPeriodTransactions, ...laterTransactions];
+
+    if (movementsFromPeriod.length === 0) {
       // No transactions at all - use account balance as initial debt
       previousBalance = Math.max(0, account.balance.toNumber());
     } else {
-      // Has transactions in current period but none before
-      // Calculate net change in current period
+      // Has movements from this invoice on, but none before
+      // Calculate net change from this invoice on
       let currentPeriodNetChange = 0;
-      for (const t of currentPeriodTransactions) {
+      for (const t of movementsFromPeriod) {
         if (t.attachmentUrl?.startsWith(`invoice_pay:${accountId}:`)) {
           // Payment decreases debt
           currentPeriodNetChange -= t.amount.toNumber();
