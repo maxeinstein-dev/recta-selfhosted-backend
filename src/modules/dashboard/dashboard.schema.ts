@@ -123,3 +123,11 @@ export const monthCloseBodySchema = z.object({
 });
 
 export type MonthCloseBody = z.infer<typeof monthCloseBodySchema>;
+
+/** Net worth query: `months` is how many months back from the current one, included (1 to 36, default 12). */
+export const netWorthQuerySchema = z.object({
+  householdId: z.string().uuid().optional(),
+  months: z.coerce.number().int().min(1).max(36).default(12),
+});
+
+export type NetWorthQuery = z.infer<typeof netWorthQuerySchema>;

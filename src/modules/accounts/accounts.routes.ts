@@ -16,6 +16,7 @@ import {
   adjustBalanceSchema,
 } from './accounts.schema.js';
 import * as accountsService from './accounts.service.js';
+import { deleteValuation, listValuations, saveValuation, valuationBodySchema } from './account-valuations.js';
 
 export async function accountRoutes(app: FastifyInstance) {
   // All routes require authentication
@@ -460,6 +461,76 @@ export async function accountRoutes(app: FastifyInstance) {
         success: true,
         data: result,
       });
+    }
+  );
+
+  const anyData = { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } };
+  // An array needs its own schema: under an object schema the serializer turns it into {"0": {...}}.
+  const listData = { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { type: 'object', additionalProperties: true } } } };
+  const accountParams = { type: 'object', required: ['accountId'], properties: { accountId: { type: 'string', format: 'uuid' } } };
+
+  /**
+   * GET /accounts/:accountId/valuations
+   * Market values informed for an investment account, newest first (member)
+   */
+  app.get<{ Params: { accountId: string } }>(
+    '/:accountId/valuations',
+    { schema: { description: 'List the market values informed for an investment account', tags: ['Accounts'], security: [{ bearerAuth: [] }], params: accountParams, response: { 200: listData } } },
+    async (request, reply) => {
+      const { accountId } = accountIdParamSchema.parse(request.params);
+      const account = await accountsService.getAccount(accountId);
+      await requireHouseholdMember(request, account.householdId);
+      return reply.send({ success: true, data: await listValuations(accountId, account.householdId) });
+    }
+  );
+
+  /**
+   * PUT /accounts/:accountId/valuations
+   * Inform the market value of an investment account on a day; one value per day, informing again replaces it (EDITOR+)
+   */
+  app.put<{ Params: { accountId: string } }>(
+    '/:accountId/valuations',
+    {
+      schema: {
+        description: 'Inform the market value of an investment account on a day (EDITOR+)',
+        tags: ['Accounts'],
+        security: [{ bearerAuth: [] }],
+        params: accountParams,
+        // No `type` on the fields: Ajv would coerce null/false to 0 before zod runs. valuationBodySchema validates them.
+        body: { type: 'object', required: ['date', 'amount'], properties: { date: { type: 'string' }, amount: {} } },
+        response: { 200: anyData },
+      },
+    },
+    async (request, reply) => {
+      const { accountId } = accountIdParamSchema.parse(request.params);
+      const body = valuationBodySchema.parse(request.body);
+      const account = await accountsService.getAccount(accountId);
+      await requireEditor(request, account.householdId);
+      return reply.send({ success: true, data: await saveValuation(accountId, account.householdId, body) });
+    }
+  );
+
+  /**
+   * DELETE /accounts/:accountId/valuations/:valuationId (EDITOR+)
+   */
+  app.delete<{ Params: { accountId: string; valuationId: string } }>(
+    '/:accountId/valuations/:valuationId',
+    {
+      schema: {
+        description: 'Remove a market value informed by mistake (EDITOR+)',
+        tags: ['Accounts'],
+        security: [{ bearerAuth: [] }],
+        params: { type: 'object', required: ['accountId', 'valuationId'], properties: { accountId: { type: 'string', format: 'uuid' }, valuationId: { type: 'string', format: 'uuid' } } },
+        response: { 200: anyData },
+      },
+    },
+    async (request, reply) => {
+      const { accountId } = accountIdParamSchema.parse(request.params);
+      const { valuationId } = request.params;
+      const account = await accountsService.getAccount(accountId);
+      await requireEditor(request, account.householdId);
+      await deleteValuation(accountId, account.householdId, valuationId);
+      return reply.send({ success: true, data: { deleted: true } });
     }
   );
 }

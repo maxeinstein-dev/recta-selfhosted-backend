@@ -5,9 +5,10 @@ import {
   requireEditor,
   ensurePersonalHousehold,
 } from '../../shared/middleware/authorization.middleware.js';
-import { cashFlowQuerySchema, dashboardOverviewQuerySchema, monthCloseBodySchema, monthCloseQuerySchema } from './dashboard.schema.js';
+import { cashFlowQuerySchema, dashboardOverviewQuerySchema, monthCloseBodySchema, monthCloseQuerySchema, netWorthQuerySchema } from './dashboard.schema.js';
 import { loadCashFlow } from './cash-flow.loader.js';
 import { loadMonthClose, saveMonthClosing } from './month-close.js';
+import { loadNetWorth } from './net-worth.loader.js';
 import * as dashboardService from './dashboard.service.js';
 
 export async function dashboardRoutes(app: FastifyInstance) {
@@ -329,6 +330,38 @@ export async function dashboardRoutes(app: FastifyInstance) {
     const membership = await requireEditor(request, householdId);
 
     const data = await saveMonthClosing({ householdId, month: body.month, accountId: body.accountId, informedBalance: body.informedBalance, userId: membership.userId });
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * GET /dashboard/net-worth
+   * Net worth by month: cash accounts, investments, reserves, FGTS (estimated) minus the card debt. Read-only.
+   */
+  app.get('/net-worth', {
+    schema: {
+      description: 'Net worth by month: accounts, investments, reserves and FGTS minus the card debt, with the savings rate',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          householdId: { type: 'string', format: 'uuid' },
+          months: { type: 'integer', minimum: 1, maximum: 36 },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = netWorthQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+
+    const data = await loadNetWorth({ householdId, months: query.months });
     return reply.send({ success: true, data });
   });
 }
