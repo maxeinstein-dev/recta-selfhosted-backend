@@ -69,7 +69,8 @@ export interface BudgetVsRealized {
   ownSpent: number;
   remaining: number;
   percentage: number;
-  status: 'ok' | 'warning' | 'exceeded';
+  /** 'reached': the spending is exactly the limit (all of it used); 'exceeded': above the limit. */
+  status: 'ok' | 'warning' | 'reached' | 'exceeded';
 }
 
 export interface DashboardHeatmapDay {

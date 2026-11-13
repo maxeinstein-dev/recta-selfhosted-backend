@@ -5,6 +5,7 @@ import { deductionCents, loadTheirShares, ownAmountCents, type TheirShare } from
 import { forecastBatch } from '../recurring-transactions/recurring-forecast.js';
 import { AccountType, TransactionType, CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { budgetStatusOf } from '../budgets/budget-status.js';
 import type {
   DashboardOverviewQuery,
   DashboardOverviewResponse,
@@ -582,8 +583,7 @@ function calculateBudgetVsRealized(
 
     const percentage = budgeted > 0 ? (spent / budgeted) * 100 : 0;
     const remaining = budgeted - spent;
-    const status: 'ok' | 'warning' | 'exceeded' = 
-      percentage >= 100 ? 'exceeded' : percentage >= 80 ? 'warning' : 'ok';
+    const status = budgetStatusOf(spent, budgeted);
 
     return {
       category: budget.categoryName,
@@ -596,8 +596,8 @@ function calculateBudgetVsRealized(
       status,
     };
   }).sort((a, b) => {
-    // Sort: exceeded first, then warning, then ok
-    const statusOrder = { exceeded: 0, warning: 1, ok: 2 };
+    // Sort: exceeded first, then reached, then warning, then ok
+    const statusOrder = { exceeded: 0, reached: 1, warning: 2, ok: 3 };
     if (statusOrder[a.status] !== statusOrder[b.status]) {
       return statusOrder[a.status] - statusOrder[b.status];
     }
