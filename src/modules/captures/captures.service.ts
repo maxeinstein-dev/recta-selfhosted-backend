@@ -5,7 +5,8 @@ import { ConflictError, NotFoundError } from '../../shared/errors/index.js';
 import { buildPaginationArgs, createPaginatedResponse } from '../../shared/utils/pagination.js';
 import { createTransaction, getTransactionWithHousehold } from '../transactions/transactions.service.js';
 import type { CreateTransactionInput } from '../transactions/transactions.schema.js';
-import { buildSuggestion, type SuggestionCardRule, type SuggestionRule } from './capture-suggestion.js';
+import { buildCategoryHints, type CategoryHints } from './capture-category.js';
+import { buildSuggestion, suggestedPlace, type SuggestionCardRule, type SuggestionRule } from './capture-suggestion.js';
 import { PARSER_VERSION, parseCapture, type ParsedCapture } from './parsers/index.js';
 import type { AccountRuleInput, CaptureItemInput, CaptureStatusValue, CardRuleInput, ConfirmCaptureInput } from './captures.schema.js';
 
@@ -103,10 +104,49 @@ const CAPTURE_SELECT = {
 
 type CaptureRow = Prisma.CapturedNotificationGetPayload<{ select: typeof CAPTURE_SELECT }>;
 
-function toCaptureDto(row: CaptureRow, rules: readonly SuggestionRule[], cardRules: readonly SuggestionCardRule[] = []) {
+function toCaptureDto(
+  row: CaptureRow,
+  rules: readonly SuggestionRule[],
+  cardRules: readonly SuggestionCardRule[] = [],
+  hints?: CategoryHints
+) {
   // Explicit fields: the rows of the transition routes also carry the dedupKey, which is not part of the API.
   const { id, package: pkg, title, text, postedAt, status, parsed, transactionId } = row;
-  return { id, package: pkg, title, text, postedAt, status, parsed, transactionId, suggestion: buildSuggestion(row, rules, cardRules) };
+  return { id, package: pkg, title, text, postedAt, status, parsed, transactionId, suggestion: buildSuggestion(row, rules, cardRules, hints) };
+}
+
+/** How far back the category hint looks: a year of the household's own transactions is enough to know a place. */
+const HINT_HISTORY_DAYS = 365;
+const HINT_HISTORY_MAX_ROWS = 5000;
+
+/**
+ * The category hints of one page of captures, in three queries, or none when no capture of the page names a place.
+ * Every query is scoped to the household.
+ */
+async function loadCategoryHints(householdId: string, rows: readonly CaptureRow[]): Promise<CategoryHints | undefined> {
+  if (!rows.some((row) => suggestedPlace(row.parsed))) return undefined;
+  const since = new Date(Date.now() - HINT_HISTORY_DAYS * 24 * 60 * 60 * 1000);
+  const [history, recurrences, customCategories] = await Promise.all([
+    prisma.transaction.findMany({
+      where: {
+        householdId,
+        type: { in: ['INCOME', 'EXPENSE'] },
+        categoryName: { not: null },
+        description: { not: null },
+        date: { gte: since },
+      },
+      select: { type: true, description: true, categoryName: true, date: true, createdAt: true },
+      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+      take: HINT_HISTORY_MAX_ROWS,
+    }),
+    prisma.recurringTransaction.findMany({
+      where: { householdId, isActive: true },
+      select: { description: true, aliases: true, categoryName: true },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+    }),
+    prisma.category.findMany({ where: { householdId }, select: { id: true, type: true } }),
+  ]);
+  return buildCategoryHints({ history, recurrences, customCategories });
 }
 
 /** Newest first; `id` breaks ties between captures of the same instant so cursor pages neither overlap nor skip. */
@@ -124,7 +164,8 @@ export async function listCaptures(householdId: string, query: { status: Capture
     prisma.captureCardRule.findMany({ where: { householdId }, select: { package: true, cardLast4: true, accountId: true } }),
   ]);
   const page = createPaginatedResponse(rows, query.limit);
-  return { data: page.data.map((row) => toCaptureDto(row, rules, cardRules)), pagination: page.pagination };
+  const hints = await loadCategoryHints(householdId, page.data);
+  return { data: page.data.map((row) => toCaptureDto(row, rules, cardRules, hints)), pagination: page.pagination };
 }
 
 export async function countCaptures(householdId: string, status: CaptureStatusValue): Promise<number> {
