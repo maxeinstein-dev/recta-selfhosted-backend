@@ -84,6 +84,7 @@ model Household {
   capturedNotifications CapturedNotification[]
   deviceTokens          DeviceToken[]
   captureAccountRules   CaptureAccountRule[]
+  captureCardRules      CaptureCardRule[]
   employments           Employment[]
   monthClosings         MonthClosing[]
 
@@ -194,6 +195,7 @@ model Account {
   recurringTransactions RecurringTransaction[]
   savingsGoals          SavingsGoal[]
   captureAccountRules   CaptureAccountRule[]
+  captureCardRules      CaptureCardRule[]
   monthClosings         MonthClosing[]
   employments           Employment[]
   employmentItems       EmploymentItem[]
@@ -824,6 +826,25 @@ model CaptureAccountRule {
 
   @@unique([householdId, package, kind])
   @@map("capture_account_rules")
+}
+
+// Which account receives the card purchases of one card ending (the last four digits the notification carries), per
+// app. Wins over the (package, kind) rule; one Nubank account can have several virtual cards, each with its own ending.
+model CaptureCardRule {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  package     String   @db.VarChar(150)
+  cardLast4   String   @map("card_last4") @db.Char(4)
+  accountId   String   @map("account_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // Relations
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, package, cardLast4])
+  @@map("capture_card_rules")
 }
 
 // ============================================================================

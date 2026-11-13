@@ -1,12 +1,17 @@
-import { BRL, parsePositiveAmount } from './amount.js';
+import { BRL, money, normalizeText, parsePositiveCents } from './amount.js';
+import { isNotice, noticeReading } from './notice.js';
 import type { AppParser } from './types.js';
 
-const PIX_DEPOSIT = new RegExp(String.raw`^Você depositou ${BRL} via Pix e o valor já está rendendo na sua conta\.?$`);
+const PIX_DEPOSIT = new RegExp(String.raw`^Você depositou ${BRL} via Pix e o valor já está rendendo na sua conta\.?$`, 'i');
 
 export const parseMercadoPago: AppParser = ({ text }) => {
-  const m = PIX_DEPOSIT.exec(text.trim());
-  if (!m) return null;
-  const amount = parsePositiveAmount(m[1]!);
-  if (amount === null) return null;
-  return { kind: 'OWN_TRANSFER_IN', type: null, amount, description: 'Depósito via Pix' };
+  const body = normalizeText(text);
+  const m = PIX_DEPOSIT.exec(body);
+  if (m) {
+    // Decided 13/11/2026: income with a warning, no pairing with an outflow of another account.
+    const cents = parsePositiveCents(m[1]!);
+    if (cents === null) return null;
+    return { kind: 'PIX_IN', type: 'INCOME', ...money(cents), method: 'PIX', description: 'Depósito via Pix', warning: 'POSSIBLE_OWN_TRANSFER' };
+  }
+  return body && isNotice(body) ? noticeReading() : null;
 };

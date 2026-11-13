@@ -16,6 +16,7 @@ import {
   createCapturesSchema,
   listCapturesQuerySchema,
   replaceAccountRulesSchema,
+  replaceCardRulesSchema,
 } from './captures.schema.js';
 import * as capturesService from './captures.service.js';
 
@@ -164,6 +165,37 @@ export async function captureRoutes(app: FastifyInstance) {
     return reply.send({ success: true, data: await capturesService.replaceAccountRules(householdId, body.rules) });
   });
 
+  /** GET /captures/card-rules : which account receives the purchases of each card ending, per app. */
+  app.get('/card-rules', {
+    ...jwt,
+    schema: {
+      ...jwtRoute,
+      description: 'List the household card-ending rules ({ package, cardLast4, accountId }); they win over the (package, kind) rules',
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: looseObject } } } },
+    },
+  }, async (request, reply) => {
+    const query = captureActionQuerySchema.parse(request.query);
+    const householdId = await resolveHousehold(request, query.householdId);
+    await requireHouseholdMember(request, householdId);
+    return reply.send({ success: true, data: await capturesService.listCardRules(householdId) });
+  });
+
+  /** PUT /captures/card-rules : replace all card-ending rules at once (EDITOR+). */
+  app.put('/card-rules', {
+    ...jwt,
+    schema: {
+      ...jwtRoute,
+      description: 'Replace all card-ending rules of the household (EDITOR+). cardLast4 is four digits; a duplicate (package, cardLast4) is a 400; an account that is not an active account of the household is a 404.',
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: looseObject } } } },
+    },
+  }, async (request, reply) => {
+    const query = captureActionQuerySchema.parse(request.query);
+    const body = replaceCardRulesSchema.parse(request.body);
+    const householdId = await resolveHousehold(request, query.householdId);
+    await requireEditor(request, householdId);
+    return reply.send({ success: true, data: await capturesService.replaceCardRules(householdId, body.rules) });
+  });
+
   /** POST /captures/:id/confirm : creates the transaction (201), or returns the existing one when already confirmed (200). */
   app.post('/:id/confirm', {
     ...jwt,
@@ -188,12 +220,15 @@ export async function captureRoutes(app: FastifyInstance) {
     });
   });
 
-  /** POST /captures/reparse : read the PENDING drafts again with the current parser (EDITOR+). */
+  /** POST /captures/reparse : read again, with the current parser, the drafts an older parser read (EDITOR+). */
   app.post('/reparse', {
     ...jwt,
     schema: {
       ...jwtRoute,
-      description: 'Re-read the PENDING captures of the household with the current parser version (EDITOR+). Known informative notices become IGNORED; no transaction is created.',
+      description:
+        'Re-read the PENDING (and legacy IGNORED) captures of the household whose parser version is older than the current one (EDITOR+). ' +
+        'Notices become DISMISSED (restorable); CONFIRMED and DISMISSED captures are never touched; no transaction is created. ' +
+        'Answers { scanned, updated, understood, dismissed, notUnderstood, parserVersion }; a second run finds nothing to do.',
       response: { 200: objectResponse },
     },
   }, async (request, reply) => {

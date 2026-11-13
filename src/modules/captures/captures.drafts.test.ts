@@ -13,6 +13,7 @@ type Row = Record<string, unknown>;
 const store = vi.hoisted(() => ({
   captures: [] as Row[],
   rules: [] as Row[],
+  cardRules: [] as Row[],
   accounts: [] as Row[],
   transactions: [] as Row[],
   members: new Map<string, string>(), // `${householdId}:${userId}` -> role
@@ -23,11 +24,13 @@ const store = vi.hoisted(() => ({
 
 const matches = (row: Row, where: Row): boolean =>
   Object.entries(where).every(([key, cond]) => {
+    if (key === 'OR') return (cond as Row[]).some((alt) => matches(row, alt));
     if (cond && typeof cond === 'object' && !(cond instanceof Date)) {
       if ('in' in cond) return (cond as { in: unknown[] }).in.includes(row[key]);
+      if ('lt' in cond) return typeof row[key] === 'number' && (row[key] as number) < (cond as { lt: number }).lt;
       return false;
     }
-    return row[key] === cond;
+    return (row[key] ?? null) === cond;
   });
 
 const captureOps = {
@@ -72,6 +75,23 @@ const ruleOps = {
   }),
 };
 
+const cardRuleOps = {
+  findMany: vi.fn(async ({ where, select }: { where: Row; select?: Record<string, boolean> }) =>
+    store.cardRules
+      .filter((r) => matches(r, where))
+      .sort((a, b) => String(a.package).localeCompare(String(b.package)) || String(a.cardLast4).localeCompare(String(b.cardLast4)))
+      .map((r) => pick(r, select))),
+  deleteMany: vi.fn(async ({ where }: { where: Row }) => {
+    const before = store.cardRules.length;
+    store.cardRules = store.cardRules.filter((r) => !matches(r, where));
+    return { count: before - store.cardRules.length };
+  }),
+  createMany: vi.fn(async ({ data }: { data: Row[] }) => {
+    store.cardRules.push(...data);
+    return { count: data.length };
+  }),
+};
+
 const prismaMock = vi.hoisted(() => ({ current: null as unknown }));
 vi.mock('../../shared/config/env.js', () => config);
 vi.mock('../../shared/db/prisma.js', () => {
@@ -87,16 +107,19 @@ vi.mock('../../shared/db/prisma.js', () => {
     },
     capturedNotification: captureOps,
     captureAccountRule: ruleOps,
+    captureCardRule: cardRuleOps,
     account: { count: vi.fn(async ({ where }: { where: Row }) => store.accounts.filter((a) => matches(a, where)).length) },
     transaction: { findFirst: vi.fn(async ({ where }: { where: Row }) => store.transactions.find((t) => matches(t, where)) ?? null) },
     $queryRaw: vi.fn(async () => []),
     // Interactive transactions: roll the rule table back when the callback throws.
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
       const snapshot = [...store.rules];
+      const cardSnapshot = [...store.cardRules];
       try {
         return await fn(prismaMock.current);
       } catch (error) {
         store.rules = snapshot;
+        store.cardRules = cardSnapshot;
         throw error;
       }
     }),
@@ -177,6 +200,7 @@ function addCapture(n: number, over: Row = {}): Row {
 beforeEach(() => {
   store.captures = [];
   store.rules = [];
+  store.cardRules = [];
   store.transactions = [];
   store.members.clear();
   store.beforeCreate = null;
@@ -209,6 +233,7 @@ describe('buildSuggestion (pure)', () => {
   it('without parsed data only the date is filled', () => {
     expect(buildSuggestion({ package: PKG, postedAt, parsed: null }, rules)).toEqual({
       type: null, accountId: null, categoryName: null, amount: null, description: null, date: '2026-11-09T14:03:21.000Z',
+      cardLast4: null, warning: null,
     });
   });
 
@@ -266,6 +291,7 @@ describe('GET /captures', () => {
     const { data } = (await get('/captures')).json();
     expect(data[0].suggestion).toEqual({
       type: null, accountId: null, categoryName: null, amount: null, description: null, date: '2026-11-09T12:01:00.000Z',
+      cardLast4: null, warning: null,
     });
   });
 
@@ -585,6 +611,7 @@ describe('buildSuggestion with a parsed notification', () => {
   it('fills type, amount, description and the account of the rule; the category stays null', () => {
     expect(buildSuggestion({ package: PKG, postedAt, parsed }, rules)).toEqual({
       type: 'EXPENSE', accountId: CARD_ID, categoryName: null, amount: 37.5, description: 'PADARIA ZETA', date: '2026-11-09T14:03:21.000Z',
+      cardLast4: null, warning: null,
     });
   });
 
@@ -604,52 +631,233 @@ describe('buildSuggestion with a parsed notification', () => {
   });
 });
 
+describe('buildSuggestion: cents, card ending and warning', () => {
+  const postedAt = new Date('2026-11-09T14:03:21.000Z');
+  const NU = 'com.nu.production';
+  const NUBANK_CARD = '12121212-2b2a-4c5a-8c7b-8f8c3d4e5f61';
+  const VIRTUAL_CARD = '13131313-2b2a-4c5a-8c7b-8f8c3d4e5f62';
+  const kindRules = [{ package: NU, kind: 'CARD_PURCHASE', accountId: NUBANK_CARD }];
+  const cardRules = [
+    { package: NU, cardLast4: '4321', accountId: VIRTUAL_CARD },
+    { package: 'com.other', cardLast4: '1234', accountId: ACCOUNT_ID },
+  ];
+  const purchase = (over: Row = {}) => ({ kind: 'CARD_PURCHASE', type: 'EXPENSE', amountCents: 3750, amount: 37.5, description: 'PADARIA', ...over });
+
+  it('takes the amount from the integer cents, and still reads the reais of an older reading', () => {
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase({ amountCents: 29, amount: 99 }) }, kindRules).amount).toBe(0.29);
+    expect(buildSuggestion({ package: NU, postedAt, parsed: { kind: 'CARD_PURCHASE', type: 'EXPENSE', amount: 12.5 } }, kindRules).amount).toBe(12.5);
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase({ amountCents: 12.5 }) }, kindRules).amount).toBeNull();
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase({ amountCents: 0 }) }, kindRules).amount).toBeNull();
+  });
+
+  it('a card-ending rule of the same app wins over the (app, kind) rule', () => {
+    const s = buildSuggestion({ package: NU, postedAt, parsed: purchase({ cardLast4: '4321' }) }, kindRules, cardRules);
+    expect(s).toMatchObject({ accountId: VIRTUAL_CARD, cardLast4: '4321' });
+  });
+
+  it('falls back to the (app, kind) rule when no rule names the card ending, or it belongs to another app', () => {
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase({ cardLast4: '9999' }) }, kindRules, cardRules).accountId).toBe(NUBANK_CARD);
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase({ cardLast4: '1234' }) }, kindRules, cardRules).accountId).toBe(NUBANK_CARD);
+    expect(buildSuggestion({ package: NU, postedAt, parsed: purchase() }, kindRules, cardRules).accountId).toBe(NUBANK_CARD);
+  });
+
+  it('drops a card ending of the wrong shape (never matched, never shown)', () => {
+    for (const cardLast4 of ['432', '43210', 4321, 'abcd']) {
+      const s = buildSuggestion({ package: NU, postedAt, parsed: purchase({ cardLast4 }) }, [], [{ package: NU, cardLast4: '4321', accountId: VIRTUAL_CARD }]);
+      expect(s).toMatchObject({ accountId: null, cardLast4: null });
+    }
+  });
+
+  it('passes the possible-own-transfer warning and drops an unknown one', () => {
+    const pixIn = { kind: 'PIX_IN', type: 'INCOME', amountCents: 1000, amount: 10, description: 'Depósito via Pix' };
+    expect(buildSuggestion({ package: NU, postedAt, parsed: { ...pixIn, warning: 'POSSIBLE_OWN_TRANSFER' } }, []).warning).toBe('POSSIBLE_OWN_TRANSFER');
+    expect(buildSuggestion({ package: NU, postedAt, parsed: { ...pixIn, warning: 'OTHER' } }, []).warning).toBeNull();
+  });
+
+  it('GET /captures suggests the account of the card-ending rule', async () => {
+    store.accounts.push({ id: NUBANK_CARD, householdId: PERSONAL_ID, isActive: true });
+    store.rules.push({ householdId: PERSONAL_ID, package: NU, kind: 'CARD_PURCHASE', accountId: NUBANK_CARD });
+    store.cardRules.push(
+      { householdId: PERSONAL_ID, package: NU, cardLast4: '4321', accountId: CARD_ID },
+      { householdId: OTHER_HOUSEHOLD_ID, package: NU, cardLast4: '5555', accountId: FOREIGN_ACCOUNT_ID },
+    );
+    addCapture(1, { package: NU, parsed: purchase({ cardLast4: '4321' }) });
+    addCapture(2, { package: NU, parsed: purchase({ cardLast4: '5555' }) });
+
+    const { data } = (await get('/captures')).json();
+    const byId = Object.fromEntries(data.map((c: Row) => [c.id, c]));
+    expect(byId[capId(1)].suggestion).toMatchObject({ accountId: CARD_ID, cardLast4: '4321', amount: 37.5 });
+    // Another household's rule never applies.
+    expect(byId[capId(2)].suggestion).toMatchObject({ accountId: NUBANK_CARD, cardLast4: '5555' });
+  });
+});
+
+describe('card rules', () => {
+  const NU = 'com.nu.production';
+  const putCards = (payload: unknown, headers = as(), url = '/captures/card-rules') => put(payload, headers, url);
+  const rule = (over: Row = {}) => ({ package: NU, cardLast4: '4321', accountId: CARD_ID, ...over });
+
+  it('lists only the household rules, sorted', async () => {
+    expect((await get('/captures/card-rules')).json()).toEqual({ success: true, data: [] });
+    store.cardRules.push(
+      { householdId: PERSONAL_ID, package: NU, cardLast4: '9999', accountId: ACCOUNT_ID },
+      { householdId: PERSONAL_ID, package: NU, cardLast4: '1111', accountId: CARD_ID },
+      { householdId: OTHER_HOUSEHOLD_ID, package: NU, cardLast4: '2222', accountId: FOREIGN_ACCOUNT_ID },
+    );
+    expect((await get('/captures/card-rules')).json().data).toEqual([
+      { package: NU, cardLast4: '1111', accountId: CARD_ID },
+      { package: NU, cardLast4: '9999', accountId: ACCOUNT_ID },
+    ]);
+  });
+
+  it('replaces all card rules at once without touching the (app, kind) rules', async () => {
+    store.rules.push({ householdId: PERSONAL_ID, package: NU, kind: 'PIX_IN', accountId: ACCOUNT_ID });
+    store.cardRules.push({ householdId: PERSONAL_ID, package: NU, cardLast4: '0000', accountId: ACCOUNT_ID });
+
+    const res = await putCards({ rules: [rule(), rule({ cardLast4: '8765', accountId: CARD_ID })] });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data).toEqual([
+      { package: NU, cardLast4: '4321', accountId: CARD_ID },
+      { package: NU, cardLast4: '8765', accountId: CARD_ID },
+    ]);
+    expect(store.rules).toHaveLength(1);
+    expect((await putCards({ rules: [] })).json().data).toEqual([]);
+  });
+
+  it('rejects a duplicate (app, ending) with 400 and an account outside the household with 404, keeping the old rules', async () => {
+    store.cardRules.push({ householdId: PERSONAL_ID, package: NU, cardLast4: '0000', accountId: ACCOUNT_ID });
+    expect((await putCards({ rules: [rule(), rule({ accountId: ACCOUNT_ID })] })).statusCode).toBe(400);
+    expect((await putCards({ rules: [rule({ accountId: FOREIGN_ACCOUNT_ID })] })).statusCode).toBe(404);
+    expect(store.cardRules).toEqual([{ householdId: PERSONAL_ID, package: NU, cardLast4: '0000', accountId: ACCOUNT_ID }]);
+  });
+
+  it.each([
+    ['three digits', { rules: [rule({ cardLast4: '123' })] }],
+    ['five digits', { rules: [rule({ cardLast4: '12345' })] }],
+    ['letters', { rules: [rule({ cardLast4: '12a4' })] }],
+    ['a number instead of text', { rules: [rule({ cardLast4: 1234 })] }],
+    ['extra keys', { rules: [{ ...rule(), kind: 'CARD_PURCHASE' }] }],
+    ['over 100 rules', { rules: Array.from({ length: 101 }, (_, i) => rule({ cardLast4: String(i).padStart(4, '0') })) }],
+  ])('400 for %s', async (_label, payload) => {
+    expect((await putCards(payload)).statusCode).toBe(400);
+  });
+
+  it('requires EDITOR+ to write (VIEWER 403) but lets a VIEWER read', async () => {
+    expect((await putCards({ rules: [] }, as(VIEWER_ID), `/captures/card-rules?householdId=${PERSONAL_ID}`)).statusCode).toBe(403);
+    expect((await get(`/captures/card-rules?householdId=${PERSONAL_ID}`, as(VIEWER_ID))).statusCode).toBe(200);
+    expect((await putCards({ rules: [] }, as(OUTSIDER_ID), `/captures/card-rules?householdId=${PERSONAL_ID}`)).statusCode).toBe(403);
+  });
+});
+
 // The in-memory stand-in stores Prisma's DbNull sentinel as is; for the database it means SQL NULL.
 const isNullJson = (value: unknown) => value == null || (value as object).constructor?.name === 'DbNull';
 
 describe('POST /captures/reparse', () => {
   const NU = 'com.nu.production';
   const purchaseText = 'Compra de R$ 37,50 APROVADA em PADARIA ZETA para o cartão com final 1234.';
+  const limitText = 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.';
 
-  it('reads the PENDING captures of the household with the current parser and stores the result', async () => {
+  it('reads the PENDING captures read by an older parser (or never read) and stores the result', async () => {
     addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText });
-    addCapture(2, { package: NU, title: 'Estorno', text: 'A compra em PADARIA ZETA no valor de R$ 37,50 foi estornada.' });
-    addCapture(3, { package: NU, title: 'Promoção', text: 'Ganhe um cupom agora.' });
-    addCapture(4, { package: NU, title: 'Seu novo limite está valendo', text: 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.' });
+    addCapture(2, { package: NU, title: 'Estorno', text: 'A compra em PADARIA ZETA no valor de R$ 37,50 foi estornada.', parserVersion: 3 });
+    addCapture(3, { package: NU, title: 'Novidade', text: 'Você ganhou R$ 20,00 de cashback.', parserVersion: 1 });
+    addCapture(4, { package: NU, title: 'Seu novo limite está valendo', text: limitText, parserVersion: 3 });
 
     const res = await postTo('/captures/reparse');
 
     expect(res.statusCode).toBe(200);
-    expect(res.json().data).toEqual({ scanned: 4, understood: 2, ignored: 1, notUnderstood: 1, parserVersion: PARSER_VERSION });
+    expect(res.json().data).toEqual({ scanned: 4, updated: 4, understood: 2, dismissed: 1, notUnderstood: 1, parserVersion: PARSER_VERSION });
     const byId = Object.fromEntries(store.captures.map((c) => [c.id, c]));
-    expect(byId[capId(1)]).toMatchObject({ status: 'PENDING', parserVersion: PARSER_VERSION, parsed: { kind: 'CARD_PURCHASE', amount: 37.5 } });
+    expect(byId[capId(1)]).toMatchObject({ status: 'PENDING', parserVersion: PARSER_VERSION, parsed: { kind: 'CARD_PURCHASE', amountCents: 3750, cardLast4: '1234' } });
     expect(byId[capId(2)]).toMatchObject({ status: 'PENDING', parsed: { kind: 'REFUND', type: 'INCOME' } });
-    expect(byId[capId(3)]!.status).toBe('PENDING');
+    expect(byId[capId(3)]).toMatchObject({ status: 'PENDING', parserVersion: PARSER_VERSION });
     expect(isNullJson(byId[capId(3)]!.parsed)).toBe(true);
-    expect(byId[capId(4)]).toMatchObject({ status: 'IGNORED', parsed: { kind: 'IGNORE' } });
+    // A promotion is dismissed (decision of 13/11/2026), so "restore" brings it back.
+    expect(byId[capId(4)]).toMatchObject({ status: 'DISMISSED', parsed: { kind: 'IGNORE' } });
   });
 
-  it('replaces an older reading when the rule changed and clears one that is no longer understood', async () => {
+  it('replaces an older reading and clears one that is no longer understood', async () => {
     addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, parsed: { kind: 'CARD_PURCHASE', amount: 1 }, parserVersion: 0 });
-    addCapture(2, { package: NU, title: 'x', text: 'texto que nenhum parser entende', parsed: { kind: 'PIX_IN', amount: 9 }, parserVersion: 0 });
+    addCapture(2, { package: NU, title: 'x', text: 'você ganhou R$ 9,00', parsed: { kind: 'PIX_IN', amount: 9 }, parserVersion: 0 });
 
     await postTo('/captures/reparse');
 
-    expect(store.captures[0]).toMatchObject({ parsed: { amount: 37.5 }, parserVersion: PARSER_VERSION });
+    expect(store.captures[0]).toMatchObject({ parsed: { amount: 37.5, amountCents: 3750 }, parserVersion: PARSER_VERSION });
     expect(isNullJson(store.captures[1]!.parsed)).toBe(true);
     expect(store.captures[1]!.parserVersion).toBe(PARSER_VERSION);
   });
 
-  it('touches only PENDING captures of the caller household', async () => {
-    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'CONFIRMED' });
+  it('turns the own transfers of the first reader into income with a warning', async () => {
+    addCapture(1, { package: NU, title: 'Transferência recebida', text: 'Recebemos sua transferência de R$ 2.500,00.', parsed: { kind: 'OWN_TRANSFER_IN', type: null, amount: 2500 }, parserVersion: 3 });
+    await postTo('/captures/reparse');
+    expect(store.captures[0]).toMatchObject({ status: 'PENDING', parsed: { kind: 'PIX_IN', type: 'INCOME', amountCents: 250000, warning: 'POSSIBLE_OWN_TRANSFER' } });
+  });
+
+  it('is idempotent: a second run finds nothing to read and changes nothing', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText });
+    addCapture(2, { package: NU, title: 'Limite', text: limitText });
+    await postTo('/captures/reparse');
+    const after = store.captures.map((c) => ({ ...c }));
+
+    const second = await postTo('/captures/reparse');
+
+    expect(second.json().data).toMatchObject({ scanned: 0, updated: 0 });
+    expect(store.captures).toEqual(after);
+  });
+
+  it('two simultaneous runs update each capture once', async () => {
+    for (let n = 1; n <= 5; n += 1) addCapture(n, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText.replace('37,50', `${n},00`) });
+
+    const [a, b] = await Promise.all([postTo('/captures/reparse'), postTo('/captures/reparse')]);
+
+    expect(a.json().data.updated + b.json().data.updated).toBe(5);
+    expect(store.captures.every((c) => c.parserVersion === PARSER_VERSION && c.status === 'PENDING')).toBe(true);
+  });
+
+  it('moves the IGNORED notices of the first reader to DISMISSED, and an IGNORED text now understood back to PENDING', async () => {
+    addCapture(1, { package: NU, title: 'Limite', text: limitText, status: 'IGNORED', parsed: { kind: 'IGNORE', ignore: true }, parserVersion: 3 });
+    addCapture(2, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'IGNORED', parserVersion: 3 });
+
+    await postTo('/captures/reparse');
+
+    expect(store.captures.map((c) => c.status)).toEqual(['DISMISSED', 'PENDING']);
+    expect((await postTo(`/captures/${capId(1)}/restore`)).statusCode).toBe(200);
+  });
+
+  it('a notice the user restored is not dismissed again by the next run', async () => {
+    addCapture(1, { package: NU, title: 'Limite', text: limitText });
+    await postTo('/captures/reparse');
+    await postTo(`/captures/${capId(1)}/restore`);
+
+    await postTo('/captures/reparse');
+
+    expect(store.captures[0]!.status).toBe('PENDING');
+  });
+
+  it('never touches CONFIRMED or DISMISSED captures, nor another household', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'CONFIRMED', transactionId: 'tx' });
     addCapture(2, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, status: 'DISMISSED' });
     addCapture(3, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText, householdId: OTHER_HOUSEHOLD_ID });
 
     const res = await postTo('/captures/reparse');
 
-    expect(res.json().data.scanned).toBe(0);
-    expect(store.captures.every((c) => c.parsed === null)).toBe(true);
+    expect(res.json().data).toMatchObject({ scanned: 0, updated: 0 });
+    expect(store.captures.every((c) => c.parsed === null && c.parserVersion === undefined)).toBe(true);
     expect(store.captures.map((c) => c.status)).toEqual(['CONFIRMED', 'DISMISSED', 'PENDING']);
+  });
+
+  it('a capture confirmed between the read and the write is left alone', async () => {
+    addCapture(1, { package: NU, title: 'Compra no crédito aprovada', text: purchaseText });
+    const original = captureOps.updateMany.getMockImplementation()!;
+    captureOps.updateMany.mockImplementationOnce(async (args) => {
+      store.captures[0]!.status = 'CONFIRMED';
+      return original(args);
+    });
+
+    const res = await postTo('/captures/reparse');
+
+    expect(res.json().data).toMatchObject({ scanned: 1, updated: 0 });
+    expect(store.captures[0]).toMatchObject({ status: 'CONFIRMED', parsed: null });
   });
 
   it('needs an EDITOR login: a VIEWER gets 403, a device token or nothing gets 401', async () => {

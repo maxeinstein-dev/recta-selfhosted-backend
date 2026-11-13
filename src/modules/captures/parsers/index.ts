@@ -9,7 +9,7 @@ export type { ParsedCapture, ParserInput } from './types.js';
  * Bumped whenever a parser rule changes (a new format, a fixed pattern), so `POST /captures/reparse` can tell which
  * captures were read by an older rule. Stored in `captured_notifications.parser_version`.
  */
-export const PARSER_VERSION = 3;
+export const PARSER_VERSION = 4;
 
 /** One parser per app package. XP is not here on purpose: investments are out of the notification reader. */
 const PARSERS: Record<string, AppParser> = {
