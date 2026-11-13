@@ -134,6 +134,12 @@ export const netWorthQuerySchema = z.object({
 export type NetWorthQuery = z.infer<typeof netWorthQuerySchema>;
 
 /** GET /dashboard/income-split: one month ('YYYY-MM'). */
+export const spendingByMethodQuerySchema = z.object({
+  householdId: z.string().uuid().optional(),
+  months: z.coerce.number().int().min(1).max(12).default(6),
+  to: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'to must be YYYY-MM').optional(),
+});
+
 export const incomeSplitQuerySchema = z.object({
   householdId: z.string().uuid().optional(),
   month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'month must be YYYY-MM'),
