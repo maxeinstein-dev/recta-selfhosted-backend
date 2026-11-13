@@ -197,10 +197,27 @@ model Account {
   monthClosings         MonthClosing[]
   employments           Employment[]
   employmentItems       EmploymentItem[]
+  valuations            AccountValuation[]
 
   // Indexes
   @@index([householdId])
   @@map("accounts")
+}
+
+// Market value of an investment account on a date, informed by the user (statement). It is NOT a transaction: the yield
+// never shows as income. Contributions stay transfers to the account; the net worth reads the latest value up to a month end.
+model AccountValuation {
+  id        String   @id @default(uuid()) @db.Uuid
+  accountId String   @map("account_id") @db.Uuid
+  date      DateTime @db.Date
+  amount    Decimal  @db.Decimal(15, 2)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, date])
+  @@map("account_valuations")
 }
 
 enum CategoryType {
