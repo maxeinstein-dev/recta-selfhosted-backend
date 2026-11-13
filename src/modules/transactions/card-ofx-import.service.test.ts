@@ -357,6 +357,8 @@ describe('card OFX import: a month that has sheet rows', () => {
       reversalsImported: 0,
       advancePayments: 0,
       payment: { action: 'adjusted', transactionId: expect.any(String), amount: 1500, date: '2026-09-03' },
+      sharedWithPeople: 0,
+      settlementsRecorded: 0,
       skipped: 0,
       createdCategories: [],
       warnings: [],

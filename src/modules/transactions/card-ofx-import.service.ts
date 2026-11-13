@@ -13,6 +13,7 @@ import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { BadRequestError, NotFoundError } from '../../shared/errors/app-error.js';
 import { AccountType, CategoryName, CategoryType, TransactionType, getCategoriesByType } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
+import { decimalFromCents } from '../people/people.common.js';
 import { clampText } from './parsers/maxfin.parser.js';
 import type { MaxFinMonth } from './parsers/maxfin.types.js';
 import {
@@ -1528,10 +1529,10 @@ interface CreateContext {
 /**
  * Create one card transaction per line of the proposal (purchase = EXPENSE, credits = INCOME), recording each ref.
  * A line whose ref is already used elsewhere is left alone (the transaction just created is removed again).
- * Returns how many were created.
+ * Returns the transactions created with the ref of their line.
  */
-async function createLines(ctx: CreateContext, refs: string[], fixedCategory?: string): Promise<number> {
-  let created = 0;
+async function createLines(ctx: CreateContext, refs: string[], fixedCategory?: string): Promise<Array<{ id: string; ref: string }>> {
+  const created: Array<{ id: string; ref: string }> = [];
   const ordered = [...refs].sort((a, b) => ctx.lineOrder.get(a)! - ctx.lineOrder.get(b)!);
   for (const ref of ordered) {
     const line = ctx.lineByRef.get(ref)!;
@@ -1564,7 +1565,7 @@ async function createLines(ctx: CreateContext, refs: string[], fixedCategory?: s
     }
     try {
       await prisma.transactionExternalRef.create({ data: { householdId: ctx.householdId, transactionId, ref: line.ref } });
-      created += 1;
+      created.push({ id: transactionId, ref: line.ref });
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
       // The ref was reconciled with another transaction meanwhile: this one would be a duplicate.
@@ -1599,15 +1600,15 @@ async function recordLegacyRefs(householdId: string, items: Array<{ transactionI
 }
 
 /** Future installments of a new purchase, one per following month, like the monthly sheet's (`<ref>:f<i>`). */
-async function createFutureInstallments(ctx: CreateContext, proposal: ReconcileProposal): Promise<number> {
-  if (proposal.futureNumbers.length === 0 || !proposal.futureBaseRef) return 0;
+async function createFutureInstallments(ctx: CreateContext, proposal: ReconcileProposal): Promise<string[]> {
+  if (proposal.futureNumbers.length === 0 || !proposal.futureBaseRef) return [];
   const base = ctx.lineByRef.get(proposal.futureBaseRef)!;
   const { number: last, total } = base.installment!;
-  let created = 0;
+  const created: string[] = [];
   for (const n of proposal.futureNumbers) {
     const offset = n - last;
     try {
-      await createTransaction(
+      const transaction = await createTransaction(
         {
           householdId: ctx.householdId,
           accountId: ctx.card.id,
@@ -1626,7 +1627,7 @@ async function createFutureInstallments(ctx: CreateContext, proposal: ReconcileP
         },
         ctx.userId,
       );
-      created += 1;
+      created.push(transaction.id);
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
     }
@@ -1722,6 +1723,85 @@ async function applyPayment(
   return { action: 'adjusted', transactionId: result.paymentTransaction.id, amount: plan.line.amount, date: plan.line.date };
 }
 
+/** Proposal kinds a line of another person can come from: a purchase made for them, a payment they made. */
+const OTHER_PERSON_KINDS: ReadonlySet<ReconcileProposal['kind']> = new Set(['create', 'advance-payment']);
+
+/**
+ * Checks `otherPeople` before the first write: each group is selected, still exists and is a new purchase or an advance
+ * payment, appears once; each person is an active person of the card's household. Returns group -> personId.
+ */
+async function resolveOtherPeople(
+  entries: CardOfxConfirmRequest['otherPeople'],
+  selected: ReadonlySet<string>,
+  proposals: ReconcileProposal[],
+  householdId: string,
+): Promise<Map<string, string>> {
+  const byGroup = new Map<string, string>();
+  if (!entries || entries.length === 0) return byGroup;
+  const kindOf = new Map(proposals.map((p) => [p.group, p.kind]));
+  for (const entry of entries) {
+    if (byGroup.has(entry.group)) throw new BadRequestError('A group can belong to only one person');
+    if (!selected.has(entry.group)) throw new BadRequestError('A line of another person must be in the selected groups');
+    const kind = kindOf.get(entry.group);
+    // A group that no longer exists was applied meanwhile by another confirm: it is skipped, so is its person.
+    if (!kind) continue;
+    if (!OTHER_PERSON_KINDS.has(kind)) {
+      throw new BadRequestError('Only new purchases and advance payments can belong to another person');
+    }
+    byGroup.set(entry.group, entry.personId);
+  }
+  const ids = [...new Set(byGroup.values())];
+  if (ids.length === 0) return byGroup;
+  const people = await prisma.person.findMany({ where: { householdId, id: { in: ids } }, select: { id: true, name: true, isActive: true } });
+  const found = new Map(people.map((p) => [p.id, p]));
+  for (const id of ids) {
+    const person = found.get(id);
+    if (!person) throw new NotFoundError('Person');
+    if (!person.isActive) throw new BadRequestError(`${person.name} is inactive: reactivate the person before assigning lines to them`);
+  }
+  return byGroup;
+}
+
+/**
+ * Split the transaction 100% to the person (THEY_OWE_ME, source 'import'), or, for a credit, record the RECEIVED
+ * settlement linked to it. When that fails the transaction (and its ref) is removed again and the error goes up: a
+ * line left without its person would not come back in the next preview.
+ */
+async function assignToPerson(
+  ctx: CreateContext,
+  transactionId: string,
+  line: { amount: number; date: string; type: 'INCOME' | 'EXPENSE' },
+  personId: string,
+): Promise<void> {
+  const amount = decimalFromCents(toCents(line.amount));
+  try {
+    if (line.type === 'INCOME') {
+      await prisma.settlement.create({
+        data: {
+          householdId: ctx.householdId,
+          personId,
+          direction: 'RECEIVED',
+          amount,
+          date: parseLocalDateString(line.date),
+          transactionId,
+          note: `Pagamento antecipado da fatura ${monthKey(ctx.month)} (OFX)`,
+        },
+      });
+    } else {
+      await prisma.transactionShare.create({
+        data: { householdId: ctx.householdId, transactionId, personId, amount, direction: 'THEY_OWE_ME', source: 'import' },
+      });
+    }
+  } catch (error) {
+    try {
+      await deleteTransaction(transactionId, ctx.householdId);
+    } catch (cleanup) {
+      console.error('[card-ofx confirm] Could not remove a line whose person could not be saved:', cleanup);
+    }
+    throw error;
+  }
+}
+
 export interface ConfirmCardOfxParams {
   request: CardOfxConfirmRequest;
   /** Resolved (and authorized) by the route. */
@@ -1744,6 +1824,7 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   const context = await loadCardContext(account, month, lines, undefined, request.ledgerBalance ?? null);
   const result = reconcileCardOfx(context.input);
   const toApply = result.proposals.filter((p) => selected.has(p.group));
+  const otherPeople = await resolveOtherPeople(request.otherPeople, selected, result.proposals, householdId);
   let skipped = selected.size - toApply.length;
 
   const warnings: string[] = [];
@@ -1798,6 +1879,8 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
   let futureInstallments = 0;
   let reversalsImported = 0;
   let advancePayments = 0;
+  let sharedWithPeople = 0;
+  let settlementsRecorded = 0;
   for (const proposal of toApply) {
     switch (proposal.kind) {
       case 'enrich-exact':
@@ -1838,14 +1921,28 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
       case 'create': {
         // The future installments go first: once the line exists its group is gone, so a failure after it would
         // lose them for good, while a failure before it leaves the group to be retried (stored numbers are skipped).
-        futureInstallments += await createFutureInstallments(createContext, proposal);
-        const count = await createLines(createContext, proposal.refs);
-        if (count === 0) skipped += 1;
-        else created += count;
+        const futureIds = await createFutureInstallments(createContext, proposal);
+        futureInstallments += futureIds.length;
+        const ids = await createLines(createContext, proposal.refs);
+        if (ids.length === 0) skipped += 1;
+        else created += ids.length;
+        const personId = otherPeople.get(proposal.group);
+        if (personId) {
+          // The purchase and each future installment: the whole amount is the person's, the holder's own share is zero.
+          const base = lineByRef.get(proposal.futureBaseRef ?? proposal.refs[0]!)!;
+          for (const id of futureIds) {
+            await assignToPerson(createContext, id, { amount: base.amount, date: base.date, type: 'EXPENSE' }, personId);
+            sharedWithPeople += 1;
+          }
+          for (const { id, ref } of ids) {
+            await assignToPerson(createContext, id, lineByRef.get(ref)!, personId);
+            sharedWithPeople += 1;
+          }
+        }
         break;
       }
       case 'reversal': {
-        const count = await createLines(createContext, proposal.refs);
+        const count = (await createLines(createContext, proposal.refs)).length;
         if (count > 0) reversalsImported += count;
         else skipped += 1;
         break;
@@ -1856,9 +1953,16 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
           break;
         }
         // A credit on the card on the bank's day: the debt drops, no bank account moves (the source is unknown).
-        const count = await createLines(createContext, proposal.refs, ADVANCE_PAYMENT_CATEGORY);
-        if (count > 0) advancePayments += count;
+        const ids = await createLines(createContext, proposal.refs, ADVANCE_PAYMENT_CATEGORY);
+        if (ids.length > 0) advancePayments += ids.length;
         else skipped += 1;
+        const advancePerson = otherPeople.get(proposal.group);
+        if (advancePerson) {
+          for (const { id, ref } of ids) {
+            await assignToPerson(createContext, id, lineByRef.get(ref)!, advancePerson);
+            settlementsRecorded += 1;
+          }
+        }
         break;
       }
     }
@@ -1884,6 +1988,8 @@ export async function confirmCardOfxImport(params: ConfirmCardOfxParams): Promis
     reversalsImported,
     advancePayments,
     payment,
+    sharedWithPeople,
+    settlementsRecorded,
     skipped,
     createdCategories: categories.created,
     warnings,
