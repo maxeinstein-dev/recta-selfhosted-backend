@@ -1,4 +1,4 @@
-import { BRL, cleanMerchant, parsePositiveAmount } from './amount.js';
+import { BRL, cleanMerchant, money, parsePositiveCents } from './amount.js';
 import type { AppParser } from './types.js';
 
 /** Senders (the notification title) whose e-mails are read. Same list the server uses to refuse other Gmail titles. */
@@ -15,14 +15,14 @@ function parseMercadoPagoPixSent(text: string) {
   const lines = text.split(/\r?\n/).map((l) => l.trim());
   const at = lines.findIndex((l) => PIX_SENT.test(l));
   if (at < 0) return null;
-  const amount = parsePositiveAmount(PIX_SENT.exec(lines[at]!)![1]!);
-  if (amount === null) return null;
+  const cents = parsePositiveCents(PIX_SENT.exec(lines[at]!)![1]!);
+  if (cents === null) return null;
   let description = 'Pix enviado';
   if (DATE_LINE.test(lines[at + 1] ?? '')) {
     const name = cleanMerchant(lines[at + 2] ?? '');
     if (name && !/^(CPF\/CNPJ|Mercado Pago)/i.test(name)) description = name;
   }
-  return { kind: 'PIX_OUT' as const, type: 'EXPENSE' as const, amount, description };
+  return { kind: 'PIX_OUT' as const, type: 'EXPENSE' as const, ...money(cents), method: 'PIX' as const, description };
 }
 
 export const parseGmail: AppParser = ({ title, text }) => {

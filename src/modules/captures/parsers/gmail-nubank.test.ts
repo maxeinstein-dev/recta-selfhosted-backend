@@ -8,12 +8,12 @@ const pixText = (value: string, extra = '') =>
 describe('Mercado Pago Pix sent, notified by Gmail', () => {
   it('reads the amount and the receiver name as an expense, never the document', () => {
     const parsed = parseCapture({ package: GM, title: 'Mercado Pago', text: pixText('1.234,56') });
-    expect(parsed).toEqual({ kind: 'PIX_OUT', type: 'EXPENSE', amount: 1234.56, description: 'MARIA FICTICIA DA SILVA' });
+    expect(parsed).toEqual({ kind: 'PIX_OUT', type: 'EXPENSE', amountCents: 123456, amount: 1234.56, method: 'PIX', description: 'MARIA FICTICIA DA SILVA' });
     expect(JSON.stringify(parsed)).not.toContain('123.456');
   });
 
   it('reads an amount without cents', () => {
-    expect(parseCapture({ package: GM, title: 'Mercado Pago', text: pixText('320') })).toMatchObject({ kind: 'PIX_OUT', amount: 320 });
+    expect(parseCapture({ package: GM, title: 'Mercado Pago', text: pixText('320') })).toMatchObject({ kind: 'PIX_OUT', amountCents: 32000, amount: 320 });
   });
 
   it('reads a text cut right after the date (no receiver name): generic description', () => {
@@ -45,13 +45,13 @@ describe('Nubank NuPay refund', () => {
   const NU = 'com.nu.production';
   it('reads the cut start as a refund (income) with the merchant, amount unknown', () => {
     expect(parseCapture({ package: NU, title: 'Estorno', text: 'NuPay: estorno recebido de compra no crédito na Loja Ficticia…' })).toEqual({
-      kind: 'REFUND', type: 'INCOME', amount: null, description: 'Estorno: Loja Ficticia',
+      kind: 'REFUND', type: 'INCOME', amountCents: null, amount: null, merchant: 'Loja Ficticia', description: 'Estorno: Loja Ficticia',
     });
   });
 
   it('takes the amount when the text carries it', () => {
     expect(parseCapture({ package: NU, title: 'Estorno', text: 'NuPay: estorno recebido de compra no crédito na Loja Ficticia no valor de R$ 1.200,50.' })).toMatchObject({
-      amount: 1200.5, description: 'Estorno: Loja Ficticia',
+      amountCents: 120050, amount: 1200.5, description: 'Estorno: Loja Ficticia',
     });
   });
 

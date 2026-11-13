@@ -459,20 +459,34 @@ describe('POST /captures reads the notification', () => {
     });
   });
 
-  it('stores an ignorable notice (known informative) as IGNORED', async () => {
+  it('stores a notice (limit, promotion) as DISMISSED, so the user can restore it', async () => {
     const token = await newToken();
-    await post(token, { items: [item({ package: NU, title: 'Seu novo limite está valendo', text: 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.' })] });
+    await post(token, { items: [
+      item({ package: NU, title: 'Seu novo limite está valendo', text: 'Agora você pode enviar até R$ 80.000,00 via Pix, TED e boleto de dia.' }),
+      item({ package: NU, title: 'Promoção', text: 'Ganhe um cupom agora.' }),
+    ] });
 
-    expect(store.captures[0]).toMatchObject({ status: 'IGNORED', parserVersion: PARSER_VERSION, parsed: { kind: 'IGNORE', ignore: true } });
+    expect(store.captures).toHaveLength(2);
+    for (const capture of store.captures) {
+      expect(capture).toMatchObject({ status: 'DISMISSED', parserVersion: PARSER_VERSION, parsed: { kind: 'IGNORE', ignore: true } });
+    }
   });
 
-  it('answers 200 and keeps the capture PENDING without parsed when the text is not understood', async () => {
+  it('stores the cents, the card ending and the warning of a reading', async () => {
     const token = await newToken();
-    const res = await post(token, { items: [item({ package: NU, title: 'Promoção', text: 'Ganhe um cupom agora.' })] });
+    await post(token, { items: [item(purchase), item({ package: 'com.mercadopago.wallet', title: 'Seu dinheiro já está disponível', text: 'Você depositou R$ 10,00 via Pix e o valor já está rendendo na sua conta.' })] });
+
+    expect(store.captures[0]).toMatchObject({ parsed: { amountCents: 3750, cardLast4: '1234' } });
+    expect(store.captures[1]).toMatchObject({ status: 'PENDING', parsed: { kind: 'PIX_IN', type: 'INCOME', amountCents: 1000, warning: 'POSSIBLE_OWN_TRANSFER' } });
+  });
+
+  it('answers 200 and keeps the capture PENDING without parsed when the text is not understood, marking the version that tried', async () => {
+    const token = await newToken();
+    const res = await post(token, { items: [item({ package: NU, title: 'Novidade', text: 'Você ganhou R$ 20,00 de cashback.' })] });
 
     expect(res.statusCode).toBe(200);
     expect(res.json().data.results[0].status).toBe('created');
-    expect(store.captures[0]).toMatchObject({ status: 'PENDING' });
+    expect(store.captures[0]).toMatchObject({ status: 'PENDING', parserVersion: PARSER_VERSION });
     expect(store.captures[0]!.parsed).toBeUndefined();
   });
 });

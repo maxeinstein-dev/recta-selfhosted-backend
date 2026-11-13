@@ -92,3 +92,27 @@ export const replaceAccountRulesSchema = z.object({
 
 export type ConfirmCaptureInput = z.infer<typeof confirmCaptureSchema>;
 export type AccountRuleInput = z.infer<typeof accountRuleSchema>;
+
+// Card-ending rules: the account of the purchases of one card (the four digits the notification carries).
+export const CARD_LAST4_PATTERN = /^\d{4}$/;
+
+export const cardRuleSchema = z.object({
+  package: z.string().min(1, 'package is required').max(150).refine(noNul, NUL_MESSAGE),
+  cardLast4: z.string().regex(CARD_LAST4_PATTERN, 'cardLast4 must be the last four digits of the card'),
+  accountId: z.string().uuid(),
+}).strict();
+
+export const replaceCardRulesSchema = z.object({
+  rules: z.array(cardRuleSchema).max(MAX_ACCOUNT_RULES, `At most ${MAX_ACCOUNT_RULES} rules`),
+}).strict().superRefine((body, ctx) => {
+  const seen = new Set<string>();
+  body.rules.forEach((rule, index) => {
+    const key = JSON.stringify([rule.package, rule.cardLast4]);
+    if (seen.has(key)) {
+      ctx.addIssue({ code: 'custom', path: ['rules', index], message: `Duplicate rule for package "${rule.package}" and card ending ${rule.cardLast4}` });
+    }
+    seen.add(key);
+  });
+});
+
+export type CardRuleInput = z.infer<typeof cardRuleSchema>;
