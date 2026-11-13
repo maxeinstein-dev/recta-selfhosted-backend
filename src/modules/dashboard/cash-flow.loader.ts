@@ -217,7 +217,7 @@ async function pendingEvents(householdId: string, accountIds: string[], endUtc: 
  * the job has not caught up with) all count today, as overdue. A month that already holds a transaction of the
  * recurrence (generated, or adopted from an import) is not counted again.
  */
-async function recurrenceEvents(
+export async function recurrenceEvents(
   householdId: string,
   accountIds: string[],
   today: string,

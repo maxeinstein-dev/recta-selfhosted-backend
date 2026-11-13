@@ -13,6 +13,7 @@ import { toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
  * Everything that stores a category reference is listed here (the schema was grepped for category_name):
  *  - transactions.category_name           (re-pointed)
  *  - recurring_transactions.category_name (re-pointed)
+ *  - category_group_assignments.category_name (re-pointed when the target has no group, else removed)
  *  - budgets.category_name                (re-pointed; unique per household+category+month, so when the target
  *                                          already has a budget for the month the two limits are added and the
  *                                          source row is removed)
@@ -142,6 +143,13 @@ async function run(tx: Db, householdId: string, input: MergeInput, write: boolea
     }
     if (move.length > 0) {
       await tx.budget.updateMany({ where: { householdId, categoryName: from }, data: { categoryName: target.categoryName } });
+    }
+    // Spending group: the target keeps its own; a target without one takes the source's, so the money stays where it was
+    const targetGroup = await tx.categoryGroupAssignment.findFirst({ where: { householdId, categoryName: target.categoryName } });
+    if (targetGroup) {
+      await tx.categoryGroupAssignment.deleteMany({ where: { householdId, categoryName: from } });
+    } else {
+      await tx.categoryGroupAssignment.updateMany({ where: { householdId, categoryName: from }, data: { categoryName: target.categoryName } });
     }
     await tx.category.delete({ where: { id: source.id } });
   }
