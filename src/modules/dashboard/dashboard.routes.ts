@@ -5,10 +5,11 @@ import {
   requireEditor,
   ensurePersonalHousehold,
 } from '../../shared/middleware/authorization.middleware.js';
-import { cashFlowQuerySchema, dashboardOverviewQuerySchema, monthCloseBodySchema, monthCloseQuerySchema, netWorthQuerySchema } from './dashboard.schema.js';
+import { cashFlowQuerySchema, dashboardOverviewQuerySchema, incomeSplitQuerySchema, monthCloseBodySchema, monthCloseQuerySchema, netWorthQuerySchema } from './dashboard.schema.js';
 import { loadCashFlow } from './cash-flow.loader.js';
 import { loadMonthClose, saveMonthClosing } from './month-close.js';
 import { loadNetWorth } from './net-worth.loader.js';
+import { loadIncomeSplit } from './income-split.loader.js';
 import * as dashboardService from './dashboard.service.js';
 
 export async function dashboardRoutes(app: FastifyInstance) {
@@ -362,6 +363,75 @@ export async function dashboardRoutes(app: FastifyInstance) {
     await requireHouseholdMember(request, householdId);
 
     const data = await loadNetWorth({ householdId, months: query.months });
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * GET /dashboard/income-split
+   * Where the month's income goes: spending per group (realized own share + still committed), the leftover and the
+   * housing share against 0.30. The income is the household's expected income of the month. Read-only, except that the
+   * default groups are created on the first use.
+   */
+  const shareSchema = { type: ['number', 'null'] };
+  app.get('/income-split', {
+    schema: {
+      description: 'Where the month income goes: spending per group, leftover and housing share',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        required: ['month'],
+        properties: {
+          householdId: { type: 'string', format: 'uuid' },
+          month: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean' },
+            data: {
+              type: 'object',
+              properties: {
+                month: { type: 'string' },
+                income: { type: 'object', properties: { amount: { type: 'number' }, basis: { type: 'string', enum: ['expected'] } } },
+                groups: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: ['string', 'null'] },
+                      key: { type: 'string' },
+                      name: { type: 'string' },
+                      color: { type: ['string', 'null'] },
+                      isHousing: { type: 'boolean' },
+                      sortOrder: { type: 'integer' },
+                      realized: { type: 'number' },
+                      committed: { type: 'number' },
+                      amount: { type: 'number' },
+                      percentOfIncome: shareSchema,
+                    },
+                  },
+                },
+                totalSpent: { type: 'number' },
+                leftover: { type: 'object', properties: { amount: { type: 'number' }, percentOfIncome: shareSchema } },
+                housing: {
+                  type: 'object',
+                  properties: { amount: { type: 'number' }, percentOfIncome: shareSchema, reference: { type: 'number' }, housingGroups: { type: 'integer' } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = incomeSplitQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+
+    const data = await loadIncomeSplit({ householdId, month: query.month });
     return reply.send({ success: true, data });
   });
 }

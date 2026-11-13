@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Row = Record<string, any>;
-const db: { category: Row[]; transaction: Row[]; recurringTransaction: Row[]; budget: Row[]; locks: string[] } = {
-  category: [], transaction: [], recurringTransaction: [], budget: [], locks: [],
+const db: { category: Row[]; transaction: Row[]; recurringTransaction: Row[]; budget: Row[]; categoryGroupAssignment: Row[]; locks: string[] } = {
+  category: [], transaction: [], recurringTransaction: [], budget: [], categoryGroupAssignment: [], locks: [],
 };
 const data = () => JSON.stringify({ ...db, locks: [] });
 const match = (row: Row, where: Row): boolean =>
@@ -11,7 +11,7 @@ const match = (row: Row, where: Row): boolean =>
     if (v && typeof v === 'object' && 'not' in v) return row[k] !== v.not;
     return row[k] === v;
   });
-const table = (name: 'category' | 'transaction' | 'recurringTransaction' | 'budget') => ({
+const table = (name: 'category' | 'transaction' | 'recurringTransaction' | 'budget' | 'categoryGroupAssignment') => ({
   findFirst: async ({ where }: { where: Row }) => db[name].find((r) => match(r, where)) ?? null,
   findUnique: async ({ where }: { where: Row }) => db[name].find((r) => match(r, where)) ?? null,
   findMany: async ({ where }: { where: Row }) => db[name].filter((r) => match(r, where)),
@@ -29,11 +29,17 @@ const table = (name: 'category' | 'transaction' | 'recurringTransaction' | 'budg
   delete: async ({ where }: { where: Row }) => {
     db[name] = db[name].filter((r) => !match(r, where));
   },
+  deleteMany: async ({ where }: { where: Row }) => {
+    const before = db[name].length;
+    db[name] = db[name].filter((r) => !match(r, where));
+    return { count: before - db[name].length };
+  },
 });
 
 vi.mock('../../shared/db/prisma.js', () => {
   const client: Row = {
     category: table('category'), transaction: table('transaction'), recurringTransaction: table('recurringTransaction'), budget: table('budget'),
+    categoryGroupAssignment: table('categoryGroupAssignment'),
     $queryRaw: async (strings: TemplateStringsArray, id: string) => {
       if (!strings.join('?').includes('FOR UPDATE')) throw new Error('unexpected raw query');
       db.locks.push(id);
@@ -67,6 +73,7 @@ beforeEach(() => {
     { id: 't3', householdId: HOUSEHOLD, categoryName: `CUSTOM:${DST}` },
     { id: 't4', householdId: OTHER_HOUSEHOLD, categoryName: `CUSTOM:${SRC}` },
   ];
+  db.categoryGroupAssignment = [];
   db.recurringTransaction = [{ id: 'r1', householdId: HOUSEHOLD, categoryName: `CUSTOM:${SRC}` }];
   db.budget = [
     { id: 'b1', householdId: HOUSEHOLD, categoryName: `CUSTOM:${SRC}`, month: new Date('2026-01-01'), monthlyLimit: 100 },
@@ -87,6 +94,23 @@ describe('mergeCategory', () => {
     expect(db.budget.find((b) => b.id === 'b3')!.monthlyLimit).toBe(130); // limits of a shared month are added
     expect(db.budget.find((b) => b.id === 'b2')!.categoryName).toBe(`CUSTOM:${DST}`);
     expect(db.budget.find((b) => b.id === 'b1')).toBeUndefined();
+  });
+
+  it('hands the source group to a target without one, and drops it when the target already has a group', async () => {
+    db.categoryGroupAssignment = [
+      { id: 'g1', householdId: HOUSEHOLD, categoryName: `CUSTOM:${SRC}`, groupId: 'casa' },
+      { id: 'g2', householdId: OTHER_HOUSEHOLD, categoryName: `CUSTOM:${SRC}`, groupId: 'alheio' },
+    ];
+    await mergeCategory(HOUSEHOLD, { sourceId: SRC, targetCategoryId: DST, preview: false });
+    expect(db.categoryGroupAssignment.filter((a) => a.householdId === HOUSEHOLD)).toEqual([
+      { id: 'g1', householdId: HOUSEHOLD, categoryName: `CUSTOM:${DST}`, groupId: 'casa' },
+    ]);
+    expect(db.categoryGroupAssignment.find((a) => a.id === 'g2')!.categoryName).toBe(`CUSTOM:${SRC}`); // other household untouched
+
+    db.category.push({ id: SRC, householdId: HOUSEHOLD, name: 'Teste Origem', type: 'INCOME' });
+    db.categoryGroupAssignment.push({ id: 'g3', householdId: HOUSEHOLD, categoryName: `CUSTOM:${SRC}`, groupId: 'pessoal' });
+    await mergeCategory(HOUSEHOLD, { sourceId: SRC, targetCategoryId: DST, preview: false });
+    expect(db.categoryGroupAssignment.filter((a) => a.householdId === HOUSEHOLD).map((a) => [a.categoryName, a.groupId])).toEqual([[`CUSTOM:${DST}`, 'casa']]);
   });
 
   it('locks source and target in id order', async () => {

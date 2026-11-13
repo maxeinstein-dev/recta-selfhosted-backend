@@ -18,6 +18,7 @@ import { userRoutes } from './modules/users/index.js';
 import { householdRoutes } from './modules/households/index.js';
 import { accountRoutes } from './modules/accounts/index.js';
 import { categoryRoutes } from './modules/categories/index.js';
+import { categoryGroupRoutes } from './modules/category-groups/index.js';
 import { transactionRoutes } from './modules/transactions/index.js';
 import { importRoutes } from './modules/transactions/import.routes.js';
 import { maxfinImportRoutes } from './modules/transactions/maxfin-import.routes.js';
@@ -314,6 +315,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(householdRoutes, { prefix: '/households' });
   await app.register(accountRoutes, { prefix: '/accounts' });
   await app.register(categoryRoutes, { prefix: '/categories' });
+  await app.register(categoryGroupRoutes, { prefix: '/category-groups' });
   await app.register(transactionRoutes, { prefix: '/transactions' });
   await app.register(importRoutes, { prefix: '/transactions' });
   await app.register(maxfinImportRoutes, { prefix: '/transactions' });

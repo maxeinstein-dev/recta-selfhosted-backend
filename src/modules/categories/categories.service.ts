@@ -163,6 +163,8 @@ export async function deleteCategory(categoryId: string, householdId: string) {
       throw new CategoryInUseError('Category is in use');
     }
 
+    // An unused category may still sit in a spending group: the mapping goes with it
+    await tx.categoryGroupAssignment.deleteMany({ where: { householdId, categoryName: customName } });
     await tx.category.delete({ where: { id: categoryId } });
   });
 }

@@ -87,6 +87,12 @@ model Household {
   captureCardRules      CaptureCardRule[]
   employments           Employment[]
   monthClosings         MonthClosing[]
+  categoryGroups        CategoryGroup[]
+  categoryGroupAssignments CategoryGroupAssignment[]
+
+  // When the default spending groups (Casa, Pessoal, Dia a dia) were created, on demand, once. Null = never: a household
+  // that later deletes every group does not get the defaults back.
+  categoryGroupsSeededAt DateTime? @map("category_groups_seeded_at") @db.Timestamptz(3)
 
   @@map("households")
 }
@@ -294,6 +300,46 @@ model Category {
   @@index([householdId])
   @@index([householdId, type])
   @@map("categories")
+}
+
+// Spending groups above the categories (Casa, Pessoal, Dia a dia...): where the month's income goes. Expense categories only.
+model CategoryGroup {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  name        String   @db.VarChar(60)
+  sortOrder   Int      @default(0) @map("sort_order")
+  color       String?  @db.VarChar(7) // Hex, e.g. #3B82F6
+  // Housing (rent, condo, power, internet, mortgage): its spending is shown as a share of the income, against 30%
+  isHousing   Boolean  @default(false) @map("is_housing")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  household   Household                 @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  assignments CategoryGroupAssignment[]
+
+  @@unique([householdId, name])
+  // Target of the composite key of the assignments: an assignment can only point at a group of its own household
+  @@unique([id, householdId])
+  @@index([householdId])
+  @@map("category_groups")
+}
+
+// Category -> group, keyed by the categoryName the transactions store (system enum value or CUSTOM:<uuid>), so system
+// categories (which have no row in `categories`) and custom ones are mapped the same way. One group per category.
+model CategoryGroupAssignment {
+  id           String   @id @default(uuid()) @db.Uuid
+  householdId  String   @map("household_id") @db.Uuid
+  categoryName String   @map("category_name") @db.VarChar(50)
+  groupId      String   @map("group_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  household Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  group     CategoryGroup @relation(fields: [groupId, householdId], references: [id, householdId], onDelete: Cascade)
+
+  @@unique([householdId, categoryName])
+  @@index([groupId])
+  @@map("category_group_assignments")
 }
 
 model Transaction {
