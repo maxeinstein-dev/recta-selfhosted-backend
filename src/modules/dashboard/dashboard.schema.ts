@@ -105,3 +105,21 @@ export const cashFlowQuerySchema = z.object({
 });
 
 export type CashFlowQuery = z.infer<typeof cashFlowQuerySchema>;
+
+/** Month close query: the month to check, 'YYYY-MM'. */
+export const monthCloseQuerySchema = z.object({
+  householdId: z.string().uuid().optional(),
+  month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'month must be YYYY-MM'),
+});
+
+export type MonthCloseQuery = z.infer<typeof monthCloseQuerySchema>;
+
+/** Record a month conference: the balance the statement shows (an invoice total for a card), for one account. */
+export const monthCloseBodySchema = z.object({
+  householdId: z.string().uuid().optional(),
+  month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'month must be YYYY-MM'),
+  accountId: z.string().uuid(),
+  informedBalance: z.number().finite().min(-1_000_000_000_000).max(1_000_000_000_000),
+});
+
+export type MonthCloseBody = z.infer<typeof monthCloseBodySchema>;

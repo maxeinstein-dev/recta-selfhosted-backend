@@ -41,6 +41,8 @@ export function matchesWhere(row: Row, where: Record<string, unknown> | undefine
     if ('startsWith' in c && !(typeof value === 'string' && value.startsWith(String(c.startsWith)))) return false;
     if ('gte' in c && !(asDay(value) >= asDay(c.gte))) return false;
     if ('lte' in c && !(asDay(value) <= asDay(c.lte))) return false;
+    if ('lt' in c && !(asDay(value) < asDay(c.lt))) return false;
+    if ('gt' in c && !(asDay(value) > asDay(c.gt))) return false;
   }
   return true;
 }
