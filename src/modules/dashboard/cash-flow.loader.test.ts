@@ -264,6 +264,34 @@ describe('loadCashFlow: accounts', () => {
     const where = db.transaction.findMany.mock.calls.find(([a]) => a.where.paid === false)![0].where;
     expect(where.accountId).toEqual({ in: [SAV] });
   });
+
+  it('next income follows the account filter: an income of another account is not the next income of this one', async () => {
+    const accounts = [account(CHK), account(SAV, { type: 'SAVINGS', balance: dec(500) })];
+    const recs = [recurrence({ accountId: SAV, description: 'Salary' })];
+    // The real query filters by account; the mock does the same so the scope is what is tested
+    const scoped = () =>
+      db.recurringTransaction.findMany.mockImplementation(async (args: { where: { accountId: { in: string[] } } }) =>
+        recs.filter((r) => args.where.accountId.in.includes(r.accountId)),
+      );
+
+    setup({ accounts });
+    scoped();
+    const set = await run({ days: 30 });
+    expect(set.summary.nextIncome).toMatchObject({ date: '2026-11-20', amount: 3000, description: 'Salary' });
+    expect(set.summary.spendableUntilNextIncome).toMatchObject({ amount: 1500, balance: 'free' });
+
+    setup({ accounts });
+    scoped();
+    const chk = await run({ accountId: CHK, days: 30 });
+    expect(chk.summary.nextIncome).toBeNull();
+    expect(chk.summary.spendableUntilNextIncome).toBeNull();
+
+    setup({ accounts });
+    scoped();
+    const sav = await run({ accountId: SAV, days: 30 });
+    expect(sav.summary.nextIncome).toMatchObject({ date: '2026-11-20' });
+    expect(sav.summary.spendableUntilNextIncome).toMatchObject({ amount: 500 });
+  });
 });
 
 describe('loadCashFlow: pending entries', () => {
@@ -582,5 +610,33 @@ describe('loadCashFlow: invoices', () => {
       invoices: { [`${CARD_A}:2026-11`]: snap({ statementTotal: 120 }) },
     });
     expect(flat(await run())[0]).toMatchObject({ accountId: CHK, amount: -120 });
+  });
+});
+
+describe('loadCashFlow: any income ends the window of "pode gastar até" (decision of 13/11/2026)', () => {
+  it('a side job (income recurrence of another category) before the salary is the next income', async () => {
+    setup({
+      recurrences: [
+        recurrence({ id: 'rec-side', categoryName: 'FREELANCE', description: 'Side job', amount: dec(400), nextRunAt: utc('2026-11-15'), startDate: utc('2026-01-15') }),
+        recurrence({ description: 'Salary', nextRunAt: utc('2026-11-20') }),
+      ],
+    });
+    const out = await run({ days: 30 });
+    expect(out.summary.nextIncome).toEqual({ date: '2026-11-15', amount: 400, description: 'Side job' });
+  });
+
+  it('a one-off pending income (a sale, a gift) before the salary is the next income, and the window stops there', async () => {
+    setup({
+      pending: [
+        pending({ id: 'rent', amount: dec(300), date: utc('2026-11-12') }),
+        pending({ id: 'sale', type: 'INCOME', categoryName: 'OTHER_INCOME', description: 'Sold a chair', amount: dec(150), date: utc('2026-11-14') }),
+        pending({ id: 'bill', amount: dec(600), date: utc('2026-11-16') }),
+      ],
+      recurrences: [recurrence({ description: 'Salary', nextRunAt: utc('2026-11-20') })],
+    });
+    const out = await run({ days: 30 });
+    expect(out.summary.nextIncome).toEqual({ date: '2026-11-14', amount: 150, description: 'Sold a chair' });
+    // 1000 - 300 on the 12th; the bill of the 16th is after the sale, so it is not in this window
+    expect(out.summary.spendableUntilNextIncome).toEqual({ amount: 700, lowestDate: '2026-11-12', balance: 'free' });
   });
 });
