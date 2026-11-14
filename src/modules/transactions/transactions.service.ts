@@ -1983,6 +1983,23 @@ export function statementOriginAmounts(
 }
 
 /**
+ * The installment purchases of a statement, each once (sorted ids): the expense rows with an installmentId, the same
+ * rows `statementOriginAmounts` counts as installments (a refund row does not make a purchase).
+ */
+export function statementInstallmentIds(
+  rows: ReadonlyArray<{ installmentId: string | null; type: string | null; categoryName: string | null }>
+): string[] {
+  const ids = new Set<string>();
+  for (const t of rows) {
+    if (!t.categoryName || !t.installmentId) continue;
+    const isIncome = t.type === TransactionType.INCOME ||
+      (t.type !== TransactionType.EXPENSE && getCategoriesByType(CategoryType.INCOME).includes(t.categoryName as any));
+    if (!isIncome) ids.add(t.installmentId);
+  }
+  return [...ids].sort();
+}
+
+/**
  * Calculate credit card invoice for a specific month.
  * `currentExpenses` is the card's net purchases in the invoice window, the figure comparable with the bank statement
  * total; `total` is the running debt (previous balance + currentExpenses - payments), not the invoice amount.
@@ -2209,6 +2226,8 @@ export async function calculateCreditCardInvoice(
       // Parts of statementTotal: installments and recurrence-generated rows (the rest are plain purchases).
       statementInstallments: fromCents(toCents(statementOrigin.installments)),
       statementRecurrences: fromCents(toCents(statementOrigin.recurrences)),
+      // The installment purchases behind statementInstallments, each once.
+      statementInstallmentIds: statementInstallmentIds(currentPeriodTransactions),
       outstandingFromPrevious: fromCents(outstandingCents),
       debtTotal: isPaid || debtCents <= 1 ? 0 : fromCents(debtCents),
       closingDate: dates.closingDate,

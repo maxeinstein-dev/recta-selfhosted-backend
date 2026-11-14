@@ -44,10 +44,24 @@ export interface CommitmentTotals {
   incomeShare: number | null;
 }
 
-export interface CardCommitment {
+/** What is still owed in installments on the card, over every unpaid invoice from the current month on. */
+export interface InstallmentsLeft {
+  /** Sum of the installments of the unpaid invoices (the same `statementInstallments` each month shows). */
+  outstanding: number;
+  /** Installment purchases with a parcel in one of those invoices. */
+  activeCount: number;
+  /** Last invoice month that still has an installment, 'YYYY-MM'; null when none is left. */
+  lastMonth: string | null;
+}
+
+export interface CommitmentCore {
   accountId: string;
   months: CommitmentMonth[];
   totals: CommitmentTotals;
+}
+
+export interface CardCommitment extends CommitmentCore {
+  installments: InstallmentsLeft;
 }
 
 export interface CommitmentInput {
@@ -62,6 +76,8 @@ export interface CommitmentInput {
   /** Part of postedCents from recurrences already generated. The purchases are postedCents minus both parts. */
   recurringCents: number;
   forecastCents: number;
+  /** Installment purchases with a parcel on this invoice. */
+  installmentIds?: readonly string[];
 }
 
 const share = (totalCents: number, incomeCents: number): number | null =>
@@ -78,7 +94,7 @@ export function buildCommitment(
   accountId: string,
   invoices: CommitmentInput[],
   incomeCentsByMonth: ReadonlyMap<string, number>,
-): CardCommitment {
+): CommitmentCore {
   let postedCents = 0;
   let installmentCents = 0;
   let recurringCents = 0;
@@ -125,6 +141,22 @@ export function buildCommitment(
       incomeShare: share(postedCents + forecastCents, incomeCents),
     },
   };
+}
+
+/** Pure: the installments of the invoices that are not paid yet, in whole cents; a paid invoice owes nothing. */
+export function buildInstallmentsLeft(
+  invoices: ReadonlyArray<Pick<CommitmentInput, 'month' | 'state' | 'installmentCents' | 'installmentIds'>>,
+): InstallmentsLeft {
+  let cents = 0;
+  let lastMonth: string | null = null;
+  const ids = new Set<string>();
+  for (const invoice of invoices) {
+    if (invoice.state === 'paid') continue;
+    cents += invoice.installmentCents;
+    for (const id of invoice.installmentIds ?? []) ids.add(id);
+    if (invoice.installmentCents > 0 && (lastMonth === null || invoice.month > lastMonth)) lastMonth = invoice.month;
+  }
+  return { outstanding: fromCents(cents), activeCount: ids.size, lastMonth };
 }
 
 /**
@@ -214,6 +246,34 @@ export async function expectedIncomeByMonth(householdId: string, months: readonl
   return result;
 }
 
+/** A month far enough ahead to hold any installment plan; the walk never goes past it. */
+const MAX_INSTALLMENT_WALK = 36;
+
+/**
+ * The invoices that can still hold an installment: from the current month (whatever months were asked for) to two
+ * months after the latest installment row of the card (an invoice is due at most two months after a purchase), none
+ * when the card has no installment row.
+ */
+async function unpaidInstallmentInvoices(
+  accountId: string,
+  householdId: string,
+  currentMonth: string,
+  invoiceOf: (month: string) => Promise<CommitmentInput>,
+): Promise<CommitmentInput[]> {
+  const latest = await prisma.transaction.findFirst({
+    where: { accountId, householdId, installmentId: { not: null } },
+    orderBy: { date: 'desc' },
+    select: { date: true },
+  });
+  if (!latest) return [];
+  const lastByRow = addMonthKey(dayString(latest.date).slice(0, 7), 2);
+  const cap = addMonthKey(currentMonth, MAX_INSTALLMENT_WALK);
+  const end = lastByRow < cap ? lastByRow : cap;
+  const out: CommitmentInput[] = [];
+  for (let month = currentMonth; month <= end; month = addMonthKey(month, 1)) out.push(await invoiceOf(month));
+  return out;
+}
+
 /**
  * The card's next invoices side by side: what is already on each one, what the recurrences will still add, and the
  * income expected for the same month. Read-only: it reuses the invoice calculation, month by month.
@@ -229,10 +289,12 @@ export async function getCreditCardCommitment(
   const from = options.from ?? dayString(today).slice(0, 7);
   const keys = Array.from({ length: count }, (_, i) => addMonthKey(from, i));
 
-  const invoices: CommitmentInput[] = [];
-  for (const month of keys) {
+  const computed = new Map<string, CommitmentInput>();
+  const invoiceOf = async (month: string): Promise<CommitmentInput> => {
+    const known = computed.get(month);
+    if (known) return known;
     const { data } = await calculateCreditCardInvoice(accountId, month, householdId, { limit: 1 }, { today });
-    invoices.push({
+    const invoice: CommitmentInput = {
       month,
       closingDate: data.closingDate,
       dueDate: data.dueDate,
@@ -241,7 +303,15 @@ export async function getCreditCardCommitment(
       installmentCents: toCents(data.statementInstallments ?? 0),
       recurringCents: toCents(data.statementRecurrences ?? 0),
       forecastCents: toCents(data.forecast.total),
-    });
-  }
-  return buildCommitment(accountId, invoices, await expectedIncomeByMonth(householdId, keys, { personId: options.personId }));
+      installmentIds: data.statementInstallmentIds ?? [],
+    };
+    computed.set(month, invoice);
+    return invoice;
+  };
+
+  const invoices: CommitmentInput[] = [];
+  for (const month of keys) invoices.push(await invoiceOf(month));
+  const installments = buildInstallmentsLeft(await unpaidInstallmentInvoices(accountId, householdId, dayString(today).slice(0, 7), invoiceOf));
+  const core = buildCommitment(accountId, invoices, await expectedIncomeByMonth(householdId, keys, { personId: options.personId }));
+  return { ...core, installments };
 }

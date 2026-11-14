@@ -5,7 +5,8 @@ import {
   requireEditor,
   ensurePersonalHousehold,
 } from '../../shared/middleware/authorization.middleware.js';
-import { cashFlowQuerySchema, dashboardOverviewQuerySchema, incomeSplitQuerySchema, monthCloseBodySchema, monthCloseQuerySchema, netWorthQuerySchema } from './dashboard.schema.js';
+import { cashFlowQuerySchema, dashboardOverviewQuerySchema, incomeSplitQuerySchema, monthCloseBodySchema, monthCloseQuerySchema, netWorthQuerySchema, spendingByMethodQuerySchema } from './dashboard.schema.js';
+import { loadSpendingByMethod } from './spending-by-method.loader.js';
 import { loadCashFlow } from './cash-flow.loader.js';
 import { loadMonthClose, saveMonthClosing } from './month-close.js';
 import { loadNetWorth } from './net-worth.loader.js';
@@ -432,6 +433,56 @@ export async function dashboardRoutes(app: FastifyInstance) {
     await requireHouseholdMember(request, householdId);
 
     const data = await loadIncomeSplit({ householdId, month: query.month });
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * GET /dashboard/spending-by-method
+   * How the spending of each of the last months was paid: on a credit card or from the other accounts, by the own share,
+   * with the credit fraction. Same rows as the General expense budget. Read-only.
+   */
+  const methodAmounts = {
+    credit: { type: 'number' },
+    other: { type: 'number' },
+    total: { type: 'number' },
+    creditShare: { type: ['number', 'null'] },
+  };
+  app.get('/spending-by-method', {
+    schema: {
+      description: 'Spending of the last months split between credit cards and the other accounts, with the credit fraction',
+      tags: ['Dashboard'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          householdId: { type: 'string', format: 'uuid' },
+          months: { type: 'integer', minimum: 1, maximum: 12 },
+          to: { type: 'string', pattern: '^\\d{4}-(0[1-9]|1[0-2])$' },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean' },
+            data: {
+              type: 'object',
+              properties: {
+                basis: { type: 'string', enum: ['own-share'] },
+                months: { type: 'array', items: { type: 'object', properties: { month: { type: 'string' }, ...methodAmounts } } },
+                totals: { type: 'object', properties: methodAmounts },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const query = spendingByMethodQuerySchema.parse(request.query);
+    const householdId = query.householdId || await ensurePersonalHousehold(request);
+    await requireHouseholdMember(request, householdId);
+
+    const data = await loadSpendingByMethod({ householdId, months: query.months, to: query.to });
     return reply.send({ success: true, data });
   });
 }
