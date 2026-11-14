@@ -259,6 +259,16 @@ export async function dashboardRoutes(app: FastifyInstance) {
                     eventCount: { type: 'integer' },
                     estimatedCount: { type: 'integer' },
                     overdueCount: { type: 'integer' },
+                    // First day after today with money coming in; null when none falls in the period
+                    nextIncome: {
+                      type: ['object', 'null'],
+                      properties: { date: { type: 'string' }, amount: { type: 'number' }, description: { type: 'string' } },
+                    },
+                    // Lowest FREE balance from today to that day, never negative; null without a next income
+                    spendableUntilNextIncome: {
+                      type: ['object', 'null'],
+                      properties: { amount: { type: 'number' }, lowestDate: { type: 'string' }, balance: { type: 'string', enum: ['free'] } },
+                    },
                   },
                 },
                 unassignedInvoices: {

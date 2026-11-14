@@ -105,6 +105,16 @@ describe('GET /dashboard/cash-flow', () => {
       eventCount: 2,
     });
     expect(body.data.unassignedInvoices).toEqual([]);
+    // What can be spent until the next income goes out whole (the response schema would drop unknown keys)
+    expect(body.data.summary.nextIncome).toEqual({ date: '2026-11-20', amount: 4000, description: 'Salary' });
+    expect(body.data.summary.spendableUntilNextIncome).toEqual({ amount: 0, lowestDate: '2026-11-18', balance: 'free' });
+  });
+
+  it('without a next income both keys go out as null (not dropped)', async () => {
+    m.load.mockResolvedValue({ currency: 'BRL', ...buildCashFlow({ startingBalanceCents: 100000, today: '2026-11-10', days: 30, events: [] }) } as never);
+    const body = (await get(`?householdId=${HH}`)).json();
+    expect(body.data.summary).toHaveProperty('nextIncome', null);
+    expect(body.data.summary).toHaveProperty('spendableUntilNextIncome', null);
   });
 
   it('keeps the early-payment discount data of a recurrence event, and leaves the other events as they are', async () => {

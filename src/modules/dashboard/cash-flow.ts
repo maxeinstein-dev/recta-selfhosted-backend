@@ -112,6 +112,19 @@ export interface CashFlowSummary {
   /** Events whose value is not firm (certainty 'estimated'): the screen should warn that the number is not exact. */
   estimatedCount: number;
   overdueCount: number;
+  /**
+   * First day after today with money coming in (an income dated today, or overdue and moved to today, is already in
+   * today's balance). `amount` is the sum of that day's incomes, `description` the largest of them. Null when no income
+   * falls in the period.
+   */
+  nextIncome: { date: string; amount: number; description: string } | null;
+  /**
+   * What can be spent until `nextIncome` without the account going negative: the lowest end-of-day balance from today
+   * to the day of the income (inclusive, with what leaves on that day), never below zero. Known events only, no estimate
+   * of day-to-day spending. `balance: 'free'`: it is the free balance (what the savings goals keep stays out). Null when
+   * `nextIncome` is null.
+   */
+  spendableUntilNextIncome: { amount: number; lowestDate: string; balance: 'free' } | null;
 }
 
 export interface CashFlowProjection {
@@ -248,6 +261,22 @@ export function buildCashFlow(input: CashFlowInput): CashFlowProjection {
     return cents;
   };
 
+  // Next income: the first day after today with an income event; the largest income of that day names it
+  const incomeDay = dayList.find((d) => d.date > today && d.events.some((e) => centsOf.get(e)! > 0));
+  let nextIncome: CashFlowSummary['nextIncome'] = null;
+  let spendable: CashFlowSummary['spendableUntilNextIncome'] = null;
+  if (incomeDay) {
+    const incomes = incomeDay.events.filter((e) => centsOf.get(e)! > 0);
+    const largest = incomes.reduce((a, b) => (centsOf.get(b)! > centsOf.get(a)! ? b : a));
+    nextIncome = { date: incomeDay.date, amount: fromCents(incomes.reduce((sum, e) => sum + centsOf.get(e)!, 0)), description: largest.description };
+    let low = { date: today, cents: Number.POSITIVE_INFINITY };
+    for (const c of checkpoints) {
+      if (c.date > incomeDay.date) break;
+      if (c.cents < low.cents) low = { date: c.date, cents: c.cents };
+    }
+    spendable = { amount: fromCents(Math.max(0, low.cents)), lowestDate: low.date, balance: 'free' };
+  }
+
   const summary: CashFlowSummary = {
     lowestBalance: { date: lowest.date, amount: fromCents(lowest.cents) },
     firstNegativeDate: firstNegative,
@@ -261,6 +290,8 @@ export function buildCashFlow(input: CashFlowInput): CashFlowProjection {
     eventCount: events.length,
     estimatedCount: events.filter((e) => e.certainty === 'estimated').length,
     overdueCount: events.filter((e) => e.overdue).length,
+    nextIncome,
+    spendableUntilNextIncome: spendable,
   };
 
   return {
